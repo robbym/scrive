@@ -7,6 +7,11 @@
 A from-scratch code-editor widget for [iced](https://iced.rs) — a headless
 editing engine plus an `iced::advanced::Widget` that renders it.
 
+![The scrive editor: syntax highlighting, cursor movement and selection, find with match navigation, code folding, and live-highlighted typing](https://raw.githubusercontent.com/robbym/scrive/master/docs/showcase.gif)
+
+<sub>Recorded deterministically, headless — the demo renders itself, no external tools:
+`cargo run -p scrive-iced --example record_showcase --release -- docs/showcase.gif`</sub>
+
 Two crates, with the dependency pointing one way:
 
 - **`scrive-core`** — the headless engine: a rope-backed buffer, atomic

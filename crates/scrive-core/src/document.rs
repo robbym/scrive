@@ -2995,7 +2995,7 @@ mod tests {
         for _ in 0..300 {
             let n = 12 + next(60); // text length
             let text: String = (0..n)
-                .map(|_| [b'a', b'b', b'c', b' '][next(4) as usize] as char)
+                .map(|_| b"abc "[next(4) as usize] as char)
                 .collect();
             let d = doc(&text);
             let needle = needles[next(needles.len() as u32) as usize];

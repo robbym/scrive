@@ -23,10 +23,15 @@ iced_renderer = { version = "0.14", default-features = false }
 iced_tiny_skia = { version = "0.14", default-features = false }
 iced_runtime = { version = "0.14", default-features = false }
 png = "0.17"
+# Pure-Rust GIF encoder for the headless showcase recorder (record_showcase).
+gif = "0.13"
 
 [[example]]
 name = "scratch"
 test = true
+
+[[example]]
+name = "record_showcase"
 
 [package.metadata.docs.rs]
 all-features = true

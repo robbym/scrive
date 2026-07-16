@@ -506,7 +506,7 @@ impl HighlightPool {
     }
 }
 
-struct App {
+pub struct App {
     doc: Document,
     /// Whether the app-side find bar is open; its live query text.
     find_open: bool,
@@ -789,7 +789,7 @@ impl Default for App {
 }
 
 #[derive(Debug, Clone)]
-enum Msg {
+pub enum Msg {
     Editor(Action),
     /// Open the find bar (Ctrl+F) and focus its input.
     OpenFind,
@@ -822,7 +822,7 @@ impl App {
         self.doc.set_find_query(None, self.now_ms());
     }
 
-    fn update(&mut self, msg: Msg) -> Task<Msg> {
+    pub fn update(&mut self, msg: Msg) -> Task<Msg> {
         match msg {
             // The editor reported a new visible range (scroll / resize /
             // autoscroll): aim the highlight retention window there
@@ -1469,7 +1469,7 @@ impl App {
         }
     }
 
-    fn view(&self) -> Element<'_, Msg> {
+    pub fn view(&self) -> Element<'_, Msg> {
         // Addressable by id (focus + future multi-pane); the editor reads
         // highlight spans straight from the document's cache and the completion
         // popup from the controller.
@@ -1669,7 +1669,7 @@ fn severity_label(sev: Severity) -> &'static str {
 
 /// An original dark theme for the demo's iced chrome (find bar, popups,
 /// scrollbar), matching the `Scrive Dark` syntax theme.
-fn scrive_dark() -> Theme {
+pub fn scrive_dark() -> Theme {
     use iced::theme::Palette;
     use iced::Color;
     Theme::custom(
