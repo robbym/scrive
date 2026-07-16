@@ -1,0 +1,45 @@
+[package]
+name = "scrive-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Headless code-editor core: buffer, atomic multi-range transactions, undo/redo, selections, tracked-range decorations, and an incremental syntect highlight cache. Imports no GUI crate."
+keywords = ["editor", "text", "buffer", "undo", "headless"]
+categories = ["text-editors", "data-structures"]
+# benches/support.rs is a shared module of the one `perf` bench, not a bench
+# of its own — explicit [[bench] ] only.
+autobenches = false
+
+# HARD STRUCTURAL RULE (mirrors oriel-core): scrive-core depends on no GUI crate.
+# If `iced`/`winit`/`wgpu` ever appears in this crate's dependency tree, the
+# design has leaked. CI runs `cargo tree -p scrive-core` and asserts none appear.
+#
+# Dependency budget (plan §3) — each entry earns its place with a consumer:
+#   syntect              — §9 highlight state cache. Types stay OUT of the public
+#                          API (wrapped). Present now for the §9 de-risking spike.
+#   memchr               — §4 line-index scanning.        (added with buffer.rs, M0a)
+#   unicode-segmentation — §7 grapheme-cluster delete step. (added with verbs.rs, M0b)
+#   thiserror            — transaction/load error enums.    (added with the first enum, M0a)
+[dependencies]
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+memchr = "2"      # §14 find scanning (memmem/memchr2) + test oracles
+thiserror = "2"   # error enums (LoadError, later TransactionError)
+
+[dev-dependencies]
+# criterion: the §17 wall-clock bench harness (op-count canaries live in unit
+# tests; wall-clock lives here). Dev-only — never enters the lib graph, so the
+# cargo-tree GUI gate is unaffected.
+criterion = "0.5"
+# ropey: kept ONLY as the byte-for-byte oracle for our own rope (rope
+# re-foundation phase 1 replaced it as the buffer backing). Dev-only now — the
+# production build no longer depends on it.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
+
+[[bench]]
+name = "perf"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

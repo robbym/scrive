@@ -1,0 +1,5 @@
+# Treat font binaries as binary — never apply text/EOL normalization.
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary

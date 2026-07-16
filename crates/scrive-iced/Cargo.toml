@@ -1,0 +1,33 @@
+[package]
+name = "scrive-iced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "iced 0.14 integration for scrive: an `advanced::Widget` code editor with gutter, selections, syntax highlighting, diagnostics, completion, and hover. Wraps scrive-core."
+keywords = ["editor", "iced", "widget", "text", "gui"]
+categories = ["gui", "text-editors"]
+
+[dependencies]
+scrive-core = { path = "../scrive-core" }
+# `advanced` unlocks the low-level `Widget` API (iced::advanced::*) the editor
+# widget implements directly (NOT canvas::Program — plan §11/§12).
+iced = { version = "0.14", features = ["advanced"] }
+
+[dev-dependencies]
+# Headless render-to-PNG for self-validation screenshots (oriel's capture tech):
+# construct a real `iced::Renderer` (fallback::Renderer::Secondary over
+# tiny-skia) with no window or GPU and rasterize one frame. Available to
+# examples + tests.
+iced_renderer = { version = "0.14", default-features = false }
+iced_tiny_skia = { version = "0.14", default-features = false }
+iced_runtime = { version = "0.14", default-features = false }
+png = "0.17"
+
+[[example]]
+name = "scratch"
+test = true
+
+[package.metadata.docs.rs]
+all-features = true

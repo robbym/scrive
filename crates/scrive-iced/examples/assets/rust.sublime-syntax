@@ -1,0 +1,52 @@
+%YAML 1.2
+---
+# Compact Rust grammar for the scratch editor demo. App-supplied asset —
+# scrive-core ships no grammar. Standard TextMate scopes so any theme colors it.
+name: Rust
+file_extensions:
+  - rs
+scope: source.rust
+contexts:
+  main:
+    - match: '///.*$'
+      scope: comment.line.documentation.rust
+    - match: '//!.*$'
+      scope: comment.line.documentation.rust
+    - match: '//.*$'
+      scope: comment.line.double-slash.rust
+    - match: '/\*'
+      scope: punctuation.definition.comment.rust
+      push:
+        - meta_scope: comment.block.rust
+        - match: '\*/'
+          scope: punctuation.definition.comment.rust
+          pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.rust
+      push:
+        - meta_scope: string.quoted.double.rust
+        - match: '\\.'
+          scope: constant.character.escape.rust
+        - match: '"'
+          scope: punctuation.definition.string.end.rust
+          pop: true
+    - match: '#!?\[[^\]]*\]'
+      scope: meta.attribute.rust
+    - match: '\b(fn|let|mut|const|static|if|else|match|for|while|loop|break|continue|return|use|mod|pub|struct|enum|impl|trait|type|where|as|ref|move|dyn|unsafe|async|await|in|crate|super|self|Self)\b'
+      scope: keyword.control.rust
+    - match: '\b(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f32|f64|bool|char|str|String|Vec|VecDeque|Option|Result|Box|Rc|Arc)\b'
+      scope: storage.type.rust
+    - match: '\b(true|false|None|Some|Ok|Err)\b'
+      scope: constant.language.rust
+    - match: '\b0[xX][0-9a-fA-F_]+\b'
+      scope: constant.numeric.hex.rust
+    - match: '\b[0-9][0-9_]*(?:\.[0-9_]+)?\b'
+      scope: constant.numeric.rust
+    - match: '[a-zA-Z_][a-zA-Z0-9_]*!'
+      scope: support.function.macro.rust
+    - match: '[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'
+      scope: entity.name.function.rust
+    - match: '[{}()\[\];:,.]'
+      scope: punctuation.rust
+    - match: '[-+*/%=<>!&|^]+'
+      scope: keyword.operator.rust
