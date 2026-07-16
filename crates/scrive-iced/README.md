@@ -1,5 +1,9 @@
 # scrive
 
+[![CI](https://github.com/robbym/scrive/actions/workflows/ci.yml/badge.svg)](https://github.com/robbym/scrive/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/scrive-iced)](https://crates.io/crates/scrive-iced)
+[![docs.rs](https://img.shields.io/docsrs/scrive-iced)](https://docs.rs/scrive-iced)
+
 A from-scratch code-editor widget for [iced](https://iced.rs) — a headless
 editing engine plus an `iced::advanced::Widget` that renders it.
 
