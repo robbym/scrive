@@ -223,3 +223,62 @@ vs K → 2K when forced down the walk fallback. Behaviour is pinned by
 `checkpoint_tree_equals_the_vec_reference_under_random_edits`, an edit-for-edit
 oracle against the retained flat-Vec algorithm; `--capture` PNGs are unaffected —
 checkpoints are internal state cache.)
+
+## Rope stage 3 (2026-07-17) — inline chunks + seam coalescing
+
+Two changes to the leaf chunk, benched together because they are entangled:
+inline storage is only safe once fill is bounded.
+
+- `Chunk(String)` → `Chunk(ArrayString<CHUNK_MAX>)`. The bytes live in the leaf
+  rather than behind a pointer, so a chunk costs no allocation of its own
+  (~78k of them per 10 MB on load) and a copy-on-write leaf clone is a flat
+  memcpy instead of a walk of scattered pointers. Same choice zed's rope makes,
+  at the same 128-byte chunk size.
+- `Rope::replace` coalesces. It re-chunks a *window* around the edit instead of
+  splicing at the endpoints, snapping the window to chunk boundaries (splitting
+  mid-chunk would create the very fragment it removes) and walking it past any
+  sub-`CHUNK_MIN` neighbour (a seam is one byte longer than the window it
+  replaced, so its remainder otherwise lands just outside the next edit's window
+  and escapes forever — one per keystroke).
+
+**These numbers are NOT comparable to the sections above**: different machine,
+and the workspace `[profile.release]` / `[profile.bench]` overrides those rows
+were taken under have since been dropped. Only the before→after delta *within*
+this section is meaningful. Both columns were measured back-to-back on the same
+box, and an identical-code control run first established a **±5–9% noise floor**
+(an earlier attempt was thrown away entirely: the box was drifting so hard that
+the same code measured 174 µs → 234 µs across two runs, and criterion reported
+the drift as a confident p=0.00 regression).
+
+| bench                | 100 KB       | 1 MB           | 10 MB          |
+|----------------------|--------------|----------------|----------------|
+| keystroke/insert_mid | 167 → 158 µs | 1.24 → 1.16 ms | 27.5 → 25.3 ms |
+| keystroke/enter_mid  | 146 → 141 µs | 1.20 → 1.18 ms | 26.2 → 23.6 ms |
+| keystroke/undo_step  | 118 → 112 µs | 1.13 → 1.09 ms | 25.7 → 23.6 ms |
+| rope/load (NEW)      | 407 → 389 µs | 4.44 → 4.26 ms | 77.1 → 69.6 ms |
+
+A net win everywhere, growing with document size. Read it honestly: only the
+10 MB column (keystroke −9…−12%, load −11%) clears the noise floor; the 100 KB
+and 1 MB deltas (−3…−7%) sit inside it and mean "not a regression", not a
+measured gain. The direction matters more than the magnitude — coalescing adds
+per-edit copying and still comes out ahead, because the shallower tree pays for
+it.
+
+`rope/load` is new here: the load path is one chunk construction per 128 bytes,
+which isolates the chunk's storage from everything the keystroke benches mix in.
+
+The anti-fragmentation result is an op count, so it lives in a unit test
+(`chunk_count_stays_proportional_to_bytes_not_edits`) rather than in this file:
+200 keystrokes at one caret took a 61-chunk rope to **262 chunks** before — the
+sizes at the caret reading `[1, 1, 1, …]`, one chunk per character, growth in
+*keystrokes* rather than bytes — and to **64** after, at 98% average fill.
+
+**Residual, honestly:** `replace` now copies a ~384-byte seam per edit that it
+did not before. That shows up nowhere above, but it is real work on the
+keystroke path. The undersized-neighbour walk is unbounded by construction: a
+step or two once the invariant holds, longer on an already-fragmented rope —
+which is the direction the cost should run, since it heals as it goes. And the
+benches cannot see the fragmented steady state at all (`iter_batched` hands
+every iteration a pristine rope from `from_str`), so the gain from a shallower
+tree during a *real* editing session is not measured here — only the canary
+speaks to it, and it is the larger of the two effects.

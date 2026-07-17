@@ -322,6 +322,21 @@ fn snapshot(c: &mut Criterion) {
     g.finish();
 }
 
+fn rope(c: &mut Criterion) {
+    let mut g = c.benchmark_group("rope");
+    g.sample_size(20).measurement_time(Duration::from_secs(3));
+    // The load path is where the rope's per-chunk cost is most visible: chunking
+    // packs the whole document into `CHUNK_MAX`-byte leaves, so this is one
+    // chunk construction per 128 bytes — ~78k of them per 10 MB. It isolates the
+    // chunk's *storage* from every other cost the keystroke benches mix in.
+    for (label, text) in support::sized() {
+        g.bench_function(format!("load_{label}"), |b| {
+            b.iter(|| black_box(Document::new(black_box(&text)).expect("bench doc loads")));
+        });
+    }
+    g.finish();
+}
+
 fn brackets(c: &mut Criterion) {
     let mut g = c.benchmark_group("brackets");
     g.sample_size(20).measurement_time(Duration::from_secs(3));
@@ -336,5 +351,7 @@ fn brackets(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, keystroke, find, highlight, checkpoints, query, snapshot, brackets);
+criterion_group!(
+    benches, keystroke, find, highlight, checkpoints, query, snapshot, rope, brackets
+);
 criterion_main!(benches);

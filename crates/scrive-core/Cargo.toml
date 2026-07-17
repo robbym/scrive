@@ -21,6 +21,13 @@ autobenches = false
 #               public API (wrapped).
 #   memchr    — line-index and substring scanning.
 #   thiserror — transaction/load error enums.
+#   arrayvec  — the rope chunk's inline storage (`ArrayString<CHUNK_MAX>`).
+#               A chunk is build-once, read-only, and ≤ CHUNK_MAX bytes by
+#               construction, so it has no use for a heap allocation of its own:
+#               inline storage puts its bytes in the leaf itself, which is what
+#               removes one malloc per chunk from the load and per-edit
+#               re-chunk paths (~78k chunks per 10 MB). Same choice zed's rope
+#               makes, at the same 128-byte chunk size.
 #   regex     — find's whole-word and regex modes. Types stay OUT of the public
 #               API (wrapped), like syntect's. Deliberately `regex` and NOT the
 #               `fancy-regex` syntect already pulls in: a find pattern arrives
@@ -34,6 +41,7 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 memchr = "2"      # find scanning (memmem/memchr2) + test oracles
 thiserror = "2"   # error enums (LoadError, TransactionError)
 regex = "1"       # find's whole-word + regex modes (wrapped; never public)
+arrayvec = "0.7"  # the rope chunk's inline storage (wrapped; never public)
 
 [dev-dependencies]
 # criterion: the wall-clock bench harness (op-count canaries live in unit tests;

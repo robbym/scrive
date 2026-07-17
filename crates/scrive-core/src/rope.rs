@@ -11,15 +11,55 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use arrayvec::ArrayString;
+
 use crate::coords::Point;
 use crate::sum_tree::{Dimension, Item, SumTree, Summary};
 
-/// Target bytes per leaf chunk; `from_str` packs to this, edits re-chunk their
-/// inserted text to it (seam fragments are left for a later coalescing pass).
+/// Target bytes per leaf chunk; `from_str` packs to this, and every edit
+/// re-chunks its seam to it ([`Rope::replace`]).
 const CHUNK_MAX: usize = 128;
 
+/// The fill floor the chunking maintains **on average**: a rope of `n` bytes
+/// holds at most `n / CHUNK_MIN` chunks, however it was edited.
+///
+/// This is not a per-chunk minimum — re-chunking a seam always leaves one
+/// remainder, which can be a single byte — it is the anti-fragmentation
+/// invariant, and the reason [`Rope::replace`] coalesces instead of splicing
+/// naively. Without it, chunk count grows with *keystrokes* rather than bytes:
+/// a naive splice puts the typed text in its own chunk and the caret then sits
+/// on that chunk's boundary, so every subsequent character adds another 1-byte
+/// chunk. That deepens the tree and inflates every O(log n) read and every
+/// summary fold — pinned by `chunk_count_stays_proportional_to_bytes_not_edits`.
+const CHUNK_MIN: usize = CHUNK_MAX / 2;
+
+/// One leaf chunk: **inline** bytes, never a heap allocation of its own.
+///
+/// A chunk is build-once and read-only — nothing ever grows one in place; the
+/// edit paths rebuild a span's text and re-chunk it wholesale ([`Rope::replace`]
+/// re-chunks its seam, [`rebuild_leaf`] a whole leaf).
+/// So its capacity is fixed at [`CHUNK_MAX`] by construction, and paying a
+/// `String`'s pointer indirection + allocation per chunk buys nothing: a 10 MB
+/// document is ~78k chunks, i.e. ~78k allocations on load and up to one per
+/// chunk again on every leaf rebuild.
+///
+/// Inline storage puts the bytes in the leaf's own array instead, so a leaf
+/// clone — which copy-on-write does on *every* edit that touches it — is a flat
+/// memcpy rather than a walk of scattered pointers.
+///
+/// [`ArrayString`] panics rather than growing past its capacity; that is a
+/// feature here, since it makes the ≤ [`CHUNK_MAX`] invariant load-bearing
+/// instead of implicit. Every construction site goes through a checked
+/// `from`/`expect` that names the invariant it relies on.
 #[derive(Clone, Debug)]
-struct Chunk(String);
+struct Chunk(ArrayString<CHUNK_MAX>);
+
+/// Build a chunk from `s`, which must already be `<= CHUNK_MAX` bytes — the ONE
+/// place the capacity invariant is enforced, so a violation names itself instead
+/// of surfacing as a truncation.
+fn chunk_of(s: &str) -> Chunk {
+    Chunk(ArrayString::from(s).expect("chunks are split to <= CHUNK_MAX by construction"))
+}
 
 /// The monoid behind every line/point query: total bytes, `\n` count, and bytes
 /// since the last `\n` (all bytes when the run has none) — enough to fold a
@@ -234,21 +274,89 @@ impl Rope {
         self.0.item_refs().into_iter().map(|c| c.0.as_str())
     }
 
-    /// Replace byte `range` with `text` (already LF-only), O(log n + |text|). Both
-    /// endpoints are split precisely (mid-chunk if needed).
+    /// Replace byte `range` with `text` (already LF-only), O(log n + |text|).
+    ///
+    /// **Coalescing.** Splicing naively — split at both ends, drop `text` in as
+    /// its own chunk — is what fragments the rope: the two splits each leave an
+    /// undersized remainder, `text` becomes a chunk however short it is, and the
+    /// caret then sits on that chunk's boundary, so the next keystroke adds
+    /// another 1-byte chunk beside it. Typing a word leaves one chunk per letter
+    /// and the count grows with keystrokes, not bytes.
+    ///
+    /// So instead of splicing at the endpoints, this peels a **window** of
+    /// [`CHUNK_MAX`] bytes either side of the edit, rebuilds that whole span as
+    /// one string, and re-chunks it packed. The window is what makes it
+    /// self-healing rather than merely tidy: a previous edit here can only have
+    /// left a remainder of `< CHUNK_MAX` bytes, so the next edit's window is
+    /// guaranteed to swallow and repack it. Fragments can never accumulate,
+    /// which is the [`CHUNK_MIN`] invariant.
+    ///
+    /// Cost is unchanged in class: the peeled span is `<= 2 * CHUNK_MAX +
+    /// text.len()`, i.e. O(|text|) extra copying on top of the same two splits
+    /// and two appends.
     pub fn replace(&mut self, range: Range<u32>, text: &str) {
         let start = range.start.min(self.len());
         let end = range.end.min(self.len()).max(start);
-        let left = self.split_byte(start).0;
-        let right = self.split_byte(end).1;
-        let mid = SumTree::from_items(chunk_str(text));
-        self.0 = left.append(&mid).append(&right);
+        // The peel window, snapped OUTWARD to CHUNK boundaries — not merely to
+        // char boundaries. This is load-bearing: splitting at an arbitrary offset
+        // cuts a chunk in two and leaves an undersized half on the far side of
+        // the window, which is exactly the fragment this method exists to
+        // prevent. Snapping to a boundary means the splits fall BETWEEN chunks
+        // and create nothing. (Chunk boundaries are char boundaries by
+        // construction, so the str contract comes along for free.)
+        let mut lo = self.chunk_at(start.saturating_sub(CHUNK_MAX as u32)).1;
+        let probe = end.saturating_add(CHUNK_MAX as u32);
+        let mut hi = if probe >= self.len() {
+            self.len()
+        } else {
+            let (c, cs) = self.chunk_at(probe);
+            cs + c.len() as u32
+        };
+        // Then keep going past any UNDERSIZED chunk on either side. This is the
+        // part that makes coalescing converge rather than merely tidy up: the
+        // seam is one byte longer than the window it replaced, so ITS remainder
+        // lands just *outside* where the next keystroke's window would stop. A
+        // window that halts at a fixed `± CHUNK_MAX` can never reach that
+        // remainder, and one escapes per keystroke — the original bug, only
+        // slower. Swallowing sub-`CHUNK_MIN` neighbours instead means every
+        // fragment is repacked by the next edit that comes near it.
+        //
+        // Bounded in practice by the invariant itself: re-chunking leaves at most
+        // one undersized chunk per seam, so these walks take a step or two. On a
+        // rope that is already fragmented they take more and heal it — which is
+        // the direction you want the cost to run.
+        while lo > 0 {
+            let (c, cs) = self.chunk_at(lo - 1);
+            if c.is_empty() || c.len() >= CHUNK_MIN {
+                break;
+            }
+            lo = cs;
+        }
+        while hi < self.len() {
+            let (c, cs) = self.chunk_at(hi);
+            if c.is_empty() || c.len() >= CHUNK_MIN {
+                break;
+            }
+            hi = cs + c.len() as u32;
+        }
+        // Read the whole seam before rebuilding: everything outside `lo..hi` is
+        // untouched and stays structurally shared.
+        let head = self.split_byte(lo).0;
+        let tail = self.split_byte(hi).1;
+        let mut seam =
+            String::with_capacity((hi - lo) as usize - (end - start) as usize + text.len());
+        seam.push_str(&self.slice(lo..start));
+        seam.push_str(text);
+        seam.push_str(&self.slice(end..hi));
+        let mid = SumTree::from_items(chunk_str(&seam));
+        self.0 = head.append(&mid).append(&tail);
     }
 
     fn split_byte(&self, offset: u32) -> (SumTree<Chunk>, SumTree<Chunk>) {
         self.0.split_with(&ByteDim(offset), &mut |chunk: &Chunk, start: &ByteDim, at: &ByteDim| {
             let pos = (at.0 - start.0) as usize;
-            (Chunk(chunk.0[..pos].to_string()), Chunk(chunk.0[pos..].to_string()))
+            // Both halves of a <= CHUNK_MAX chunk are <= CHUNK_MAX.
+            (chunk_of(&chunk.0[..pos]), chunk_of(&chunk.0[pos..]))
         })
     }
 
@@ -307,7 +415,7 @@ fn chunk_str(s: &str) -> Vec<Chunk> {
             end -= 1;
         }
         debug_assert!(end > start, "a single char cannot exceed CHUNK_MAX");
-        chunks.push(Chunk(s[start..end].to_string()));
+        chunks.push(chunk_of(&s[start..end])); // `end - start <= CHUNK_MAX` by the walk above
         start = end;
     }
     chunks
@@ -418,6 +526,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The anti-fragmentation canary: chunk count tracks BYTES, not keystrokes.
+    ///
+    /// Fails hard against a naive splice — typing N characters used to leave N
+    /// one-byte chunks (measured: 100 keystrokes took a 61-chunk rope to 162
+    /// chunks, 101 of them under `CHUNK_MIN`, the sizes at the caret reading
+    /// `[1, 1, 1, ...]`). That is unbounded growth in edits, and it deepens the
+    /// tree and inflates every O(log n) read.
+    ///
+    /// Asserted as AVERAGE fill, not a per-chunk floor, because re-chunking a
+    /// seam always leaves one remainder that may legitimately be tiny. Op counts
+    /// only — no wall-clock — so it holds on any machine.
+    #[test]
+    fn chunk_count_stays_proportional_to_bytes_not_edits() {
+        let text = "lorem ipsum dolor sit amet consectetur ".repeat(200);
+        let mut r = Rope::from_str(&text);
+        let packed = r.chunks().count();
+        assert!(
+            packed <= r.len() as usize / CHUNK_MIN,
+            "a freshly packed rope must already satisfy the invariant"
+        );
+
+        // Type a run at one spot — the case that fragments, because after the
+        // first keystroke the caret sits on a chunk boundary.
+        let base = (text.len() / 2) as u32;
+        for at in base..base + 200 {
+            r.replace(at..at, "x");
+        }
+        let n = r.chunks().count();
+        eprintln!(
+            "[rope] packed {packed} chunks -> {n} after 200 keystrokes ({} bytes, avg fill {}, \
+             ceiling {})",
+            r.len(),
+            r.len() as usize / n,
+            r.len() as usize / CHUNK_MIN
+        );
+        assert!(
+            n <= r.len() as usize / CHUNK_MIN,
+            "typing fragmented the rope: {n} chunks for {} bytes (max {}), sizes {:?}",
+            r.len(),
+            r.len() as usize / CHUNK_MIN,
+            r.chunks().map(str::len).collect::<Vec<_>>()
+        );
+
+        // Scattered edits, deletions, and multi-byte inserts must not either.
+        for i in 0..200u32 {
+            let at = (i * 37) % (r.len().saturating_sub(8));
+            let at = (0..=at).rev().find(|&o| r.is_char_boundary(o)).unwrap_or(0);
+            r.replace(at..at, "ß");
+        }
+        for _ in 0..200 {
+            let at = r.len() / 3;
+            let at = (0..=at).rev().find(|&o| r.is_char_boundary(at.min(o))).unwrap_or(0);
+            let end = (at + 1..=r.len()).find(|&o| r.is_char_boundary(o)).unwrap_or(r.len());
+            r.replace(at..end, "");
+        }
+        let n = r.chunks().count();
+        assert!(
+            n <= r.len() as usize / CHUNK_MIN,
+            "scattered edits fragmented the rope: {n} chunks for {} bytes (max {})",
+            r.len(),
+            r.len() as usize / CHUNK_MIN
+        );
+        // Nothing above may exceed the capacity the chunk type is built on.
+        assert!(r.chunks().all(|c| c.len() <= CHUNK_MAX));
     }
 
     #[test]
