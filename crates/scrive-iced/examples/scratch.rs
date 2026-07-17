@@ -27,7 +27,7 @@ mod capture;
 use std::time::Instant;
 
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::operation::focus;
+use iced::widget::operation::{focus, focus_next, focus_previous, is_focused};
 use iced::widget::{button, column, container, row, stack, text, text_input};
 use iced::{Alignment, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector};
 use std::ops::Range;
@@ -807,13 +807,20 @@ impl Default for App {
     }
 }
 
-#[derive(Debug, Clone)]
+// `PartialEq` so the chord table can be asserted directly (`Action` already
+// derives it, and every other payload is a `String`/`bool`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     Editor(Action),
     /// Open the find bar (Ctrl+F) and focus its input.
     OpenFind,
     /// Open the find bar with the replace row already expanded (Ctrl+H).
     OpenReplace,
+    /// Tab / Shift+Tab: move focus to the next / previous input.
+    CycleFocus { back: bool },
+    /// A left press landed somewhere — re-assert single focus (see
+    /// [`App::resync_focus`]).
+    PointerDown,
     /// Close the find bar (Escape / ✕), clear the query, refocus the editor.
     CloseFind,
     /// The find query text changed — re-scan synchronously.
@@ -857,6 +864,32 @@ impl App {
         self.find_open = false;
         self.find_query.clear();
         self.doc.set_find_query(None, self.now_ms());
+    }
+
+    /// Re-assert SINGLE focus after a press — the repair for a genuine
+    /// double-focus hole in the stack.
+    ///
+    /// A click inside a bar input focuses that input *natively* and captures the
+    /// event, and iced's `Stack` stops dispatching the moment a child captures
+    /// (`stack.rs`: `if shell.is_event_captured() { return; }`). The editor sits
+    /// under that overlay, so its `update` never runs — and it is the editor's
+    /// own press handler that would have unfocused it. Two widgets are then both
+    /// convinced they hold focus.
+    ///
+    /// That was invisible for as long as every key the bar cares about was
+    /// captured by the input (a character, Enter, Escape) — the editor never saw
+    /// them. Tab is the first key `text_input` does NOT capture, so it falls
+    /// through to a stale-focused editor, which indents instead of moving focus.
+    ///
+    /// `focus(id)` unfocuses every OTHER focusable, so focusing whichever input
+    /// iced reports as focused is exactly the repair. When the press landed in
+    /// the editor instead, neither input is focused and both arms are no-ops —
+    /// the editor already handled its own focus correctly.
+    fn resync_focus() -> Task<Msg> {
+        Task::batch([
+            is_focused(FIND_INPUT).then(|f| if f { focus(FIND_INPUT) } else { Task::none() }),
+            is_focused(REPLACE_INPUT).then(|f| if f { focus(REPLACE_INPUT) } else { Task::none() }),
+        ])
     }
 
     /// Push the live query text + its options into the document — the ONE place
@@ -1030,6 +1063,21 @@ impl App {
                 self.replace_open = true;
                 self.update(Msg::OpenFind)
             }
+            // Only reachable when nothing captured Tab (see the subscription),
+            // so this never fights the editor's indent. Buttons are not
+            // focusable in iced, so the cycle is exactly find → replace →
+            // editor, skipping the icon row.
+            Msg::CycleFocus { back } => {
+                if back {
+                    focus_previous()
+                } else {
+                    focus_next()
+                }
+            }
+            // Only while the bar is open: with no inputs in the tree there is no
+            // second focusable to desync against, and this would cost two
+            // tree-walking operations on every click in the editor.
+            Msg::PointerDown if self.find_open => Self::resync_focus(),
             Msg::CloseFind if self.find_open => {
                 self.close_find(); // drop matches + decorations
                 focus(EDITOR) // hand focus back to the editor
@@ -1182,7 +1230,8 @@ impl App {
             | Msg::FindSelectAll
             | Msg::ReplaceOne
             | Msg::ReplaceAll
-            | Msg::ToggleFindInSelection => Task::none(),
+            | Msg::ToggleFindInSelection
+            | Msg::PointerDown => Task::none(),
         }
     }
 
@@ -1680,6 +1729,14 @@ impl App {
         // The one gap between every control in the panel — shared so the
         // derived toggle-cluster width below matches the row it mirrors.
         const SPACING: f32 = 4.0;
+        // One row's height. Pinned rather than left to iced's intrinsic
+        // `text_input` sizing, because the chevron must span the rows EXACTLY:
+        // deriving both from one number is what stops them drifting apart. A
+        // hair over the input's natural height (25 px at size 13 + padding 4),
+        // so nothing clips. `Length::Fill` cannot do this job — a Fill child in
+        // a Shrink row propagates upward and stretches the whole panel to the
+        // viewport.
+        const ROW_H: f32 = 26.0;
         // Colors are neutral dark-theme grays (theme-agnostic) so the find bar
         // reads as standard editor chrome over the dark editor theme.
         //
@@ -1714,14 +1771,15 @@ impl App {
             .size(13)
             .width(Length::Fixed(INPUT_W))
             .style(input_style);
-        // Every button in the bar is this 22×22 square.
+        // Every button in the bar is this wide; all but the chevron are square.
         const BTN_W: f32 = 22.0;
         // Flat icon buttons: transparent at rest, translucent gray on hover.
         // `on` LATCHES that background and adds the focus-blue border, so an
         // engaged option (`Aa`) reads as pressed at rest rather than only under
         // the pointer — a toggle whose state you cannot see is a trap.
+        // `height` is a parameter only so the chevron can span both rows.
         // Glyphs are Codicons, rendered in the bundled font.
-        let icon_btn = |glyph: char, on: bool, msg| {
+        let sized_btn = |glyph: char, on: bool, msg, height: Length| {
             button(
                 text(glyph.to_string())
                     .font(scrive_iced::CODICON)
@@ -1732,7 +1790,7 @@ impl App {
                     .align_y(Vertical::Center),
             )
             .width(Length::Fixed(BTN_W))
-            .height(Length::Fixed(BTN_W))
+            .height(height)
             .padding(0)
             .on_press(msg)
             .style(move |_theme, status| {
@@ -1750,8 +1808,9 @@ impl App {
                 }
             })
         };
-        // The plain (never-latched) action buttons.
-        let btn = |glyph: char, msg| icon_btn(glyph, false, msg);
+        // The square variants: a latching option toggle, and a plain action.
+        let icon_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, Length::Fixed(BTN_W));
+        let btn = |glyph: char, msg| sized_btn(glyph, false, msg, Length::Fixed(BTN_W));
         // The find row's option toggles — each one part of the QUERY, not chrome.
         // The replace row mirrors this cluster with an empty slot of the same
         // width so the two rows' buttons line up; deriving that width from this
@@ -1781,6 +1840,7 @@ impl App {
             btn(scrive_iced::icon::CLOSE, Msg::CloseFind), // close
         ]
         .spacing(SPACING)
+        .height(Length::Fixed(ROW_H))
         .align_y(Alignment::Center);
         let rows = if self.replace_open {
             let replace_row = row![
@@ -1804,22 +1864,33 @@ impl App {
                 btn(scrive_iced::icon::REPLACE_ALL, Msg::ReplaceAll), // …and every other one
             ]
             .spacing(SPACING)
+            .height(Length::Fixed(ROW_H))
             .align_y(Alignment::Center);
             column![find_row, replace_row].spacing(SPACING)
         } else {
             column![find_row]
         };
         container(
-            // The chevron sits left of BOTH rows, so it reads as a handle on the
-            // whole panel rather than as another find-row button.
             row![
-                btn(
+                // The chevron is a handle on the WHOLE panel, so it spans both
+                // rows rather than sitting beside them as one more 22×22 button
+                // — its hit target grows with the bar it toggles, which is both
+                // VS Code's shape and the honest one: it acts on the panel, not
+                // on the query row it happens to sit next to.
+                sized_btn(
                     if self.replace_open {
                         scrive_iced::icon::CHEVRON_DOWN
                     } else {
                         scrive_iced::icon::CHEVRON_RIGHT
                     },
-                    Msg::ToggleReplace
+                    false,
+                    Msg::ToggleReplace,
+                    // Exactly the rows it spans — both derived from `ROW_H`.
+                    Length::Fixed(if self.replace_open {
+                        ROW_H * 2.0 + SPACING
+                    } else {
+                        ROW_H
+                    }),
                 ),
                 rows,
             ]
@@ -1869,28 +1940,18 @@ impl App {
         // one press. It filter-maps, so non-find keys produce no message, and the
         // editor's own captured keystrokes still route through the widget. The
         // closure is a fn (non-capturing), so `find_open` is gated in `update`.
-        let keys = iced::event::listen_with(|event, _status, _window| {
-            use iced::keyboard::{key::Named, Event, Key};
-            let iced::Event::Keyboard(Event::KeyPressed { key, modifiers, .. }) = event else {
-                return None;
-            };
-            match key {
-                Key::Character(c) if (modifiers.command() || modifiers.control()) && c.as_str() == "f" => {
-                    Some(Msg::OpenFind)
-                }
-                // Ctrl+H — find, with the replace row already expanded.
-                Key::Character(c) if (modifiers.command() || modifiers.control()) && c.as_str() == "h" => {
-                    Some(Msg::OpenReplace)
-                }
-                Key::Named(Named::Escape) => Some(Msg::CloseFind),
-                // Alt+Enter: select all matches — safe as a global chord
-                // because the editor deliberately ignores Alt+Enter (no
-                // newline dispatched alongside it). Plain Enter is NOT handled
-                // here: in the input it navigates via `on_submit`; in the
-                // editor it must only type a newline.
-                Key::Named(Named::Enter) if modifiers.alt() => Some(Msg::FindSelectAll),
-                _ => None,
+        let keys = iced::event::listen_with(|event, status, _window| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key, modifiers, ..
+            }) => find_chord(&key, modifiers, status),
+            // A press can move focus NATIVELY, behind the app's back, and leave
+            // two widgets focused — see `App::resync_focus`. Watched here rather
+            // than through a widget callback because the press that causes it is
+            // captured by the input and never surfaces as one.
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+                Some(Msg::PointerDown)
             }
+            _ => None,
         });
         Subscription::batch([keys, sweep, relint])
     }
@@ -1922,6 +1983,43 @@ pub fn scrive_dark() -> Theme {
             danger: Color::from_rgb8(0xe0, 0x57, 0x5b),     // red
         },
     )
+}
+
+/// The find bar's global chord table — a free fn, so it is testable without a
+/// window (the same shape as the widget's own `interpret_key`).
+///
+/// `status` is what the widget tree did with the key BEFORE this saw it, and it
+/// is load-bearing for Tab: see the `Named::Tab` arm.
+fn find_chord(
+    key: &iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+    status: iced::event::Status,
+) -> Option<Msg> {
+    use iced::keyboard::{key::Named, Key};
+    let ctrl = modifiers.command() || modifiers.control();
+    match key {
+        Key::Character(c) if ctrl && c.as_str() == "f" => Some(Msg::OpenFind),
+        // Ctrl+H — find, with the replace row already expanded.
+        Key::Character(c) if ctrl && c.as_str() == "h" => Some(Msg::OpenReplace),
+        Key::Named(Named::Escape) => Some(Msg::CloseFind),
+        // Alt+Enter: select all matches — safe as a global chord because the
+        // editor deliberately ignores Alt+Enter (no newline dispatched
+        // alongside it). Plain Enter is NOT handled here: in the input it
+        // navigates via `on_submit`; in the editor it must only type a newline.
+        Key::Named(Named::Enter) if modifiers.alt() => Some(Msg::FindSelectAll),
+        // Tab moves focus between the bar's inputs — but ONLY when nothing else
+        // took the key. The editor CAPTURES Tab (it indents), so gating on
+        // `Ignored` is exactly what keeps indent working while the bar is open:
+        // a focused editor swallows Tab before this is ever called. iced's
+        // `text_input` leaves keys it does not handle uncaptured (its match's
+        // arms are `_ => {}`, no `capture_event`), so a focused input falls
+        // through to here instead. Buttons are not focusable in iced, so the
+        // cycle is exactly find → replace → editor.
+        Key::Named(Named::Tab) if status == iced::event::Status::Ignored => {
+            Some(Msg::CycleFocus { back: modifiers.shift() })
+        }
+        _ => None,
+    }
 }
 
 fn theme(_state: &App) -> Theme {
@@ -2156,6 +2254,224 @@ mod tests {
         let _ = app.update(Msg::ToggleFindInSelection);
         assert!(!app.scoped());
         assert_eq!(app.doc.find_match_count(), all);
+    }
+
+    /// Clicking a bar input must not leave the editor stealing Tab.
+    ///
+    /// The repro, end to end: Tab out to the editor, CLICK the find input, press
+    /// Tab. It must move focus — not indent the document.
+    ///
+    /// A click inside the input focuses it *natively* and captures, and iced's
+    /// `Stack` stops dispatching on capture, so the editor's press handler — the
+    /// one that would unfocus it — never runs. Both stay focused, and Tab (the
+    /// one key `text_input` does not capture) falls through to the editor. This
+    /// has to drive the REAL widget tree, because the bug is in that
+    /// integration: no smaller test can see it.
+    #[test]
+    fn clicking_a_bar_input_stops_the_editor_stealing_tab() {
+        use iced::advanced::widget::Operation;
+        use iced::advanced::{clipboard, renderer};
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        use iced::{mouse, Event, Font, Pixels, Point, Size, Theme};
+        use iced_runtime::task;
+        use iced_runtime::user_interface::{Cache, UserInterface};
+        use std::task::{Context, Poll, Waker};
+
+        const W: f32 = 900.0;
+        const H: f32 = 560.0;
+        let mut renderer = iced_renderer::fallback::Renderer::Secondary(
+            iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
+        );
+        let theme = scrive_dark();
+        let mut app = App::default();
+        let mut cache = Cache::new();
+        // Messages queued for the NEXT frame — the queue iced's runtime keeps
+        // between the update pass and the operation pass. Their tasks are driven
+        // at the top of the next frame, against that frame's built UI.
+        let mut pending: Vec<Msg> = vec![Msg::OpenReplace];
+
+        // One frame. Faithful enough to drive the focus operations these messages
+        // emit — which the recorder's simpler `drain` cannot, because it drops the
+        // task stream at the first `Pending` and loses the continuation. The
+        // trick: a `widget::operate` task yields its op, and re-polling the SAME
+        // stream AFTER the op runs yields whatever the op's result fed into
+        // (`is_focused(id).then(focus)` becomes the `focus` op only once the
+        // `is_focused` op has produced its bool). So each stream is polled,
+        // operated, and RE-polled in a loop.
+        let mut frame = |app: &mut App,
+                         cache: &mut Cache,
+                         pending: &mut Vec<Msg>,
+                         events: &[Event],
+                         cursor: mouse::Cursor| {
+            // Streams must be built BEFORE the UI borrows `app` immutably — the
+            // relevant tasks (focus / resync) emit only operations, never app
+            // messages, so nothing here needs a mid-flight `app.update`.
+            let mut streams: Vec<_> = pending
+                .drain(..)
+                .filter_map(|m| task::into_stream(app.update(m)))
+                .collect();
+            let mut ui: UserInterface<'_, Msg, Theme, iced::Renderer> = UserInterface::build(
+                app.view(),
+                Size::new(W, H),
+                std::mem::take(cache),
+                &mut renderer,
+            );
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            for mut stream in streams.drain(..) {
+                loop {
+                    match stream.as_mut().poll_next(&mut cx) {
+                        Poll::Ready(Some(iced_runtime::Action::Widget(op))) => {
+                            // Run the op (following its chain — `focus_next`
+                            // counts then moves), which feeds its result back into
+                            // the stream; the loop re-polls for the continuation.
+                            let mut current = Some(op);
+                            while let Some(mut op) = current.take() {
+                                ui.operate(&renderer, op.as_mut());
+                                if let iced::advanced::widget::operation::Outcome::Chain(next) =
+                                    op.finish()
+                                {
+                                    current = Some(next);
+                                }
+                            }
+                        }
+                        // These focus tasks never output an app message; if one
+                        // ever did, deferring it to the next frame is the honest
+                        // thing (we cannot `app.update` while the UI borrows it).
+                        Poll::Ready(Some(iced_runtime::Action::Output(m))) => pending.push(m),
+                        Poll::Ready(Some(_)) => {}
+                        Poll::Ready(None) | Poll::Pending => break,
+                    }
+                }
+            }
+            let mut published: Vec<Msg> = Vec::new();
+            let (_, statuses) =
+                ui.update(events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
+            ui.draw(&mut renderer, &theme, &renderer::Style::default(), cursor);
+            *cache = ui.into_cache();
+            // Editor actions the widget published (e.g. Tab → indent) are plain
+            // doc mutations with no widget operations, so apply them NOW rather
+            // than deferring — otherwise a caller sees stale text this frame.
+            for m in published {
+                let _ = app.update(m);
+            }
+            // Stand in for the `listen_with` subscription: iced hands it each
+            // event WITH the status the widget tree produced, which is exactly
+            // what the Tab gate reads.
+            for (ev, status) in events.iter().zip(statuses) {
+                let msg = match ev {
+                    Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key, modifiers, ..
+                    }) => find_chord(key, *modifiers, status),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                        Some(Msg::PointerDown)
+                    }
+                    _ => None,
+                };
+                pending.extend(msg);
+            }
+        };
+
+        let away = mouse::Cursor::Available(Point::new(W / 2.0, H - 8.0));
+        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let tab = Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Tab),
+            modified_key: Key::Named(Named::Tab),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: Modifiers::default(),
+            text: None,
+            repeat: false,
+        });
+
+        // Settle: two empty frames so `OpenReplace`'s focus op applies and the
+        // bar's inputs are in the tree.
+        frame(&mut app, &mut cache, &mut pending, &[], away);
+        frame(&mut app, &mut cache, &mut pending, &[], away);
+
+        // Baseline: CLICK the editor (`away` is deep in the text). The press
+        // focuses the editor natively AND routes through `PointerDown` →
+        // `resync_focus`, which clears the find input. Tab then indents, proving
+        // the editor holds focus.
+        frame(&mut app, &mut cache, &mut pending, std::slice::from_ref(&click), away);
+        frame(&mut app, &mut cache, &mut pending, &[], away); // apply resync
+        let before = app.doc.text().into_owned();
+        frame(&mut app, &mut cache, &mut pending, std::slice::from_ref(&tab), away);
+        assert_ne!(
+            app.doc.text(),
+            before.as_str(),
+            "precondition: after clicking the editor, Tab must indent"
+        );
+        app.apply(Action::Undo);
+
+        // THE REPRO. Click the find input (its box is at ~y=26, left of the
+        // toggles), then Tab. Before the fix, the click focused the input
+        // natively but never unfocused the editor (its press was captured, so the
+        // Stack stopped dispatching and the editor's unfocus never ran), leaving
+        // TWO widgets focused; Tab then reached the still-focused editor and
+        // indented. It must NOT.
+        // On the find input's box (measured: its #3C3C3C field covers x≈500,
+        // y≈14–38; x=600 is past it, over the toggles).
+        let on_input = mouse::Cursor::Available(Point::new(500.0, 26.0));
+        frame(&mut app, &mut cache, &mut pending, &[click], on_input);
+        frame(&mut app, &mut cache, &mut pending, &[], on_input); // apply resync
+        let before = app.doc.text().into_owned();
+        frame(&mut app, &mut cache, &mut pending, &[tab], on_input);
+        assert_eq!(
+            app.doc.text(),
+            before.as_str(),
+            "the editor kept focus after the input was clicked and stole Tab to indent"
+        );
+    }
+
+    /// The bar's global chords, and — the load-bearing one — that Tab only moves
+    /// focus when nothing else took the key.
+    ///
+    /// The editor captures Tab to indent (`interpret_key` → `capture_event`), so
+    /// a `Captured` status MUST yield nothing here: otherwise opening the find
+    /// bar would break Tab-to-indent in the editor, which is exactly the kind of
+    /// global-chord collision the app-side chrome has to avoid.
+    #[test]
+    fn tab_cycles_focus_only_when_nothing_else_took_the_key() {
+        use iced::event::Status;
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        const TAB: Key = Key::Named(Named::Tab);
+
+        // A focused editor captured it ⇒ it is an indent, not a focus move.
+        assert_eq!(find_chord(&TAB, Modifiers::default(), Status::Captured), None);
+        assert_eq!(find_chord(&TAB, Modifiers::SHIFT, Status::Captured), None);
+        // Nobody took it (a focused text_input leaves Tab uncaptured) ⇒ cycle.
+        assert_eq!(
+            find_chord(&TAB, Modifiers::default(), Status::Ignored),
+            Some(Msg::CycleFocus { back: false })
+        );
+        assert_eq!(
+            find_chord(&TAB, Modifiers::SHIFT, Status::Ignored),
+            Some(Msg::CycleFocus { back: true })
+        );
+
+        // The rest of the table, so a new arm cannot quietly shadow one.
+        let ign = Status::Ignored;
+        assert_eq!(
+            find_chord(&Key::Character("f".into()), Modifiers::CTRL, ign),
+            Some(Msg::OpenFind)
+        );
+        assert_eq!(
+            find_chord(&Key::Character("h".into()), Modifiers::CTRL, ign),
+            Some(Msg::OpenReplace)
+        );
+        assert_eq!(find_chord(&Key::Named(Named::Escape), Modifiers::default(), ign), Some(Msg::CloseFind));
+        assert_eq!(
+            find_chord(&Key::Named(Named::Enter), Modifiers::ALT, ign),
+            Some(Msg::FindSelectAll)
+        );
+        // Plain Enter is the input's `on_submit` / the editor's newline — never
+        // a global chord.
+        assert_eq!(find_chord(&Key::Named(Named::Enter), Modifiers::default(), ign), None);
+        // An unmodified letter must never be a chord.
+        assert_eq!(find_chord(&Key::Character("f".into()), Modifiers::default(), ign), None);
     }
 
     /// Ctrl+H is Ctrl+F with the replace row already out, seeding the query the
