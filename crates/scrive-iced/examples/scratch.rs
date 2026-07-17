@@ -4,6 +4,7 @@
 //! cargo run -p scrive-iced --example scratch                              # open the window
 //! cargo run -p scrive-iced --example scratch -- --capture out.png         # headless PNG
 //! cargo run -p scrive-iced --example scratch -- --capture-folds out.png   # …all folds collapsed
+//! cargo run -p scrive-iced --example scratch -- --capture-find out.png    # …find+replace bar open
 //! ```
 //!
 //! `--capture-folds` is the fold-geometry verification harness: it collapses
@@ -27,7 +28,7 @@ use std::time::Instant;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::operation::focus;
-use iced::widget::{button, container, row, stack, text, text_input};
+use iced::widget::{button, column, container, row, stack, text, text_input};
 use iced::{Alignment, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector};
 use std::ops::Range;
 
@@ -44,6 +45,7 @@ use scrive_iced::{Action, Editor};
 /// focusables, so moving focus between the find input and the editor is a proper
 /// single-focus model (no double-typing).
 const FIND_INPUT: &str = "scrive-find-input";
+const REPLACE_INPUT: &str = "scrive-replace-input";
 const EDITOR: &str = "editor";
 
 /// The `--large <MB>` corpus, generated in `main` before the app starts.
@@ -511,6 +513,18 @@ pub struct App {
     /// Whether the app-side find bar is open; its live query text.
     find_open: bool,
     find_query: String,
+    /// The `Aa` / `ab|` / `.*` options. Each is part of the QUERY, not just
+    /// chrome: flipping one changes what matches, so all of them re-scan through
+    /// [`App::push_find_query`] exactly like a text change.
+    find_case: bool,
+    find_whole_word: bool,
+    find_regex: bool,
+    /// Whether the bar is expanded into find+replace (the chevron), and the live
+    /// replacement text. Expansion deliberately SURVIVES a close/reopen (as
+    /// mainstream editors do) — `close_find` drops the query, not the shape of
+    /// the bar.
+    replace_open: bool,
+    replace_text: String,
     /// Monotonic clock start — `find`'s debounced re-scan needs a `now_ms`.
     start: Instant,
     /// The last visible buffer-row range the editor reported
@@ -770,6 +784,11 @@ impl Default for App {
             doc,
             find_open: false,
             find_query: String::new(),
+            find_case: false,
+            find_whole_word: false,
+            find_regex: false,
+            replace_open: false,
+            replace_text: String::new(),
             start: Instant::now(),
             viewport: 0..0,
             completion: CompletionController::new(),
@@ -793,15 +812,33 @@ pub enum Msg {
     Editor(Action),
     /// Open the find bar (Ctrl+F) and focus its input.
     OpenFind,
+    /// Open the find bar with the replace row already expanded (Ctrl+H).
+    OpenReplace,
     /// Close the find bar (Escape / ✕), clear the query, refocus the editor.
     CloseFind,
     /// The find query text changed — re-scan synchronously.
     FindQuery(String),
+    /// The `Aa` / `ab|` / `.*` option toggles: flip one and re-scan.
+    ToggleCase,
+    ToggleWholeWord,
+    ToggleRegex,
+    /// The find-in-selection toggle: scope find to the current selection, or
+    /// clear the scope if one is already set.
+    ToggleFindInSelection,
     /// Go to the next / previous match (Enter / Shift+Enter / buttons).
     FindNext,
     FindPrev,
     /// Alt+Enter in the find bar: every live match becomes a selection.
     FindSelectAll,
+    /// The chevron: expand/collapse the bar's replace row.
+    ToggleReplace,
+    /// The replacement text changed — no scan; the query is untouched.
+    ReplaceText(String),
+    /// Replace the active match and advance (Enter in the replace input / the
+    /// replace button).
+    ReplaceOne,
+    /// Replace every match in one undo step (the replace-all button).
+    ReplaceAll,
     /// One idle-sweep tick (window::frames while a dirty highlight frontier
     /// remains): tokenize the next budgeted batch toward convergence.
     HighlightSweep,
@@ -820,6 +857,25 @@ impl App {
         self.find_open = false;
         self.find_query.clear();
         self.doc.set_find_query(None, self.now_ms());
+    }
+
+    /// Push the live query text + its options into the document — the ONE place
+    /// a [`FindQuery`] is built.
+    ///
+    /// Every input that can change what matches routes through here (the text,
+    /// and each option toggle), so the bar's controls cannot disagree about the
+    /// live query: an option is not chrome, it is part of the query, and
+    /// flipping one re-scans exactly like typing does. An empty text means "no
+    /// query" — never match-all.
+    fn push_find_query(&mut self) {
+        let query = (!self.find_query.is_empty()).then(|| FindQuery {
+            text: self.find_query.clone(),
+            case_sensitive: self.find_case,
+            whole_word: self.find_whole_word,
+            regex: self.find_regex,
+        });
+        let now = self.now_ms();
+        self.doc.set_find_query(query, now); // synchronous scan
     }
 
     pub fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -962,21 +1018,55 @@ impl App {
                     .then(|| self.doc.buffer().slice(sel.start()..sel.end()).into_owned())
                     .filter(|t| !t.contains('\n'));
                 if let Some(text) = seed {
-                    self.find_query = text.clone();
-                    let now = self.now_ms();
-                    self.doc.set_find_query(Some(FindQuery { text, case_sensitive: false }), now);
+                    self.find_query = text;
+                    self.push_find_query();
                 }
                 focus(FIND_INPUT) // focus the input, unfocusing the editor
+            }
+            Msg::OpenReplace => {
+                // Ctrl+H is Ctrl+F with the replace row already out. The query
+                // seeding and focus rules are `OpenFind`'s job — reuse them
+                // rather than growing a second copy that can drift.
+                self.replace_open = true;
+                self.update(Msg::OpenFind)
             }
             Msg::CloseFind if self.find_open => {
                 self.close_find(); // drop matches + decorations
                 focus(EDITOR) // hand focus back to the editor
             }
             Msg::FindQuery(q) => {
-                let query = (!q.is_empty()).then(|| FindQuery { text: q.clone(), case_sensitive: false });
                 self.find_query = q;
+                self.push_find_query();
+                Task::none()
+            }
+            Msg::ToggleCase => {
+                self.find_case = !self.find_case;
+                self.push_find_query(); // the flag changes what matches: re-scan
+                Task::none()
+            }
+            Msg::ToggleWholeWord => {
+                self.find_whole_word = !self.find_whole_word;
+                self.push_find_query();
+                Task::none()
+            }
+            Msg::ToggleRegex => {
+                self.find_regex = !self.find_regex;
+                self.push_find_query();
+                Task::none()
+            }
+            Msg::ToggleFindInSelection if self.find_open => {
+                // The scope lives in the document (it has to ride every edit),
+                // so there is no app-side copy to flip — read the live one and
+                // set its opposite. A scope the user cannot produce (no
+                // selection) simply leaves find unscoped.
+                let scope = if self.doc.find_scope().is_some() {
+                    None
+                } else {
+                    let sel = self.doc.selections().newest();
+                    (!sel.is_empty()).then(|| sel.start()..sel.end())
+                };
                 let now = self.now_ms();
-                self.doc.set_find_query(query, now); // synchronous scan
+                self.doc.set_find_scope(scope, now);
                 Task::none()
             }
             Msg::FindNext if self.find_open => {
@@ -994,6 +1084,35 @@ impl App {
                 // returns to the editor (matching mainstream editors); the bar stays open.
                 if self.doc.select_find_matches() {
                     return focus(EDITOR);
+                }
+                Task::none()
+            }
+            Msg::ToggleReplace => {
+                self.replace_open = !self.replace_open;
+                // Expanding puts the caret where the user is about to type;
+                // collapsing hands it back to the query rather than stranding
+                // focus on a row that no longer exists.
+                focus(if self.replace_open { REPLACE_INPUT } else { FIND_INPUT })
+            }
+            Msg::ReplaceText(t) => {
+                self.replace_text = t;
+                Task::none() // the query is untouched: nothing to re-scan
+            }
+            Msg::ReplaceOne if self.find_open => {
+                let now = self.now_ms();
+                let before = self.doc.revision();
+                self.doc.replace_next(&self.replace_text, now);
+                // The first press only NAVIGATES (it shows the match before
+                // overwriting it), which commits nothing — running the post-edit
+                // tail then would arm a re-lint for an edit that never happened.
+                if self.doc.revision() != before {
+                    self.after_edit(CompletionEvent::CaretOrClose);
+                }
+                Task::none()
+            }
+            Msg::ReplaceAll if self.find_open => {
+                if self.doc.replace_all(&self.replace_text) > 0 {
+                    self.after_edit(CompletionEvent::CaretOrClose);
                 }
                 Task::none()
             }
@@ -1057,7 +1176,13 @@ impl App {
                 self.maybe_relint(self.now_ms());
                 Task::none()
             }
-            Msg::CloseFind | Msg::FindNext | Msg::FindPrev | Msg::FindSelectAll => Task::none(),
+            Msg::CloseFind
+            | Msg::FindNext
+            | Msg::FindPrev
+            | Msg::FindSelectAll
+            | Msg::ReplaceOne
+            | Msg::ReplaceAll
+            | Msg::ToggleFindInSelection => Task::none(),
         }
     }
 
@@ -1157,6 +1282,24 @@ impl App {
             | Action::ToggleFold { .. }
             | Action::FoldAtCarets { .. } => {} // handled in update() before apply()
         }
+        self.after_edit(comp_event);
+    }
+
+    /// The find bar's option toggles + the nav/close cluster share this — the
+    /// find-in-selection button latches off the DOCUMENT's live scope, not an
+    /// app-side copy, so an edit that collapses the scope un-latches the button
+    /// with no code here at all.
+    fn scoped(&self) -> bool {
+        self.doc.find_scope().is_some()
+    }
+
+    /// Everything that must follow a document mutation — the ONE owner of the
+    /// post-edit tail. Both edit entry points run it: the keystroke path
+    /// ([`App::apply`]) and the replace verbs. Keeping it in one place is what
+    /// stops a second entry point from silently doing half of it (a replace that
+    /// forgot `tokenize_highlight` would paint stale colors; one that forgot
+    /// `relint_dirty` would strand the diagnostics).
+    fn after_edit(&mut self, comp_event: CompletionEvent) {
         // Bring the incremental highlight cache current down to the reported
         // viewport bottom only — convergence stops at the edited lines for a
         // normal edit, and the viewport bound caps a state-cascade to the screen.
@@ -1498,26 +1641,66 @@ impl App {
         }
     }
 
-    /// The app-side find bar: query input + match count + prev/next/
-    /// close, as a floating panel. The widget owns no find keys — the app drives
-    /// the Document methods.
+    /// The app-side find bar: a floating panel holding a query row (input +
+    /// match count + prev/next/close) and, once the chevron expands it, a
+    /// replace row (input + replace/replace-all). The widget owns no find keys —
+    /// the app drives the Document methods.
     fn find_bar(&self) -> Element<'_, Msg> {
         let count = self.doc.find_match_count();
-        let label = match self.doc.active_find_match() {
-            Some(i) => format!("{} of {}", i + 1, count),
-            None if count > 0 => format!("{count} matches"),
-            None if self.find_query.is_empty() => String::new(),
-            None => "No results".to_string(),
+        // A half-typed regex (`(`, `[a-`) is a NORMAL state, not a failure — but
+        // it must say so. Reporting the honest zero matches as "No results"
+        // would imply the pattern is fine and the document simply lacks it.
+        let invalid = self.doc.find_pattern_error().is_some();
+        let label = if invalid {
+            "Invalid regex".to_string()
+        } else {
+            match self.doc.active_find_match() {
+                Some(i) => format!("{} of {}", i + 1, count),
+                None if count > 0 => format!("{count} matches"),
+                None if self.find_query.is_empty() => String::new(),
+                None => "No results".to_string(),
+            }
         };
-        // The match-count text turns to an error red on "No results";
-        // otherwise the neutral `#CCCCCC`.
-        let label_color = if label == "No results" {
+        // Error red for anything the user has to notice or fix; otherwise the
+        // neutral `#CCCCCC`.
+        let label_color = if invalid || label == "No results" {
             Color::from_rgb8(0xF4, 0x87, 0x71)
         } else {
             Color::from_rgb8(0xCC, 0xCC, 0xCC)
         };
+        // Both inputs share this width, and both rows a count-slot width, so the
+        // two rows' columns line up under each other.
+        const INPUT_W: f32 = 220.0;
+        // Fixed and centered so the panel never reflows as the match count's
+        // digit count changes (e.g. "1 of 5" ↔ "50 of 500"). Sized to fit the
+        // widest label — "10000 of 10000" at the FIND_MATCH_CAP. The replace row
+        // mirrors it with an EMPTY slot, which is what puts its buttons under
+        // the nav buttons.
+        const COUNT_W: f32 = 90.0;
+        // The one gap between every control in the panel — shared so the
+        // derived toggle-cluster width below matches the row it mirrors.
+        const SPACING: f32 = 4.0;
         // Colors are neutral dark-theme grays (theme-agnostic) so the find bar
         // reads as standard editor chrome over the dark editor theme.
+        //
+        // ONE style for BOTH inputs — it captures nothing, so it is `Copy` and
+        // can be handed to each. The query and replacement boxes cannot drift
+        // apart visually.
+        let input_style = |_theme: &Theme, status: text_input::Status| {
+            let focused = matches!(status, text_input::Status::Focused { .. });
+            text_input::Style {
+                background: Color::from_rgb8(0x3C, 0x3C, 0x3C).into(),
+                border: iced::border::rounded(4.0).width(1.0).color(if focused {
+                    Color::from_rgb8(0x00, 0x7F, 0xD4) // focus ring
+                } else {
+                    Color::TRANSPARENT
+                }),
+                icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+                placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
+                value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+                selection: Color::from_rgb8(0x26, 0x4F, 0x78),
+            }
+        };
         let input = text_input("Find", &self.find_query)
             .id(FIND_INPUT)
             .on_input(Msg::FindQuery)
@@ -1529,25 +1712,16 @@ impl App {
             .on_submit(Msg::FindNext)
             .padding(4)
             .size(13)
-            .width(Length::Fixed(220.0))
-            .style(|_theme, status| {
-                let focused = matches!(status, text_input::Status::Focused { .. });
-                text_input::Style {
-                    background: Color::from_rgb8(0x3C, 0x3C, 0x3C).into(),
-                    border: iced::border::rounded(4.0).width(1.0).color(if focused {
-                        Color::from_rgb8(0x00, 0x7F, 0xD4) // focus ring
-                    } else {
-                        Color::TRANSPARENT
-                    }),
-                    icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                    placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
-                    value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                    selection: Color::from_rgb8(0x26, 0x4F, 0x78),
-                }
-            });
-        // Flat 22×22 icon buttons: transparent at rest, translucent gray on hover.
+            .width(Length::Fixed(INPUT_W))
+            .style(input_style);
+        // Every button in the bar is this 22×22 square.
+        const BTN_W: f32 = 22.0;
+        // Flat icon buttons: transparent at rest, translucent gray on hover.
+        // `on` LATCHES that background and adds the focus-blue border, so an
+        // engaged option (`Aa`) reads as pressed at rest rather than only under
+        // the pointer — a toggle whose state you cannot see is a trap.
         // Glyphs are Codicons, rendered in the bundled font.
-        let btn = |glyph: char, msg| {
+        let icon_btn = |glyph: char, on: bool, msg| {
             button(
                 text(glyph.to_string())
                     .font(scrive_iced::CODICON)
@@ -1557,38 +1731,99 @@ impl App {
                     .align_x(Horizontal::Center)
                     .align_y(Vertical::Center),
             )
-            .width(Length::Fixed(22.0))
-            .height(Length::Fixed(22.0))
+            .width(Length::Fixed(BTN_W))
+            .height(Length::Fixed(BTN_W))
             .padding(0)
             .on_press(msg)
-            .style(|_theme, status| {
+            .style(move |_theme, status| {
                 let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
-                    background: hover.then(|| Color::from_rgba8(90, 93, 94, 0.314).into()),
+                    background: (on || hover).then(|| Color::from_rgba8(90, 93, 94, 0.314).into()),
                     text_color: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                    border: iced::border::rounded(5.0),
+                    border: if on {
+                        iced::border::rounded(5.0).width(1.0).color(Color::from_rgb8(0x00, 0x7F, 0xD4))
+                    } else {
+                        iced::border::rounded(5.0)
+                    },
                     shadow: Shadow::default(),
                     snap: true,
                 }
             })
         };
-        container(
-            row![
-                input,
-                // Fixed-width, centered slot so the box never reflows as the
-                // match count's digit count changes (e.g. "1 of 5" ↔ "50 of 500").
-                // Sized to fit the widest label — "10000 of 10000" at the
-                // FIND_MATCH_CAP.
-                text(label)
-                    .size(12)
-                    .color(label_color)
-                    .width(Length::Fixed(90.0))
-                    .align_x(Horizontal::Center),
-                btn(scrive_iced::icon::ARROW_UP, Msg::FindPrev), // previous match
-                btn(scrive_iced::icon::ARROW_DOWN, Msg::FindNext), // next match
-                btn(scrive_iced::icon::CLOSE, Msg::CloseFind),     // close
+        // The plain (never-latched) action buttons.
+        let btn = |glyph: char, msg| icon_btn(glyph, false, msg);
+        // The find row's option toggles — each one part of the QUERY, not chrome.
+        // The replace row mirrors this cluster with an empty slot of the same
+        // width so the two rows' buttons line up; deriving that width from this
+        // very list is what stops the mirror from drifting when a toggle is
+        // added or removed.
+        let toggles: Vec<Element<'_, Msg>> = vec![
+            icon_btn(scrive_iced::icon::CASE_SENSITIVE, self.find_case, Msg::ToggleCase).into(),
+            icon_btn(scrive_iced::icon::WHOLE_WORD, self.find_whole_word, Msg::ToggleWholeWord)
+                .into(),
+            icon_btn(scrive_iced::icon::REGEX, self.find_regex, Msg::ToggleRegex).into(),
+        ];
+        let toggles_w = toggles.len() as f32 * BTN_W
+            + toggles.len().saturating_sub(1) as f32 * SPACING;
+        let find_row = row![
+            input,
+            row(toggles).spacing(SPACING).align_y(Alignment::Center),
+            text(label)
+                .size(12)
+                .color(label_color)
+                .width(Length::Fixed(COUNT_W))
+                .align_x(Horizontal::Center),
+            btn(scrive_iced::icon::ARROW_UP, Msg::FindPrev), // previous match
+            btn(scrive_iced::icon::ARROW_DOWN, Msg::FindNext), // next match
+            // Find in selection — a latched toggle, sitting with the nav cluster
+            // where VS Code puts it rather than with the option toggles.
+            icon_btn(scrive_iced::icon::SELECTION, self.scoped(), Msg::ToggleFindInSelection),
+            btn(scrive_iced::icon::CLOSE, Msg::CloseFind), // close
+        ]
+        .spacing(SPACING)
+        .align_y(Alignment::Center);
+        let rows = if self.replace_open {
+            let replace_row = row![
+                text_input("Replace", &self.replace_text)
+                    .id(REPLACE_INPUT)
+                    .on_input(Msg::ReplaceText)
+                    // Enter here replaces the active match and advances — the
+                    // same INPUT-focused rule as the query's `on_submit`, so an
+                    // Enter typed in the editor still only makes a newline.
+                    .on_submit(Msg::ReplaceOne)
+                    .padding(4)
+                    .size(13)
+                    .width(Length::Fixed(INPUT_W))
+                    .style(input_style),
+                // The empty twins of the toggle cluster and the count slot —
+                // together these are what land the replace buttons directly
+                // under the nav buttons.
+                text("").width(Length::Fixed(toggles_w)),
+                text("").width(Length::Fixed(COUNT_W)),
+                btn(scrive_iced::icon::REPLACE, Msg::ReplaceOne), // replace the active match
+                btn(scrive_iced::icon::REPLACE_ALL, Msg::ReplaceAll), // …and every other one
             ]
-            .spacing(4)
+            .spacing(SPACING)
+            .align_y(Alignment::Center);
+            column![find_row, replace_row].spacing(SPACING)
+        } else {
+            column![find_row]
+        };
+        container(
+            // The chevron sits left of BOTH rows, so it reads as a handle on the
+            // whole panel rather than as another find-row button.
+            row![
+                btn(
+                    if self.replace_open {
+                        scrive_iced::icon::CHEVRON_DOWN
+                    } else {
+                        scrive_iced::icon::CHEVRON_RIGHT
+                    },
+                    Msg::ToggleReplace
+                ),
+                rows,
+            ]
+            .spacing(SPACING)
             .align_y(Alignment::Center),
         )
         .padding([6, 8])
@@ -1642,6 +1877,10 @@ impl App {
             match key {
                 Key::Character(c) if (modifiers.command() || modifiers.control()) && c.as_str() == "f" => {
                     Some(Msg::OpenFind)
+                }
+                // Ctrl+H — find, with the replace row already expanded.
+                Key::Character(c) if (modifiers.command() || modifiers.control()) && c.as_str() == "h" => {
+                    Some(Msg::OpenReplace)
                 }
                 Key::Named(Named::Escape) => Some(Msg::CloseFind),
                 // Alt+Enter: select all matches — safe as a global chord
@@ -1724,6 +1963,36 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // Find+replace layout harness (see the module doc): open the bar with the
+    // replace row expanded over a live query and an active match, then render
+    // one frame — chevron, both inputs, the match count, and every button on
+    // screen at once. Headless tests cannot see pixels; this is how the bar's
+    // layout gets judged.
+    if let Some(i) = args.iter().position(|a| a == "--capture-find") {
+        let path = args.get(i + 1).map_or("scratch-find.png", String::as_str);
+        let mut app = App::default();
+        app.doc.tokenize_highlight(app.doc.buffer().line_count());
+        let _ = app.update(Msg::OpenReplace); // find + the replace row out
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let _ = app.update(Msg::ReplaceText("this".into()));
+        // Latch two of the three options, so both the engaged and the resting
+        // toggle style are on screen to compare.
+        let _ = app.update(Msg::ToggleCase);
+        let _ = app.update(Msg::ToggleWholeWord);
+        // Scope find to a block of the sample, so the scope wash + its latched
+        // toggle are on screen too.
+        app.apply(Action::DragSelect {
+            granularity: scrive_core::Granularity::Char,
+            origin: 0,
+            head: 600,
+        });
+        let _ = app.update(Msg::ToggleFindInSelection);
+        let _ = app.update(Msg::FindNext); // activate a match ⇒ a real "N of M"
+        let (w, h) = capture::render_to_png(app.view(), 900, 560, &scrive_dark(), &[], path);
+        eprintln!("captured {w}x{h} -> {path}");
+        return Ok(());
+    }
+
     let app = iced::application(App::default, App::update, App::view)
         .title("scrive — scratch")
         .theme(theme)
@@ -1739,6 +2008,180 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replace-all driven through the BAR (not the core verb directly) must land
+    /// as one transaction: a single undo restores the document byte-for-byte.
+    /// This is the app-side half of the one-undo-step claim — it proves the
+    /// message path commits once, not once per match.
+    #[test]
+    fn replace_all_through_the_bar_is_one_undo_step() {
+        let mut app = App::default();
+        // Owned: `text()` borrows the document, and every `update` below needs it
+        // mutably.
+        let original = app.doc.text().into_owned();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        assert!(app.doc.find_match_count() > 0, "the sample must contain the needle");
+        let _ = app.update(Msg::ReplaceText("this".into()));
+        let _ = app.update(Msg::ReplaceAll);
+        assert!(!app.doc.text().contains("self"), "every match replaced");
+        assert!(app.doc.text().contains("this"));
+        app.apply(Action::Undo);
+        assert_eq!(app.doc.text(), original.as_str(), "replace-all must undo as ONE step");
+    }
+
+    /// The replace button shows the match before it overwrites it: the first
+    /// press only navigates, the second replaces.
+    #[test]
+    fn the_replace_button_selects_before_it_replaces() {
+        let mut app = App::default();
+        let original = app.doc.text().into_owned();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let _ = app.update(Msg::ReplaceText("this".into()));
+        let _ = app.update(Msg::ReplaceOne);
+        assert_eq!(app.doc.text(), original.as_str(), "the first press only navigates");
+        let _ = app.update(Msg::ReplaceOne);
+        assert_ne!(app.doc.text(), original.as_str(), "the second press replaces");
+    }
+
+    /// The chevron's state is the shape of the bar, not part of the query —
+    /// closing find drops the query text and leaves the shape alone, so
+    /// reopening comes back the way you left it.
+    #[test]
+    fn the_replace_row_survives_a_close() {
+        let mut app = App::default();
+        assert!(!app.replace_open);
+        let _ = app.update(Msg::ToggleReplace);
+        assert!(app.replace_open);
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let _ = app.update(Msg::CloseFind);
+        assert!(app.find_query.is_empty(), "close drops the query");
+        assert!(app.doc.find_query().is_none(), "…and its matches");
+        assert!(app.replace_open, "…but not the chevron's state");
+    }
+
+    /// The `Aa` toggle is part of the QUERY, not chrome: flipping it must
+    /// re-scan and change the live match set, not merely restyle the button.
+    #[test]
+    fn the_case_toggle_rescans() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenFind);
+        // The sample has `Self` (the type) and `self` (the receiver), so the
+        // case flag is observable in the count.
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let insensitive = app.doc.find_match_count();
+        let _ = app.update(Msg::ToggleCase);
+        assert!(app.find_case);
+        let sensitive = app.doc.find_match_count();
+        assert!(
+            sensitive < insensitive,
+            "case-sensitive must drop the `Self` matches ({sensitive} vs {insensitive})"
+        );
+        assert!(app.doc.find_query().is_some_and(|q| q.case_sensitive));
+        // …and back.
+        let _ = app.update(Msg::ToggleCase);
+        assert_eq!(app.doc.find_match_count(), insensitive);
+    }
+
+    /// The `ab|` and `.*` toggles are part of the query too: each re-scans and
+    /// changes the live match set, and they compose (a whole-word regex).
+    #[test]
+    fn the_whole_word_and_regex_toggles_rescan() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let plain = app.doc.find_match_count();
+        // Whole word drops the `self` inside longer identifiers, if any, and can
+        // never ADD matches.
+        let _ = app.update(Msg::ToggleWholeWord);
+        assert!(app.doc.find_query().is_some_and(|q| q.whole_word));
+        assert!(app.doc.find_match_count() <= plain);
+        let _ = app.update(Msg::ToggleWholeWord);
+        assert_eq!(app.doc.find_match_count(), plain, "…and toggling back restores it");
+
+        // Regex: `.` is a metacharacter only with the option on.
+        let _ = app.update(Msg::FindQuery("s.lf".into()));
+        assert_eq!(app.doc.find_match_count(), 0, "literal `s.lf` is not in the sample");
+        let _ = app.update(Msg::ToggleRegex);
+        assert!(app.doc.find_match_count() > 0, "as a regex it matches `self`");
+    }
+
+    /// A half-typed regex is a normal state: no matches, no panic, and the bar
+    /// says *why* rather than implying the document simply lacks the text.
+    #[test]
+    fn a_half_typed_regex_reports_invalid_rather_than_no_results() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::ToggleRegex);
+        let _ = app.update(Msg::FindQuery("(".into()));
+        assert_eq!(app.doc.find_match_count(), 0);
+        assert!(app.doc.find_pattern_error().is_some(), "the bar has a reason to show");
+        // Editing while the pattern is broken must not panic.
+        app.apply(Action::Type('x'));
+        // Finishing it resumes matching.
+        let _ = app.update(Msg::FindQuery("(self)".into()));
+        assert!(app.doc.find_pattern_error().is_none());
+        assert!(app.doc.find_match_count() > 0);
+    }
+
+    /// Find-in-selection scopes to the live selection, restricts the match set,
+    /// and toggles back off. Its latched state is the DOCUMENT's scope, so there
+    /// is no app-side copy that could disagree with what is actually searched.
+    #[test]
+    fn find_in_selection_scopes_to_the_selection() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let all = app.doc.find_match_count();
+        assert!(all > 1);
+        // Select a prefix of the document, then scope to it.
+        app.apply(Action::PlaceCaret(0));
+        let half = app.doc.buffer().len() / 2;
+        app.apply(Action::DragSelect {
+            granularity: scrive_core::Granularity::Char,
+            origin: 0,
+            head: half,
+        });
+        let _ = app.update(Msg::ToggleFindInSelection);
+        assert!(app.scoped(), "the button latches off the document's scope");
+        let scoped = app.doc.find_match_count();
+        assert!(scoped < all, "the scope must drop the out-of-range matches");
+        assert!(
+            app.doc.find_matches_in(0..u32::MAX).all(|(m, _)| m.end <= half),
+            "no match may sit outside the scope"
+        );
+        // …and toggling off restores the full set.
+        let _ = app.update(Msg::ToggleFindInSelection);
+        assert!(!app.scoped());
+        assert_eq!(app.doc.find_match_count(), all);
+    }
+
+    /// Ctrl+H is Ctrl+F with the replace row already out, seeding the query the
+    /// same way (it delegates to `OpenFind`).
+    #[test]
+    fn ctrl_h_opens_find_with_the_replace_row_out() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenReplace);
+        assert!(app.find_open);
+        assert!(app.replace_open);
+    }
+
+    /// A replace press that only navigates commits nothing, so it must not arm
+    /// the re-lint — the post-edit tail runs for edits, not for gestures.
+    #[test]
+    fn a_navigate_only_replace_press_does_not_arm_the_relint() {
+        let mut app = App::default();
+        let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::FindQuery("self".into()));
+        let _ = app.update(Msg::ReplaceText("this".into()));
+        app.relint_dirty = false;
+        let _ = app.update(Msg::ReplaceOne); // navigates only — no commit
+        assert!(!app.relint_dirty, "a navigate-only press must not arm a re-lint");
+        let _ = app.update(Msg::ReplaceOne); // this one edits
+        assert!(app.relint_dirty, "…but a real replace must");
+    }
 
     /// The demo re-lint must be debounced OFF the keystroke path: a burst of
     /// keystrokes inside one debounce window triggers ZERO whole-document scans

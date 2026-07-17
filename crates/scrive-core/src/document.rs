@@ -1768,6 +1768,36 @@ impl Document {
         self.find.query()
     }
 
+    /// Restrict find to a byte range — **find in selection** — or clear the
+    /// restriction with `None`. Re-scans synchronously: the scope is part of
+    /// what matches, not a display filter, so every consumer (navigation, the
+    /// N-of-M count, [`replace_all`](Document::replace_all)) honors it without
+    /// knowing it exists.
+    ///
+    /// The scope then rides every edit's patch like any other derived position,
+    /// growing when text is typed at its edges and dropping if it collapses. An
+    /// empty range clears it rather than pinning zero matches.
+    pub fn set_find_scope(&mut self, scope: Option<Range<u32>>, now_ms: u64) {
+        self.find.set_scope(scope, &self.buffer, &mut self.decorations, now_ms);
+    }
+
+    /// The live find-in-selection scope, if any — for the view to shade it.
+    #[must_use]
+    pub fn find_scope(&self) -> Option<Range<u32>> {
+        self.find.scope()
+    }
+
+    /// Why the current find pattern does not parse, if it does not — for the
+    /// find bar to show.
+    ///
+    /// This is not an error path: with the regex option on, every prefix of a
+    /// pattern being typed (`(`, `[a-`) is invalid, so find simply reports zero
+    /// matches and carries the reason until the pattern parses again.
+    #[must_use]
+    pub fn find_pattern_error(&self) -> Option<&str> {
+        self.find.pattern_error()
+    }
+
     /// Whole-word occurrences of the word under the newest caret WITHIN the
     /// byte range `within` — the passive occurrence wash (the reading aid for
     /// tracing a PID/label through a script). The window keeps this per-frame
@@ -1884,6 +1914,85 @@ impl Document {
     /// [`find_next`](Document::find_next) mirror.
     pub fn find_prev(&mut self, now_ms: u64) -> Option<Range<u32>> {
         self.step_find(false, now_ms)
+    }
+
+    /// Replace the active find match with `replacement`, then advance to the
+    /// next match, wrapping — the Replace verb. Returns the match left selected,
+    /// or `None` when there is nowhere to go.
+    ///
+    /// Replaces only when the newest selection IS the active match — the state
+    /// [`find_next`](Document::find_next) leaves behind. Otherwise it merely
+    /// navigates, so the first press selects and the second replaces: text is
+    /// never overwritten before it has been shown. One transaction ⇒ one undo
+    /// step, and the match set needs no resync — it rides the commit through the
+    /// shared view-rebase mover like any other edit.
+    pub fn replace_next(&mut self, replacement: &str, now_ms: u64) -> Option<Range<u32>> {
+        self.find.maybe_rescan(&self.buffer, &mut self.decorations, now_ms);
+        let extent = {
+            let sel = self.selections.newest();
+            sel.start()..sel.end()
+        };
+        // Armed only when the selection IS the active match. An empty selection
+        // can never be one (`FindMatch` is `EmptyPolicy::Drop`), but the guard
+        // states it rather than relying on that.
+        let armed = !extent.is_empty()
+            && self.find.active_range(&self.decorations).is_some_and(|r| r == extent);
+        if armed {
+            // In regex mode the replacement is a template, so it must be
+            // expanded against THIS match's captures — resolved through the one
+            // owner of that rule, bounded to the match itself.
+            let text = self.find.query().cloned().map_or_else(
+                || replacement.to_string(),
+                |q| {
+                    crate::find::replacements(&self.buffer, &q, extent.clone(), replacement)
+                        .into_iter()
+                        .next()
+                        .map_or_else(|| replacement.to_string(), |(_, t)| t)
+                },
+            );
+            if self.edit(vec![EditOp::new(extent, text)]).is_err() {
+                return None; // a rejected transaction must not read as a replace
+            }
+        }
+        self.step_find(true, now_ms)
+    }
+
+    /// Replace **every** match of the current query with `replacement` in one
+    /// transaction — the Replace All verb. Returns how many were replaced.
+    ///
+    /// **One transaction ⇒ one undo step.** Matches are disjoint by
+    /// construction, so the batch satisfies the engine's no-overlap rule for
+    /// free — [`TransactionError::Overlap`] cannot fire here.
+    ///
+    /// Scans the document itself rather than reading the live match set: that
+    /// set is capped at [`FIND_MATCH_CAP`] and is only a *prefix of the
+    /// document*, so an "all" built from it would silently stop at the cap and
+    /// leave the tail untouched. The scan is therefore whole-document — the same
+    /// class as [`set_find_query`](Document::set_find_query), and legitimate for
+    /// the same reason: a discrete user action, never a keystroke.
+    ///
+    /// Cost, honestly: one [`EditOp`] per match, each owning its own copy of
+    /// `replacement`, so a query with millions of hits allocates proportionally
+    /// before it commits. Bounded by the match count and paid once per press.
+    ///
+    /// [`FIND_MATCH_CAP`]: crate::find::FIND_MATCH_CAP
+    pub fn replace_all(&mut self, replacement: &str) -> usize {
+        let Some(query) = self.find.query().cloned() else {
+            return 0; // find is idle
+        };
+        // Scoped find replaces only inside its range — the scan bound is the one
+        // place that has to know, so every other path inherits it.
+        let within = self.find.scope().unwrap_or(0..self.buffer.len());
+        let plan = crate::find::replacements(&self.buffer, &query, within, replacement);
+        if plan.is_empty() {
+            return 0; // no matches ⇒ no transaction, no undo step
+        }
+        let n = plan.len();
+        let ops = plan.into_iter().map(|(r, t)| EditOp::new(r, t)).collect();
+        if self.edit(ops).is_err() {
+            return 0;
+        }
+        n
     }
 
     /// Shared find-navigation body.
@@ -2514,7 +2623,7 @@ mod tests {
         // visible text, not inside the chip.
         let mut d = doc("x = [1, 2, 3]\nafter");
         assert!(d.toggle_fold_opener(4)); // the `[`
-        d.set_find_query(Some(FindQuery { text: "2".into(), case_sensitive: false }), 0);
+        d.set_find_query(Some(FindQuery { text: "2".into(), case_sensitive: false, ..Default::default() }), 0);
         d.find_next(0).expect("the match exists");
         assert!(!d.folds().is_folded(4), "the inline fold expanded to show the match");
     }
@@ -2658,7 +2767,7 @@ mod tests {
         let mut d = doc("aa\nfn {\nneedle\n}\nbb");
         let opener = 6; // the `{` (pair 6..15, hides rows 2..=3)
         assert!(d.toggle_fold_opener(opener));
-        d.set_find_query(Some(FindQuery { text: "needle".into(), case_sensitive: false }), 0);
+        d.set_find_query(Some(FindQuery { text: "needle".into(), case_sensitive: false, ..Default::default() }), 0);
         let m = d.find_next(0).expect("the match exists");
         assert!(!d.folds().is_folded(opener), "the fold expanded to reveal the match");
         let fm = crate::fold_map::FoldMap::new(d.folds(), d.brackets(), d.buffer());
@@ -2669,7 +2778,7 @@ mod tests {
         // A match on VISIBLE ground (the header line) leaves folds alone.
         let mut v = doc("aa\nfn {\nx\n}\nbb");
         assert!(v.toggle_fold_opener(6));
-        v.set_find_query(Some(FindQuery { text: "fn".into(), case_sensitive: false }), 0);
+        v.set_find_query(Some(FindQuery { text: "fn".into(), case_sensitive: false, ..Default::default() }), 0);
         v.find_next(0).expect("match on the header");
         assert!(v.folds().is_folded(6), "a visible match keeps the fold collapsed");
     }
@@ -2775,7 +2884,7 @@ mod tests {
     #[test]
     fn select_find_matches_turns_matches_into_selections() {
         let mut d = doc("foo bar foo baz foo");
-        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false }), 0);
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
         d.find_next(0); // activate the first match (caret there)
         assert!(d.select_find_matches());
         assert_eq!(d.selections().len(), 3);
@@ -2784,6 +2893,296 @@ mod tests {
         let mut e = doc("abc");
         assert!(!e.select_find_matches());
         assert_eq!(e.selections().len(), 1);
+    }
+
+    #[test]
+    fn replace_all_swaps_every_match_in_one_undo_step() {
+        // The load-bearing claim: replace-all is ONE transaction, so ONE undo
+        // puts the document back byte-for-byte.
+        let original = "foo bar foo baz foo";
+        let mut d = doc(original);
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(d.replace_all("QUX"), 3);
+        assert_eq!(d.text(), "QUX bar QUX baz QUX");
+        assert!(d.undo());
+        assert_eq!(d.text(), original, "replace-all must undo as ONE step");
+        assert!(!d.undo(), "…with no second step hiding behind it");
+        // The match set rode the commit through the shared mover — undo included.
+        assert_eq!(d.find_match_count(), 3);
+    }
+
+    #[test]
+    fn replace_all_is_not_capped_by_the_live_match_set() {
+        // The live set is a capped PREFIX of the document, so a replace-all
+        // built from it would silently leave everything past the cap untouched.
+        // `replace_all` runs its own uncapped scan; this pins that it must.
+        let n = crate::find::FIND_MATCH_CAP + 500;
+        let mut d = doc(&"a".repeat(n));
+        d.set_find_query(Some(FindQuery { text: "a".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(d.find_match_count(), crate::find::FIND_MATCH_CAP, "the live set caps");
+        assert_eq!(d.replace_all("b"), n, "replace-all must NOT cap");
+        assert_eq!(d.text(), "b".repeat(n), "every match past the cap replaced too");
+    }
+
+    #[test]
+    fn replace_next_selects_before_it_replaces() {
+        let mut d = doc("foo bar foo");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        // Nothing selected yet: the first press only NAVIGATES — text is never
+        // overwritten before it has been shown.
+        assert_eq!(d.replace_next("X", 0), Some(0..3));
+        assert_eq!(d.text(), "foo bar foo", "the first press must not replace");
+        // Now the selection IS the active match: replace it, then advance. The
+        // returned range is POST-edit — "foo bar foo" − "foo" + "X" ⇒ the
+        // surviving match slid 8..11 → 6..9.
+        assert_eq!(d.replace_next("X", 0), Some(6..9));
+        assert_eq!(d.text(), "X bar foo");
+        // …and one undo takes the replacement back.
+        assert!(d.undo());
+        assert_eq!(d.text(), "foo bar foo");
+    }
+
+    #[test]
+    fn find_scope_restricts_matches_and_replace_all() {
+        let mut d = doc("foo foo | foo foo");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(d.find_match_count(), 4);
+        // Scope to the left half: the two matches beyond it stop existing.
+        d.set_find_scope(Some(0..7), 0);
+        assert_eq!(d.find_match_count(), 2, "only the in-scope matches survive");
+        // …and replace-all inherits that without knowing the scope exists.
+        assert_eq!(d.replace_all("X"), 2, "replace-all must honor the scope");
+        assert_eq!(d.text(), "X X | foo foo", "the out-of-scope matches are untouched");
+        // Clearing the scope brings the rest back.
+        d.set_find_scope(None, 0);
+        assert_eq!(d.find_match_count(), 2, "the two outside are findable again");
+    }
+
+    #[test]
+    fn the_find_scope_rides_edits_and_drops_when_it_collapses() {
+        let mut d = doc("aaa foo bbb");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        d.set_find_scope(Some(4..7), 0); // exactly "foo"
+        assert_eq!(d.find_match_count(), 1);
+        // An insert BEFORE the scope slides it, keeping it over the same text.
+        d.edit(vec![EditOp::insert(0, "XY")]).unwrap();
+        assert_eq!(d.find_scope(), Some(6..9));
+        assert_eq!(d.find_match_count(), 1, "the scope still covers the match");
+        // Deleting the scope's whole content collapses it ⇒ it drops, rather
+        // than pinning zero matches forever.
+        d.edit(vec![EditOp::delete(6..9)]).unwrap();
+        assert_eq!(d.find_scope(), None, "a collapsed scope must clear");
+    }
+
+    #[test]
+    fn an_edit_outside_the_scope_creates_no_matches() {
+        let mut d = doc("foo | ...");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        d.set_find_scope(Some(0..3), 0);
+        assert_eq!(d.find_match_count(), 1);
+        // Type a matching word far outside the scope: the repair window clamps
+        // to the scope, so this must NOT become a match.
+        d.edit(vec![EditOp::insert(6, "foo")]).unwrap();
+        assert_eq!(d.find_match_count(), 1, "out-of-scope text must not match");
+    }
+
+    /// The oracle for the scoped repair: after random edits, the incrementally
+    /// repaired set must be byte-identical to what a from-scratch scan of the
+    /// (patch-ridden) scope produces. "foo" cannot overlap itself, so the
+    /// documented self-overlap phase relaxation does not apply — these must
+    /// agree exactly.
+    #[test]
+    fn scoped_repair_equals_a_fresh_scoped_scan_under_random_edits() {
+        let mut seed = 0x5EED_u64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base = "foo bar foo baz\nfoo foo bar\nbarfoo foo\n".repeat(3);
+        let n = base.len() as u32;
+        for trial in 0..300 {
+            let mut d = doc(&base);
+            let a = (rng() as u32) % n;
+            let b = (rng() as u32) % n;
+            let (lo, hi) = (a.min(b), a.max(b));
+            let lo = d.buffer().clip_offset(lo, Bias::Right);
+            let hi = d.buffer().clip_offset(hi, Bias::Left);
+            if lo >= hi {
+                continue;
+            }
+            d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+            d.set_find_scope(Some(lo..hi), 0);
+            for _ in 0..4 {
+                let at = (rng() as u32) % (d.buffer().len() + 1);
+                let at = d.buffer().clip_offset(at, Bias::Left);
+                let ins = ["foo", "x", "", "\nfoo "][(rng() % 4) as usize];
+                d.edit(vec![EditOp::insert(at, ins)]).unwrap();
+            }
+            let incremental: Vec<_> = d.find_matches_in(0..u32::MAX).map(|(r, _)| r).collect();
+            // Force a from-scratch rescan of the SAME (now patch-ridden) scope:
+            // dropping the query and re-setting it re-scans, and never touches
+            // the scope.
+            let scope = d.find_scope();
+            let q = d.find_query().cloned().unwrap();
+            d.set_find_query(None, 0);
+            d.set_find_query(Some(q), 0);
+            let fresh: Vec<_> = d.find_matches_in(0..u32::MAX).map(|(r, _)| r).collect();
+            assert_eq!(incremental, fresh, "trial {trial}, scope {scope:?}");
+            // …and nothing ever escaped the scope.
+            if let Some(s) = scope {
+                assert!(
+                    incremental.iter().all(|m| m.start >= s.start && m.end <= s.end),
+                    "trial {trial}: a match escaped the scope {s:?}: {incremental:?}"
+                );
+            }
+        }
+    }
+
+    /// The oracle for the LINE-SCOPED repair. After random edits the
+    /// incrementally repaired set must be byte-identical to a from-scratch scan
+    /// — the same bar the literal path is held to.
+    ///
+    /// This is the proof that a line window is *sufficient* for a
+    /// variable-length pattern, where the literal path's "a match starts at most
+    /// k−1 bytes left of a changed byte" argument does not hold at all. `.*` is
+    /// the case that makes the point: one edit anywhere rewrites a match
+    /// spanning its entire line.
+    #[test]
+    fn line_scoped_repair_equals_a_fresh_scan_under_random_edits() {
+        let mut seed = 0x00C0_FFEE_u64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base = "foo bar foo baz\nfoo foo bar\nbarfoo foo\n\nqux foofoo\n".repeat(3);
+        let queries = [
+            FindQuery { text: "foo".into(), whole_word: true, ..Default::default() },
+            FindQuery { text: "f.o".into(), regex: true, ..Default::default() },
+            FindQuery { text: r"\w+o".into(), regex: true, ..Default::default() },
+            // The one a fixed-k window can never handle.
+            FindQuery { text: ".*".into(), regex: true, ..Default::default() },
+            FindQuery { text: r"\bba\w+".into(), regex: true, ..Default::default() },
+            FindQuery {
+                text: "foo|bar".into(),
+                whole_word: true,
+                regex: true,
+                ..Default::default()
+            },
+        ];
+        for (qi, q) in queries.iter().enumerate() {
+            for trial in 0..40 {
+                let mut d = doc(&base);
+                d.set_find_query(Some(q.clone()), 0);
+                for _ in 0..5 {
+                    let len = d.buffer().len();
+                    // Mix inserts and deletions — a deletion can JOIN two lines,
+                    // which is the line-window repair's sharpest case.
+                    if rng() % 3 == 0 && len > 4 {
+                        let a = d.buffer().clip_offset((rng() as u32) % len, Bias::Left);
+                        let b = d
+                            .buffer()
+                            .clip_offset((a + 1 + (rng() as u32) % 6).min(len), Bias::Right);
+                        if a < b {
+                            d.edit(vec![EditOp::delete(a..b)]).unwrap();
+                        }
+                    } else {
+                        let at = d.buffer().clip_offset((rng() as u32) % (len + 1), Bias::Left);
+                        let ins = ["foo", "x", "\n", " ", "\nfoo bar"][(rng() % 5) as usize];
+                        d.edit(vec![EditOp::insert(at, ins)]).unwrap();
+                    }
+                }
+                let incremental: Vec<_> = d.find_matches_in(0..u32::MAX).map(|(r, _)| r).collect();
+                // Force a from-scratch rescan and compare.
+                d.set_find_query(None, 0);
+                d.set_find_query(Some(q.clone()), 0);
+                let fresh: Vec<_> = d.find_matches_in(0..u32::MAX).map(|(r, _)| r).collect();
+                assert_eq!(incremental, fresh, "query {qi} ({:?}), trial {trial}", q.text);
+            }
+        }
+    }
+
+    #[test]
+    fn regex_replace_all_is_one_undo_step() {
+        let original = "a1 b22 c333";
+        let mut d = doc(original);
+        d.set_find_query(
+            Some(FindQuery { text: r"\d+".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        assert_eq!(d.find_match_count(), 3);
+        assert_eq!(d.replace_all("#"), 3);
+        assert_eq!(d.text(), "a# b# c#");
+        assert!(d.undo());
+        assert_eq!(d.text(), original, "a regex replace-all undoes as ONE step");
+    }
+
+    #[test]
+    fn a_regex_replacement_expands_capture_groups() {
+        // Regex mode makes the replacement a TEMPLATE, per VS Code.
+        let mut d = doc("fn one()\nfn two()");
+        d.set_find_query(
+            Some(FindQuery { text: r"fn (\w+)\(\)".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        assert_eq!(d.replace_all("let $1 = 1;"), 2);
+        assert_eq!(d.text(), "let one = 1;\nlet two = 1;");
+        assert!(d.undo());
+        assert_eq!(d.text(), "fn one()\nfn two()", "still ONE undo step");
+
+        // …and a LITERAL query does not expand: nothing captured anything, so a
+        // typed `$1` must land as a literal `$1`.
+        let mut e = doc("aaa");
+        e.set_find_query(Some(FindQuery { text: "aaa".into(), ..Default::default() }), 0);
+        assert_eq!(e.replace_all("$1"), 1);
+        assert_eq!(e.text(), "$1");
+    }
+
+    #[test]
+    fn replace_next_expands_captures_for_the_active_match_only() {
+        let mut d = doc("fn one()\nfn two()");
+        d.set_find_query(
+            Some(FindQuery { text: r"fn (\w+)\(\)".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        d.replace_next("x", 0); // first press: selects only
+        d.replace_next("[$1]", 0); // second: replaces the active match
+        assert_eq!(d.text(), "[one]\nfn two()");
+    }
+
+    #[test]
+    fn an_unfinished_regex_matches_nothing_and_reports_why() {
+        let mut d = doc("foo (bar)");
+        d.set_find_query(
+            Some(FindQuery { text: "(".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        assert_eq!(d.find_match_count(), 0, "an unfinished pattern matches nothing");
+        assert!(d.find_pattern_error().is_some(), "…and says why");
+        // Editing while the pattern is broken must not panic or strand state.
+        d.edit(vec![EditOp::insert(0, "x")]).unwrap();
+        assert_eq!(d.find_match_count(), 0);
+        // Finishing the pattern resumes matching, and clears the error.
+        d.set_find_query(
+            Some(FindQuery { text: r"\(bar\)".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        assert!(d.find_pattern_error().is_none());
+        assert_eq!(d.find_match_count(), 1);
+    }
+
+    #[test]
+    fn replace_all_without_a_match_commits_nothing() {
+        let mut d = doc("foo");
+        assert_eq!(d.replace_all("x"), 0, "no query ⇒ no-op");
+        d.set_find_query(Some(FindQuery { text: "zzz".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(d.replace_all("x"), 0, "no matches ⇒ no-op");
+        assert_eq!(d.text(), "foo");
+        assert!(!d.is_dirty(), "a no-op replace must not open an undo step");
+        assert!(!d.undo());
     }
 
     #[test]
@@ -4526,7 +4925,7 @@ mod tests {
     }
 
     fn query(text: &str) -> crate::FindQuery {
-        crate::FindQuery { text: text.into(), case_sensitive: true }
+        crate::FindQuery { text: text.into(), case_sensitive: true, ..Default::default() }
     }
 
     #[test]
@@ -5059,7 +5458,7 @@ mod tests {
     #[test]
     fn case_fold_repair() {
         // The windowed repair honors the query's fold toggle.
-        let fq = crate::FindQuery { text: "foo".into(), case_sensitive: false };
+        let fq = crate::FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() };
         let mut d = doc("FO bar");
         d.set_find_query(Some(fq), 0);
         assert_eq!(d.find_match_count(), 0);

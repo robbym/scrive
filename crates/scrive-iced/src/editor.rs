@@ -167,6 +167,12 @@ const HOVER_SB_W: f32 = 6.0;
 const FIND_MATCH: Color = Color::from_rgba8(0xfc, 0xe5, 0x66, 0.22);
 /// The active find match's brighter wash.
 const FIND_MATCH_ACTIVE: Color = Color::from_rgba8(0xfc, 0xe5, 0x66, 0.48);
+/// Find-in-selection scope wash: the faintest member of the find family, behind
+/// the scoped range. A find restricted to a selection is otherwise invisible —
+/// the count just silently drops — so the restriction has to be on screen. Kept
+/// far below [`FIND_MATCH`] because it is a backdrop the matches sit on, not a
+/// hit of its own.
+const FIND_SCOPE: Color = Color::from_rgba8(0xfc, 0xe5, 0x66, 0.07);
 /// Rows of context the indent-guide walks may consult beyond the visible
 /// window: blank-line level interpolation and the active guide's extent only
 /// need NEARBY context for visual continuity, and clamping the walk to this
@@ -1450,6 +1456,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             // The visible window bounds the scan, so it stays O(viewport).
             for span in self.doc.caret_word_occurrences(vis_start..vis_end) {
                 self.draw_selection(renderer, &geo, span.start, span.end, OCCURRENCE_MATCH);
+            }
+        }
+        // Find-in-selection: shade the scope UNDER the match washes, so an
+        // in-scope match still reads over it. Clipped to the visible window, so
+        // a scope spanning the whole document still costs one viewport-sized
+        // fill — never a document-scale pass.
+        if let Some(scope) = self.doc.find_scope() {
+            let (s, e) = (scope.start.max(vis_start), scope.end.min(vis_end));
+            if s < e {
+                self.draw_selection(renderer, &geo, s, e, FIND_SCOPE);
             }
         }
         for (span, is_active) in self.doc.find_matches_in(vis_start..vis_end) {

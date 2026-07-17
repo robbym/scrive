@@ -39,8 +39,9 @@ Two crates, with the dependency pointing one way:
 - **Bracket-pair colorization, matching, and indent guides.**
 - **Code folding** — foldable ranges, gutter chevrons, nested and inline
   (sub-line) collapse, and fold-aware movement.
-- **Find** — literal search with a match set repaired per edit, so results never
-  go stale.
+- **Find and replace** — literal, whole-word, or regex search (with `$1` capture
+  groups in the replacement), find-in-selection, and replace / replace-all as a
+  single undo step. The match set is repaired per edit, so results never go stale.
 - **Language intelligence** — completion, snippets, signature help, and hover,
   exposed as trait seams the integrating application implements.
 - **Diagnostics** — squiggles, a diagnostic hover, and scrollbar overview marks.

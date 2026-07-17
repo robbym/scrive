@@ -48,9 +48,11 @@ pub fn required_fonts() -> &'static [&'static [u8]] {
 /// `mapping.json` (verified against v0.0.45); the private-use-area codepoints are
 /// only meaningful rendered in the [`CODICON`] font.
 pub mod icon {
-    /// `chevron-right` (U+EAB6) — the collapsed-fold gutter indicator.
+    /// `chevron-right` (U+EAB6) — the collapsed-fold gutter indicator, and the
+    /// find bar's collapsed replace-row toggle.
     pub const CHEVRON_RIGHT: char = '\u{eab6}';
-    /// `chevron-down` (U+EAB4) — the expanded-fold gutter indicator.
+    /// `chevron-down` (U+EAB4) — the expanded-fold gutter indicator, and the
+    /// find bar's expanded replace-row toggle.
     pub const CHEVRON_DOWN: char = '\u{eab4}';
     /// `arrow-up` (U+EAA1) — find "previous match".
     pub const ARROW_UP: char = '\u{eaa1}';
@@ -58,4 +60,18 @@ pub mod icon {
     pub const ARROW_DOWN: char = '\u{ea9a}';
     /// `close` (U+EA76) — find "close".
     pub const CLOSE: char = '\u{ea76}';
+    /// `replace` (U+EB3D) — find "replace this match".
+    pub const REPLACE: char = '\u{eb3d}';
+    /// `replace-all` (U+EB3C) — find "replace every match".
+    pub const REPLACE_ALL: char = '\u{eb3c}';
+    /// `case-sensitive` (U+EAB1) — the find bar's `Aa` option toggle.
+    pub const CASE_SENSITIVE: char = '\u{eab1}';
+    /// `whole-word` (U+EB7E) — the find bar's `ab|` option toggle.
+    pub const WHOLE_WORD: char = '\u{eb7e}';
+    /// `regex` (U+EB38) — the find bar's `.*` option toggle.
+    pub const REGEX: char = '\u{eb38}';
+    /// `list-selection` (U+EB85) — the find bar's "find in selection" toggle.
+    /// The codicon set names this glyph `list-selection`; `selection` is an
+    /// alias for it, and is what VS Code calls the same button.
+    pub const SELECTION: char = '\u{eb85}';
 }

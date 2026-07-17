@@ -74,7 +74,7 @@ fn fold_first(d: &mut Document, k: usize) {
     let _ = d.fold_map();
 }
 fn find_on(d: &mut Document) {
-    d.set_find_query(Some(FindQuery { text: "mark".into(), case_sensitive: true }), 0);
+    d.set_find_query(Some(FindQuery { text: "mark".into(), case_sensitive: true, ..Default::default() }), 0);
 }
 
 /// Reset the meter, run `op`, return the semantic work it charged.
@@ -351,6 +351,46 @@ fn plain_type_with_active_match_is_match_count_independent() {
         meter_of(&mut d, |d| d.type_char('x'))
     };
     assert_budget("find: type, active match, k matches", Budget::Constant, cell(s), cell(b));
+}
+
+// A LINE-SCOPED query (the `.*` / `ab|` options) repairs by re-scanning only the
+// lines an edit touched, never the document. `.*` is the case that makes the
+// point: every line carries a match spanning the whole of it, so the literal
+// path's "a match starts at most k−1 bytes left of a changed byte" argument is
+// worthless here — the bound comes from the newline instead. Typing one char must
+// therefore cost the same at 2× the document size.
+#[test]
+fn line_scoped_type_is_document_size_independent() {
+    let (s, b) = (1000usize, 2000usize);
+    let cell = |k: usize| {
+        let mut d = build(k);
+        d.set_find_query(
+            Some(FindQuery { text: ".*".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        let end = d.text().len() as u32;
+        d.set_selections(SelectionSet::new(end)); // type at EOF: one line touched
+        meter_of(&mut d, |d| d.type_char('x'))
+    };
+    assert_budget("find: type, regex `.*`, k blocks", Budget::Constant, cell(s), cell(b));
+}
+
+// The same for whole-word, which rides the same line-scoped engine: its
+// boundaries need the char OUTSIDE the match, and a line is what supplies it.
+#[test]
+fn whole_word_type_is_document_size_independent() {
+    let (s, b) = (1000usize, 2000usize);
+    let cell = |k: usize| {
+        let mut d = build(k);
+        d.set_find_query(
+            Some(FindQuery { text: "mark".into(), whole_word: true, ..Default::default() }),
+            0,
+        );
+        let end = d.text().len() as u32;
+        d.set_selections(SelectionSet::new(end));
+        meter_of(&mut d, |d| d.type_char('x'))
+    };
+    assert_budget("find: type, whole-word, k blocks", Budget::Constant, cell(s), cell(b));
 }
 
 // ── SCROLLBAR OVERVIEW. The overview reduce (`overview_marks`) folds the two

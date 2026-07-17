@@ -72,7 +72,7 @@ fn keystroke(c: &mut Criterion) {
 fn find(c: &mut Criterion) {
     let mut g = c.benchmark_group("find");
     g.sample_size(10).measurement_time(Duration::from_secs(3));
-    let query = || Some(FindQuery { text: "return".into(), case_sensitive: false });
+    let query = || Some(FindQuery { text: "return".into(), case_sensitive: false, ..Default::default() });
     for (label, text) in support::sized() {
         g.bench_function(format!("set_query_{label}"), |b| {
             b.iter_batched(
