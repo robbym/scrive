@@ -123,6 +123,20 @@ fn script() -> Vec<(Vec<Step>, u16)> {
     beat(vec![], 35);
     beat(vec![chord("[", Modifiers::empty())], 95);
     beat(vec![chord("]", Modifiers::empty())], 80);
+    beat(vec![], 55);
+
+    // Completion: on a fresh line, type a prefix — the popup filters live.
+    beat(vec![press(Named::End, Modifiers::empty())], 22);
+    beat(vec![press(Named::Enter, Modifiers::empty())], 22);
+    for c in ["s", "t", "r"] {
+        beat(vec![typed(c)], 16);
+    }
+    beat(vec![], 90);
+    beat(vec![press(Named::ArrowDown, Modifiers::empty())], 32);
+    beat(vec![press(Named::Escape, Modifiers::empty())], 25);
+    // Undo the completion demo edit (the `str` line) so the view settles back.
+    beat(vec![chord("z", Modifiers::empty())], 30);
+    beat(vec![press(Named::Home, Modifiers::CTRL)], 20);
     beat(vec![], 150);
 
     t
