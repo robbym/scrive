@@ -531,10 +531,10 @@ mod tests {
     /// The anti-fragmentation canary: chunk count tracks BYTES, not keystrokes.
     ///
     /// Fails hard against a naive splice — typing N characters used to leave N
-    /// one-byte chunks (measured: 100 keystrokes took a 61-chunk rope to 162
-    /// chunks, 101 of them under `CHUNK_MIN`, the sizes at the caret reading
-    /// `[1, 1, 1, ...]`). That is unbounded growth in edits, and it deepens the
-    /// tree and inflates every O(log n) read.
+    /// one-byte chunks (measured: the 200 keystrokes this test types took a
+    /// 61-chunk rope to 262 chunks, ~201 of them under `CHUNK_MIN`, the sizes at
+    /// the caret reading `[1, 1, 1, ...]`). That is unbounded growth in edits,
+    /// and it deepens the tree and inflates every O(log n) read.
     ///
     /// Asserted as AVERAGE fill, not a per-chunk floor, because re-chunking a
     /// seam always leaves one remainder that may legitimately be tiny. Op counts

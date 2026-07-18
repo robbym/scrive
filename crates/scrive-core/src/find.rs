@@ -39,7 +39,13 @@ use crate::patch::Patch;
 ///
 /// The flags pick the matcher: plain text takes the literal byte scan;
 /// `whole_word` or `regex` take the line-scoped engine.
+///
+/// `#[non_exhaustive]` so a future option can be added without a breaking
+/// change: outside this crate, build one with [`FindQuery::new`] (a plain
+/// literal query) and set the options you want on its public fields, rather
+/// than a struct literal.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct FindQuery {
     /// The text to find — a literal, or a regular expression when
     /// [`regex`](Self::regex) is set. Empty means "no matches" (never
@@ -59,6 +65,16 @@ pub struct FindQuery {
     /// being typed looks like — so it simply yields no matches, and
     /// [`FindState::pattern_error`] carries the reason for the bar to show.
     pub regex: bool,
+}
+
+impl FindQuery {
+    /// A plain literal query for `text` — every option off (case-insensitive,
+    /// not whole-word, not regex). The common case; set the public option fields
+    /// on the returned value to change it.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into(), ..Self::default() }
+    }
 }
 
 /// The compiled form of a [`FindQuery`] — the one place that decides *how* a
@@ -150,25 +166,28 @@ pub const FIND_MATCH_CAP: usize = 10_000;
 /// Every non-overlapping match of `query` in `text`, leftmost-first, as byte
 /// spans; the `bool` is whether the scan hit [`FIND_MATCH_CAP`].
 ///
-/// Literal byte-wise substring — the next probe starts at the previous match's
-/// end (non-overlapping). Case-insensitive mode folds **ASCII only** (the
-/// documented limitation). An empty query yields no matches, never match-all.
-/// Byte-wise is exact for the ASCII DSL; a multi-byte needle is out of scope.
+/// The query's options pick the matcher. Plain text takes a **literal byte-wise
+/// substring** scan — the next probe starts at the previous match's end
+/// (non-overlapping), case fold is **ASCII only**, byte-wise is exact for the
+/// ASCII DSL, and a multi-byte needle is out of scope. `whole_word` / `regex`
+/// take the **line-scoped** engine, fed one line at a time so a match never
+/// crosses a newline. An empty literal query yields no matches (never
+/// match-all); an unfinished regex yields none until it parses.
 ///
-/// This is the pure oracle every other find path defers to: the query-change
-/// full scan, the capped refill, and the per-edit window repairs all run this
-/// same function, so the rules cannot fork. Case-sensitive search rides
-/// `memchr::memmem`; the fold path probes the needle's first byte's two case
-/// forms via `memchr2` and verifies each candidate window — both bit-identical
+/// The pure whole-text scan the tests use as the oracle. The live paths (the
+/// query-change full scan, the capped refill, the per-edit window repairs) share
+/// its matcher rather than calling it directly, so the match rules cannot fork.
+/// Case-sensitive literal search rides `memchr::memmem`; the fold path probes
+/// the needle's first byte's two case forms via `memchr2` — both bit-identical
 /// to the naive reference scan (pinned by `scan_equals_the_naive_oracle`).
 #[must_use]
 pub fn scan(text: &str, query: &FindQuery) -> (Vec<Range<u32>>, bool) {
     scan_capped(text, query, FIND_MATCH_CAP)
 }
 
-/// [`scan`] with the cap injected — the ONE implementation behind both the
-/// capped display scan and the uncapped [`scan_all`] that replace-all runs, so
-/// the text you replace cannot diverge from the text you were shown.
+/// [`scan`] with the cap injected. Compiles the query's matcher, then defers to
+/// [`scan_with`] — the same per-slice matcher the windowed paths use — so the
+/// text you replace cannot diverge from the text you were shown.
 fn scan_capped(text: &str, query: &FindQuery, cap: usize) -> (Vec<Range<u32>>, bool) {
     match Matcher::compile(query) {
         Ok(m) => scan_with(text, query, &m, cap),
@@ -277,13 +296,14 @@ fn scan_buffer(
     scan_buffer_capped(buffer, query, window, FIND_MATCH_CAP, within)
 }
 
-/// Every match in `buffer`, **uncapped** — the replace-all scan.
+/// Every match of `query` inside `within` — the whole document when find is
+/// unscoped, or the find-in-selection scope — **uncapped**. The replace-all scan.
 ///
 /// Replace-all cannot read the live match set: that set is capped at
-/// [`FIND_MATCH_CAP`] and is only a *prefix of the document*, so "all" built
-/// from it would silently stop at the cap and leave the tail untouched. It runs
-/// the same windowed [`scan_buffer_capped`] the display scan does — one match
-/// rule, no fork — with the cap lifted. Whole-document by nature (you cannot
+/// [`FIND_MATCH_CAP`] and is only a *prefix of its range*, so "all" built from
+/// it would silently stop at the cap and leave the tail untouched. It runs the
+/// same windowed [`scan_buffer_capped`] the display scan does — one match rule,
+/// no fork — with the cap lifted. Whole-`within` in the worst case (you cannot
 /// replace what you have not found), which is why it is reachable only from a
 /// discrete user action, never a keystroke.
 pub(crate) fn scan_all(buffer: &Buffer, query: &FindQuery, within: Range<u32>) -> Vec<Range<u32>> {
@@ -425,7 +445,7 @@ fn whole_lines(buffer: &Buffer, r: &Range<u32>) -> Range<u32> {
 /// replacement is re-cased to the pattern of the text it replaces — an
 /// ALL-CAPS match takes an upper-cased replacement, a Capitalized match a
 /// capitalized one — so a mechanical rename does not flatten the casing of the
-/// identifiers it touches. See [`preserve_case`].
+/// identifiers it touches. See [`preserve_case_of`].
 pub(crate) fn replacements(
     buffer: &Buffer,
     query: &FindQuery,
@@ -746,10 +766,15 @@ impl FindState {
     /// from the view-rebase path AFTER `DecorationStore::apply_patch` (it needs
     /// post-patch positions). No-op when find is idle.
     ///
-    /// Per edit (post-edit coordinates), with `k` = needle byte length: every
-    /// affected placement must overlap the influence window
-    /// `new.start−(k−1) .. new.end+(k−1)` (a created/destroyed match contains a
-    /// changed byte or the join point). Matches touching the window are removed
+    /// The influence window depends on the matcher. A **literal** query (post-edit
+    /// coordinates, `k` = needle byte length): every affected placement must
+    /// overlap `new.start−(k−1) .. new.end+(k−1)` (a created/destroyed match
+    /// contains a changed byte or the join point). A **line-scoped** query
+    /// (whole-word / regex) instead repairs the whole lines the edit touched —
+    /// a match cannot cross a newline, so nothing off those lines can have
+    /// changed — with no `k−1` widening and no anchor/guard (the greedy phase the
+    /// widening repairs does not exist there). The rest of this describes the
+    /// literal path. Matches touching the window are removed
     /// wholesale ([`DecorationStore::take_matching_in`]); the re-scan zone is
     /// then the window widened (a) to the removed extents — a merely-touching
     /// match must be re-findable, not lost — and (b) a further `k−1` bytes each

@@ -1977,12 +1977,13 @@ impl Document {
     /// construction, so the batch satisfies the engine's no-overlap rule for
     /// free — [`TransactionError::Overlap`] cannot fire here.
     ///
-    /// Scans the document itself rather than reading the live match set: that
-    /// set is capped at [`FIND_MATCH_CAP`] and is only a *prefix of the
-    /// document*, so an "all" built from it would silently stop at the cap and
-    /// leave the tail untouched. The scan is therefore whole-document — the same
-    /// class as [`set_find_query`](Document::set_find_query), and legitimate for
-    /// the same reason: a discrete user action, never a keystroke.
+    /// Scans the query's range itself (the whole document, or the
+    /// find-in-selection scope) rather than reading the live match set: that set
+    /// is capped at [`FIND_MATCH_CAP`] and is only a *prefix of that range*, so
+    /// an "all" built from it would silently stop at the cap and leave the tail
+    /// untouched. That scan is whole-range — the same class as
+    /// [`set_find_query`](Document::set_find_query), and legitimate for the same
+    /// reason: a discrete user action, never a keystroke.
     ///
     /// Cost, honestly: one [`EditOp`] per match, each owning its own copy of
     /// `replacement`, so a query with millions of hits allocates proportionally

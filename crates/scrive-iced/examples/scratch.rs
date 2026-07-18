@@ -937,11 +937,14 @@ impl App {
     /// flipping one re-scans exactly like typing does. An empty text means "no
     /// query" — never match-all.
     fn push_find_query(&mut self) {
-        let query = (!self.find_query.is_empty()).then(|| FindQuery {
-            text: self.find_query.clone(),
-            case_sensitive: self.find_case,
-            whole_word: self.find_whole_word,
-            regex: self.find_regex,
+        let query = (!self.find_query.is_empty()).then(|| {
+            // `FindQuery` is `#[non_exhaustive]`, so build via `new` + the option
+            // fields rather than a struct literal.
+            let mut q = FindQuery::new(self.find_query.clone());
+            q.case_sensitive = self.find_case;
+            q.whole_word = self.find_whole_word;
+            q.regex = self.find_regex;
+            q
         });
         let now = self.now_ms();
         self.doc.set_find_query(query, now); // synchronous scan

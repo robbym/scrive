@@ -2,7 +2,8 @@
 //!
 //! Renders the REAL `scratch` editor frame-by-frame with the tiny-skia renderer
 //! — no window, no GPU — while a scripted timeline drives it with genuine
-//! keyboard events and app messages (find, fold). Each beat renders one frame,
+//! keyboard events and app messages (find & replace, fold). Each beat renders
+//! one frame,
 //! held for its own delay; identical consecutive frames are coalesced. The
 //! frames are encoded straight to an animated GIF with the pure-Rust `gif`
 //! crate, so the recorder needs no external tools. Same script, same GIF, every
