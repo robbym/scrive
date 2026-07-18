@@ -103,17 +103,32 @@ fn script() -> Vec<(Vec<Step>, u16)> {
     // Collapse back to a single caret.
     beat(vec![press(Named::Escape, Modifiers::empty())], 45);
 
-    // Find: open the bar, type a needle, walk the matches.
+    // Find & replace: open the replace bar (Ctrl+H), search a word, step a
+    // match, then replace every occurrence at once.
     beat(vec![press(Named::Home, Modifiers::CTRL)], 20);
-    beat(vec![Step::Msg(Msg::OpenFind)], 30);
-    for q in ["s", "se", "sel", "self"] {
-        beat(vec![Step::Msg(Msg::FindQuery(q.into()))], 12);
+    beat(vec![Step::Msg(Msg::OpenReplace)], 34);
+    for q in ["r", "re", "rea", "read", "readi", "readin", "reading"] {
+        beat(vec![Step::Msg(Msg::FindQuery(q.into()))], 11);
     }
-    beat(vec![], 60);
-    for _ in 0..3 {
-        beat(vec![Step::Msg(Msg::FindNext)], 48);
+    beat(vec![], 55);
+    // Walk the matches — the active one brightens, the count updates.
+    beat(vec![Step::Msg(Msg::FindNext)], 46);
+    beat(vec![Step::Msg(Msg::FindNext)], 46);
+    beat(vec![], 30);
+    // Type the replacement into the second row.
+    for r in ["s", "sa", "sam", "samp", "sampl", "sample"] {
+        beat(vec![Step::Msg(Msg::ReplaceText(r.into()))], 12);
     }
-    beat(vec![Step::Msg(Msg::CloseFind)], 40);
+    beat(vec![], 55);
+    // Replace all — every `reading` becomes `sample` in one step.
+    beat(vec![Step::Msg(Msg::ReplaceAll)], 85);
+    // Close to a clean view of the replaced text — the payoff — then hold.
+    beat(vec![Step::Msg(Msg::CloseFind)], 18);
+    beat(vec![], 120);
+    // Undo the replace so the rest of the tour runs on the original text (Undo
+    // goes to the editor now the bar has handed focus back).
+    beat(vec![chord("z", Modifiers::empty())], 55);
+    beat(vec![], 35);
 
     // Fold a block from inside it, then unfold it.
     beat(vec![press(Named::Home, Modifiers::CTRL)], 25);
@@ -193,6 +208,30 @@ fn main() {
     encoder.set_repeat(gif::Repeat::Infinite).expect("gif repeat");
     let mut pending: Option<(Vec<u8>, u16)> = None;
     let mut frames = 0u32;
+
+    // Prime highlighting before the first recorded frame. The editor reports its
+    // viewport (`ViewportChanged`) during `update`, and the app tokenizes the
+    // visible rows only when it processes that message — which, in the frame
+    // loop below, happens AFTER the draw. So the very first frame would paint in
+    // the fallback (unhighlighted) style. Run one throwaway update+settle here,
+    // discarding the draw, so the doc's highlight cache is warm when frame 1 is
+    // drawn.
+    {
+        let events = [Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ))];
+        let mut ui: UserInterface<'_, Msg, Theme, iced::Renderer> =
+            UserInterface::build(app.view(), logical, cache, &mut renderer);
+        let mut published: Vec<Msg> = Vec::new();
+        let _ = ui.update(&events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
+        cache = ui.into_cache();
+        inbox.extend(published);
+        while !inbox.is_empty() {
+            for m in std::mem::take(&mut inbox) {
+                drain(app.update(m), &mut inbox, &mut ops);
+            }
+        }
+    }
 
     for (steps, hold) in script() {
         let mut events: Vec<Event> = vec![Event::Window(iced::window::Event::RedrawRequested(
