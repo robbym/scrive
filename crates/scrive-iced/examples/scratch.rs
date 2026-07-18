@@ -524,6 +524,13 @@ pub struct App {
     /// starts from a known shape: Ctrl+F is find-only, Ctrl+H brings replace.
     replace_open: bool,
     replace_text: String,
+    /// Which field wears the focus ring. The box border lives on a container, so
+    /// it can't read the field's focus itself — these mirror it. Set directly for
+    /// focus changes the app drives (open / close / chevron), and synced from the
+    /// live widget focus ([`App::sync_rings`]) for the ones it can't predict
+    /// (a click, a Tab).
+    find_focused: bool,
+    replace_focused: bool,
     /// The `AB` option — whether a replacement is re-cased to the match it lands
     /// on. A REPLACE option, so unlike the find toggles it changes nothing until
     /// a replace runs (no re-scan).
@@ -792,6 +799,8 @@ impl Default for App {
             find_regex: false,
             replace_open: false,
             replace_text: String::new(),
+            find_focused: false,
+            replace_focused: false,
             replace_preserve_case: false,
             start: Instant::now(),
             viewport: 0..0,
@@ -822,6 +831,9 @@ pub enum Msg {
     OpenReplace,
     /// Tab / Shift+Tab: move focus to the next / previous input.
     CycleFocus { back: bool },
+    /// A synced focus-ring result: `on` is whether the `replace`/find field holds
+    /// the live widget focus (see [`App::sync_rings`]).
+    Focused { replace: bool, on: bool },
     /// A left press landed somewhere — re-assert single focus (see
     /// [`App::resync_focus`]).
     PointerDown,
@@ -874,8 +886,20 @@ impl App {
     fn close_find(&mut self) {
         self.find_open = false;
         self.replace_open = false;
+        self.find_focused = false;
+        self.replace_focused = false;
         self.find_query.clear();
         self.doc.set_find_query(None, self.now_ms());
+    }
+
+    /// Read the live widget focus back into the ring flags — for the focus
+    /// changes the app can't predict (a click, a Tab). Each field's box border
+    /// mirrors its flag; the query is one frame behind, which is imperceptible.
+    fn sync_rings() -> Task<Msg> {
+        Task::batch([
+            is_focused(FIND_INPUT).map(|on| Msg::Focused { replace: false, on }),
+            is_focused(REPLACE_INPUT).map(|on| Msg::Focused { replace: true, on }),
+        ])
     }
 
     /// Re-assert SINGLE focus after a press — the repair for a genuine
@@ -1066,6 +1090,8 @@ impl App {
                     self.find_query = text;
                     self.push_find_query();
                 }
+                self.find_focused = true; // focus lands on the find field
+                self.replace_focused = false;
                 focus(FIND_INPUT) // focus the input, unfocusing the editor
             }
             Msg::OpenReplace => {
@@ -1080,16 +1106,26 @@ impl App {
             // focusable in iced, so the cycle is exactly find → replace →
             // editor, skipping the icon row.
             Msg::CycleFocus { back } => {
-                if back {
-                    focus_previous()
-                } else {
-                    focus_next()
-                }
+                // Tab's landing field can't be predicted here, so read it back
+                // into the rings after the move.
+                let moved = if back { focus_previous() } else { focus_next() };
+                moved.chain(Self::sync_rings())
             }
             // Only while the bar is open: with no inputs in the tree there is no
             // second focusable to desync against, and this would cost two
-            // tree-walking operations on every click in the editor.
-            Msg::PointerDown if self.find_open => Self::resync_focus(),
+            // tree-walking operations on every click in the editor. The click's
+            // landing field can't be predicted either, so sync the rings.
+            Msg::PointerDown if self.find_open => {
+                Task::batch([Self::resync_focus(), Self::sync_rings()])
+            }
+            Msg::Focused { replace, on } => {
+                if replace {
+                    self.replace_focused = on;
+                } else {
+                    self.find_focused = on;
+                }
+                Task::none()
+            }
             Msg::CloseFind if self.find_open => {
                 self.close_find(); // drop matches + decorations
                 focus(EDITOR) // hand focus back to the editor
@@ -1152,6 +1188,8 @@ impl App {
                 // Expanding puts the caret where the user is about to type;
                 // collapsing hands it back to the query rather than stranding
                 // focus on a row that no longer exists.
+                self.replace_focused = self.replace_open;
+                self.find_focused = !self.replace_open;
                 focus(if self.replace_open { REPLACE_INPUT } else { FIND_INPUT })
             }
             Msg::ReplaceText(t) => {
@@ -1826,7 +1864,8 @@ impl App {
         // container of the fixed box width — both boxes come out identical
         // regardless of how many buttons each holds.
         let in_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, IN_BTN, IN_BTN);
-        let box_of = |field, buttons| box_of(field, buttons, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
+        let box_of =
+            |field, buttons, focused| box_of(field, buttons, focused, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
 
         // The find box: query field + the `Aa`/`ab|`/`.*` option toggles inside
         // it. Each toggle is part of the QUERY, not chrome — flipping one
@@ -1852,6 +1891,7 @@ impl App {
                     .into(),
                 in_btn(scrive_iced::icon::REGEX, self.find_regex, Msg::ToggleRegex).into(),
             ],
+            self.find_focused,
         );
         let find_row = row![
             find_box,
@@ -1894,6 +1934,7 @@ impl App {
                     Msg::TogglePreserveCase,
                 )
                 .into()],
+                self.replace_focused,
             );
             let replace_row = row![
                 replace_box,
@@ -2037,6 +2078,7 @@ pub fn scrive_dark() -> Theme {
 fn box_of<'a>(
     field: Element<'a, Msg>,
     buttons: Vec<Element<'a, Msg>>,
+    focused: bool,
     w: f32,
     h: f32,
     gap: f32,
@@ -2050,9 +2092,15 @@ fn box_of<'a>(
     .width(Length::Fixed(w))
     .height(Length::Fixed(h))
     .padding(iced::Padding::from([0.0, margin]))
-    .style(|_theme: &Theme| container::Style {
+    // The focus ring lives here (the box is the container), driven by the
+    // app-tracked `focused` flag since a container can't read its field's focus.
+    .style(move |_theme: &Theme| container::Style {
         background: Some(Color::from_rgb8(0x3C, 0x3C, 0x3C).into()),
-        border: iced::border::rounded(4.0),
+        border: iced::border::rounded(4.0).width(1.0).color(if focused {
+            Color::from_rgb8(0x00, 0x7F, 0xD4) // focus ring
+        } else {
+            Color::TRANSPARENT
+        }),
         ..container::Style::default()
     })
     .into()
@@ -2547,6 +2595,19 @@ mod tests {
         frame(&mut app, &mut cache, &mut pending, from_ref(&type_z), on_find);
         assert_ne!(app.find_query, fq, "a char typed after clicking FIND must land in the find field");
         assert_eq!(app.replace_text, rt, "…and not in the replace field");
+
+        // The focus rings track the live field focus. A click's landing field is
+        // read back via the async `is_focused` → `Msg::Focused` round-trip, so
+        // settle a few frames before asserting. (Find is focused now.)
+        for _ in 0..3 {
+            frame(&mut app, &mut cache, &mut pending, &[], on_find);
+        }
+        assert!(app.find_focused && !app.replace_focused, "find ring on after clicking find");
+        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_replace);
+        for _ in 0..3 {
+            frame(&mut app, &mut cache, &mut pending, &[], on_replace);
+        }
+        assert!(app.replace_focused && !app.find_focused, "replace ring follows the click to replace");
     }
 
     /// The bar's global chords, and — the load-bearing one — that Tab only moves
