@@ -420,17 +420,32 @@ fn whole_lines(buffer: &Buffer, r: &Range<u32>) -> Range<u32> {
 /// against each match's own capture groups, as VS Code does. In every other mode
 /// (literal, whole-word) it is literal text — a `$1` typed into the replace box
 /// replaces with a literal `$1`, because nothing captured anything.
+///
+/// When `preserve_case` is set (the replace bar's `AB` toggle), each
+/// replacement is re-cased to the pattern of the text it replaces — an
+/// ALL-CAPS match takes an upper-cased replacement, a Capitalized match a
+/// capitalized one — so a mechanical rename does not flatten the casing of the
+/// identifiers it touches. See [`preserve_case`].
 pub(crate) fn replacements(
     buffer: &Buffer,
     query: &FindQuery,
     within: Range<u32>,
     replacement: &str,
+    preserve_case: bool,
 ) -> Vec<(Range<u32>, String)> {
     if !query.regex {
-        // Literal and whole-word: one fixed string, every match.
+        // Literal and whole-word: one fixed string, every match — re-cased to
+        // the match when `preserve_case` is on.
         return scan_all(buffer, query, within)
             .into_iter()
-            .map(|r| (r, replacement.to_string()))
+            .map(|r| {
+                let text = if preserve_case {
+                    preserve_case_of(&buffer.slice(r.clone()), replacement)
+                } else {
+                    replacement.to_string()
+                };
+                (r, text)
+            })
             .collect();
     }
     let Ok(Matcher::Lines(re)) = Matcher::compile(query) else {
@@ -459,10 +474,50 @@ pub(crate) fn replacements(
             }
             let mut dst = String::new();
             c.expand(replacement, &mut dst);
-            out.push((s..e, dst));
+            // Preserve-case keys off the WHOLE match (group 0), applied AFTER
+            // template expansion — so `$1`-driven text is re-cased too.
+            let text = if preserve_case { preserve_case_of(m.as_str(), &dst) } else { dst };
+            out.push((s..e, text));
         }
     }
     out
+}
+
+/// Re-case `replacement` to the case *pattern* of `matched` — the engine behind
+/// the replace bar's preserve-case (`AB`) toggle.
+///
+/// Three patterns carry over, matching VS Code: an all-upper match ⇒ the
+/// replacement upper-cased; an all-lower match ⇒ lower-cased; a match whose
+/// first cased letter is upper (a Capitalized / Title word) ⇒ the replacement's
+/// first letter upper-cased, the rest left as typed. Anything else (mixed case
+/// like `camelCase`, or no cased letters at all) leaves the replacement exactly
+/// as written — guessing at mixed case does more harm than good.
+fn preserve_case_of(matched: &str, replacement: &str) -> String {
+    let mut has_upper = false;
+    let mut has_lower = false;
+    let mut first_is_upper = None; // set by the first CASED char only
+    for ch in matched.chars() {
+        if ch.is_uppercase() {
+            has_upper = true;
+            first_is_upper.get_or_insert(true);
+        } else if ch.is_lowercase() {
+            has_lower = true;
+            first_is_upper.get_or_insert(false);
+        }
+    }
+    match (has_upper, has_lower) {
+        (true, false) => replacement.to_uppercase(),
+        (false, true) => replacement.to_lowercase(),
+        // Capitalized/Title: upper the first letter, leave the rest as typed.
+        (true, true) if first_is_upper == Some(true) => {
+            let mut chars = replacement.chars();
+            match chars.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+        _ => replacement.to_string(),
+    }
 }
 
 /// Whether a tracked range is a find match — the one predicate the store

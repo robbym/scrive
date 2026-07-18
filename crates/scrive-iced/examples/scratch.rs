@@ -520,11 +520,14 @@ pub struct App {
     find_whole_word: bool,
     find_regex: bool,
     /// Whether the bar is expanded into find+replace (the chevron), and the live
-    /// replacement text. Expansion deliberately SURVIVES a close/reopen (as
-    /// mainstream editors do) — `close_find` drops the query, not the shape of
-    /// the bar.
+    /// replacement text. Reset on close ([`App::close_find`]) so the next open
+    /// starts from a known shape: Ctrl+F is find-only, Ctrl+H brings replace.
     replace_open: bool,
     replace_text: String,
+    /// The `AB` option — whether a replacement is re-cased to the match it lands
+    /// on. A REPLACE option, so unlike the find toggles it changes nothing until
+    /// a replace runs (no re-scan).
+    replace_preserve_case: bool,
     /// Monotonic clock start — `find`'s debounced re-scan needs a `now_ms`.
     start: Instant,
     /// The last visible buffer-row range the editor reported
@@ -789,6 +792,7 @@ impl Default for App {
             find_regex: false,
             replace_open: false,
             replace_text: String::new(),
+            replace_preserve_case: false,
             start: Instant::now(),
             viewport: 0..0,
             completion: CompletionController::new(),
@@ -846,6 +850,8 @@ pub enum Msg {
     ReplaceOne,
     /// Replace every match in one undo step (the replace-all button).
     ReplaceAll,
+    /// The `AB` toggle: flip whether a replacement preserves the match's case.
+    TogglePreserveCase,
     /// One idle-sweep tick (window::frames while a dirty highlight frontier
     /// remains): tokenize the next budgeted batch toward convergence.
     HighlightSweep,
@@ -860,8 +866,14 @@ impl App {
     /// ONE owner of "close find" — both Escape paths (editor-focused `Collapse`
     /// and input-focused `CloseFind`, which a single Escape fires together) call
     /// it, so they cannot diverge into two meanings of "close".
+    ///
+    /// Closing also collapses the replace row, so the NEXT open starts from a
+    /// clean shape: Ctrl+F reopens find-only, Ctrl+H reopens with replace. The
+    /// alternative — persisting the expanded row across a close — means Ctrl+F
+    /// surprises you with a replace box you didn't ask for.
     fn close_find(&mut self) {
         self.find_open = false;
+        self.replace_open = false;
         self.find_query.clear();
         self.doc.set_find_query(None, self.now_ms());
     }
@@ -1149,7 +1161,7 @@ impl App {
             Msg::ReplaceOne if self.find_open => {
                 let now = self.now_ms();
                 let before = self.doc.revision();
-                self.doc.replace_next(&self.replace_text, now);
+                self.doc.replace_next(&self.replace_text, self.replace_preserve_case, now);
                 // The first press only NAVIGATES (it shows the match before
                 // overwriting it), which commits nothing — running the post-edit
                 // tail then would arm a re-lint for an edit that never happened.
@@ -1159,10 +1171,14 @@ impl App {
                 Task::none()
             }
             Msg::ReplaceAll if self.find_open => {
-                if self.doc.replace_all(&self.replace_text) > 0 {
+                if self.doc.replace_all(&self.replace_text, self.replace_preserve_case) > 0 {
                     self.after_edit(CompletionEvent::CaretOrClose);
                 }
                 Task::none()
+            }
+            Msg::TogglePreserveCase => {
+                self.replace_preserve_case = !self.replace_preserve_case;
+                Task::none() // a replace option: nothing to re-scan
             }
             // Find-nav keys arriving while the bar is closed: ignore (the guards
             // above only match when `find_open`). The editor still handles its own
@@ -1717,15 +1733,16 @@ impl App {
         } else {
             Color::from_rgb8(0xCC, 0xCC, 0xCC)
         };
-        // Both inputs share this width, and both rows a count-slot width, so the
-        // two rows' columns line up under each other.
-        const INPUT_W: f32 = 220.0;
-        // Fixed and centered so the panel never reflows as the match count's
-        // digit count changes (e.g. "1 of 5" ↔ "50 of 500"). Sized to fit the
-        // widest label — "10000 of 10000" at the FIND_MATCH_CAP. The replace row
-        // mirrors it with an EMPTY slot, which is what puts its buttons under
-        // the nav buttons.
-        const COUNT_W: f32 = 90.0;
+        // Both inputs share this width (so the two boxes align under each other),
+        // wide enough to breathe with the in-box toggles present.
+        const INPUT_W: f32 = 264.0;
+        // Fixed so the nav buttons never shuffle as the match count's digit
+        // count changes (e.g. "1 of 5" ↔ "50 of 500"), but LEFT-aligned and only
+        // as wide as the labels that actually recur — "Invalid regex" (13
+        // chars), "No results", a mid-size count. The "10000 of 10000" cap-edge
+        // label overflows this by a hair and is allowed to; it is a
+        // once-in-a-corpus state, not worth widening the whole bar for.
+        const COUNT_W: f32 = 78.0;
         // The one gap between every control in the panel — shared so the
         // derived toggle-cluster width below matches the row it mirrors.
         const SPACING: f32 = 4.0;
@@ -1740,57 +1757,50 @@ impl App {
         // Colors are neutral dark-theme grays (theme-agnostic) so the find bar
         // reads as standard editor chrome over the dark editor theme.
         //
-        // ONE style for BOTH inputs — it captures nothing, so it is `Copy` and
-        // can be handed to each. The query and replacement boxes cannot drift
-        // apart visually.
-        let input_style = |_theme: &Theme, status: text_input::Status| {
-            let focused = matches!(status, text_input::Status::Focused { .. });
-            text_input::Style {
-                background: Color::from_rgb8(0x3C, 0x3C, 0x3C).into(),
-                border: iced::border::rounded(4.0).width(1.0).color(if focused {
-                    Color::from_rgb8(0x00, 0x7F, 0xD4) // focus ring
-                } else {
-                    Color::TRANSPARENT
-                }),
-                icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
-                value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                selection: Color::from_rgb8(0x26, 0x4F, 0x78),
-            }
+        // The box look lives on the CONTAINER (see `box_of`), so the field is
+        // TRANSPARENT and sits inside it beside the in-box buttons as an ordinary
+        // row sibling — NOT overlaid in a `Stack`. That is load-bearing for
+        // focus: a `Stack` early-returns on capture, so once one field captured a
+        // click the OTHER field's stack skipped it and left it stale-focused
+        // (two fields both "focused", and a click would bounce back to the wrong
+        // one). A plain row lets every field see the click and the non-clicked
+        // ones unfocus themselves, the way iced's single-focus is meant to work.
+        //
+        // ONE style for BOTH fields — it captures nothing, so it is `Copy`.
+        let input_style = |_theme: &Theme, _status: text_input::Status| text_input::Style {
+            background: Color::TRANSPARENT.into(),
+            border: iced::border::rounded(0.0),
+            icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+            placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
+            value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+            selection: Color::from_rgb8(0x26, 0x4F, 0x78),
         };
-        let input = text_input("Find", &self.find_query)
-            .id(FIND_INPUT)
-            .on_input(Msg::FindQuery)
-            // Enter-in-the-input navigates. `on_submit` fires only while the
-            // INPUT holds focus, so an Enter typed in the editor can never
-            // double-dispatch into find navigation; Shift+
-            // Enter previous-match is the ↑ button (on_submit is modifier-
-            // blind), and Alt+Enter select-all stays a subscription chord.
-            .on_submit(Msg::FindNext)
-            .padding(4)
-            .size(13)
-            .width(Length::Fixed(INPUT_W))
-            .style(input_style);
-        // Every button in the bar is this wide; all but the chevron are square.
+        // Every button OUTSIDE an input is this wide; all but the chevron are
+        // square. The buttons that live INSIDE an input box are a touch smaller
+        // so they clear the box's border.
         const BTN_W: f32 = 22.0;
+        const IN_BTN: f32 = 20.0;
+        const IN_GAP: f32 = 3.0; // between in-box buttons
+        const IN_MARGIN: f32 = 3.0; // from the box's right edge
         // Flat icon buttons: transparent at rest, translucent gray on hover.
         // `on` LATCHES that background and adds the focus-blue border, so an
         // engaged option (`Aa`) reads as pressed at rest rather than only under
         // the pointer — a toggle whose state you cannot see is a trap.
-        // `height` is a parameter only so the chevron can span both rows.
+        // `w`/`h` are parameters so the same button serves the outside row, the
+        // in-box clusters, and the two-row-tall chevron.
         // Glyphs are Codicons, rendered in the bundled font.
-        let sized_btn = |glyph: char, on: bool, msg, height: Length| {
+        let sized_btn = |glyph: char, on: bool, msg, w: f32, h: f32| {
             button(
                 text(glyph.to_string())
                     .font(scrive_iced::CODICON)
-                    .size(16)
+                    .size(15)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(Horizontal::Center)
                     .align_y(Vertical::Center),
             )
-            .width(Length::Fixed(BTN_W))
-            .height(height)
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
             .padding(0)
             .on_press(msg)
             .style(move |_theme, status| {
@@ -1808,34 +1818,52 @@ impl App {
                 }
             })
         };
-        // The square variants: a latching option toggle, and a plain action.
-        let icon_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, Length::Fixed(BTN_W));
-        let btn = |glyph: char, msg| sized_btn(glyph, false, msg, Length::Fixed(BTN_W));
-        // The find row's option toggles — each one part of the QUERY, not chrome.
-        // The replace row mirrors this cluster with an empty slot of the same
-        // width so the two rows' buttons line up; deriving that width from this
-        // very list is what stops the mirror from drifting when a toggle is
-        // added or removed.
-        let toggles: Vec<Element<'_, Msg>> = vec![
-            icon_btn(scrive_iced::icon::CASE_SENSITIVE, self.find_case, Msg::ToggleCase).into(),
-            icon_btn(scrive_iced::icon::WHOLE_WORD, self.find_whole_word, Msg::ToggleWholeWord)
+        // Outside-the-box variants: a latching option toggle, and a plain action.
+        let icon_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, BTN_W, BTN_W);
+        let btn = |glyph: char, msg| sized_btn(glyph, false, msg, BTN_W, BTN_W);
+        // In-box variant (`Aa`, replace, …), a touch smaller so it clears the
+        // box's edges. `box_of` places `[Fill field | buttons]` in a styled
+        // container of the fixed box width — both boxes come out identical
+        // regardless of how many buttons each holds.
+        let in_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, IN_BTN, IN_BTN);
+        let box_of = |field, buttons| box_of(field, buttons, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
+
+        // The find box: query field + the `Aa`/`ab|`/`.*` option toggles inside
+        // it. Each toggle is part of the QUERY, not chrome — flipping one
+        // re-scans, which is why they live with the query text.
+        let find_box = box_of(
+            text_input("Find", &self.find_query)
+                .id(FIND_INPUT)
+                .on_input(Msg::FindQuery)
+                // Enter-in-the-input navigates. `on_submit` fires only while the
+                // INPUT holds focus, so an Enter typed in the editor can never
+                // double-dispatch into find navigation; Shift+Enter previous-match
+                // is the ↑ button (on_submit is modifier-blind), and Alt+Enter
+                // select-all stays a subscription chord.
+                .on_submit(Msg::FindNext)
+                .padding(iced::Padding::new(4.0).left(2.0))
+                .size(13)
+                .width(Length::Fill)
+                .style(input_style)
                 .into(),
-            icon_btn(scrive_iced::icon::REGEX, self.find_regex, Msg::ToggleRegex).into(),
-        ];
-        let toggles_w = toggles.len() as f32 * BTN_W
-            + toggles.len().saturating_sub(1) as f32 * SPACING;
+            vec![
+                in_btn(scrive_iced::icon::CASE_SENSITIVE, self.find_case, Msg::ToggleCase).into(),
+                in_btn(scrive_iced::icon::WHOLE_WORD, self.find_whole_word, Msg::ToggleWholeWord)
+                    .into(),
+                in_btn(scrive_iced::icon::REGEX, self.find_regex, Msg::ToggleRegex).into(),
+            ],
+        );
         let find_row = row![
-            input,
-            row(toggles).spacing(SPACING).align_y(Alignment::Center),
+            find_box,
             text(label)
                 .size(12)
                 .color(label_color)
                 .width(Length::Fixed(COUNT_W))
-                .align_x(Horizontal::Center),
+                .align_x(Horizontal::Left),
             btn(scrive_iced::icon::ARROW_UP, Msg::FindPrev), // previous match
             btn(scrive_iced::icon::ARROW_DOWN, Msg::FindNext), // next match
             // Find in selection — a latched toggle, sitting with the nav cluster
-            // where VS Code puts it rather than with the option toggles.
+            // where VS Code puts it rather than with the in-box option toggles.
             icon_btn(scrive_iced::icon::SELECTION, self.scoped(), Msg::ToggleFindInSelection),
             btn(scrive_iced::icon::CLOSE, Msg::CloseFind), // close
         ]
@@ -1843,23 +1871,32 @@ impl App {
         .height(Length::Fixed(ROW_H))
         .align_y(Alignment::Center);
         let rows = if self.replace_open {
-            let replace_row = row![
+            // The replace box mirrors the find box: same width, with its ONE
+            // option — preserve-case (`AB`) — inside it. The replace / replace-all
+            // buttons sit OUTSIDE to the right (as VS Code does), the way the
+            // find row's nav buttons sit outside the find box.
+            let replace_box = box_of(
                 text_input("Replace", &self.replace_text)
                     .id(REPLACE_INPUT)
                     .on_input(Msg::ReplaceText)
-                    // Enter here replaces the active match and advances — the
-                    // same INPUT-focused rule as the query's `on_submit`, so an
-                    // Enter typed in the editor still only makes a newline.
+                    // Enter here replaces the active match and advances — the same
+                    // INPUT-focused rule as the query's `on_submit`, so an Enter
+                    // typed in the editor still only makes a newline.
                     .on_submit(Msg::ReplaceOne)
-                    .padding(4)
+                    .padding(iced::Padding::new(4.0).left(2.0))
                     .size(13)
-                    .width(Length::Fixed(INPUT_W))
-                    .style(input_style),
-                // The empty twins of the toggle cluster and the count slot —
-                // together these are what land the replace buttons directly
-                // under the nav buttons.
-                text("").width(Length::Fixed(toggles_w)),
-                text("").width(Length::Fixed(COUNT_W)),
+                    .width(Length::Fill)
+                    .style(input_style)
+                    .into(),
+                vec![in_btn(
+                    scrive_iced::icon::PRESERVE_CASE,
+                    self.replace_preserve_case,
+                    Msg::TogglePreserveCase,
+                )
+                .into()],
+            );
+            let replace_row = row![
+                replace_box,
                 btn(scrive_iced::icon::REPLACE, Msg::ReplaceOne), // replace the active match
                 btn(scrive_iced::icon::REPLACE_ALL, Msg::ReplaceAll), // …and every other one
             ]
@@ -1885,12 +1922,9 @@ impl App {
                     },
                     false,
                     Msg::ToggleReplace,
+                    BTN_W,
                     // Exactly the rows it spans — both derived from `ROW_H`.
-                    Length::Fixed(if self.replace_open {
-                        ROW_H * 2.0 + SPACING
-                    } else {
-                        ROW_H
-                    }),
+                    if self.replace_open { ROW_H * 2.0 + SPACING } else { ROW_H },
                 ),
                 rows,
             ]
@@ -1985,6 +2019,45 @@ pub fn scrive_dark() -> Theme {
     )
 }
 
+/// One input box: a `Fill` text field beside its in-box buttons, in a styled
+/// container of the fixed box width (VS Code's shape).
+///
+/// A plain **row**, deliberately NOT a `Stack` overlay. A `Stack` early-returns
+/// once any child captures an event, so when one box's field captured a click
+/// the OTHER box's stack skipped its field and left it stale-"focused" — two
+/// fields both believing they held focus, so a later click could bounce back to
+/// the wrong one. A row lets every field see the click, and the non-clicked ones
+/// unfocus themselves, which is how iced's single-focus is meant to work. The
+/// box look lives on the container, so the field is transparent and the buttons
+/// are ordinary siblings.
+///
+/// Both boxes pass the same `w`, so they come out identical widths whatever
+/// their button count. A free fn, not a closure, for the usual lifetime reason
+/// (the field/buttons' lifetime must equal the returned element's).
+fn box_of<'a>(
+    field: Element<'a, Msg>,
+    buttons: Vec<Element<'a, Msg>>,
+    w: f32,
+    h: f32,
+    gap: f32,
+    margin: f32,
+) -> Element<'a, Msg> {
+    container(
+        row![field, row(buttons).spacing(gap).align_y(Alignment::Center)]
+            .spacing(gap)
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(w))
+    .height(Length::Fixed(h))
+    .padding(iced::Padding::from([0.0, margin]))
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Color::from_rgb8(0x3C, 0x3C, 0x3C).into()),
+        border: iced::border::rounded(4.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// The find bar's global chord table — a free fn, so it is testable without a
 /// window (the same shape as the widget's own `interpret_key`).
 ///
@@ -2077,6 +2150,7 @@ fn main() -> iced::Result {
         // toggle style are on screen to compare.
         let _ = app.update(Msg::ToggleCase);
         let _ = app.update(Msg::ToggleWholeWord);
+        let _ = app.update(Msg::TogglePreserveCase); // latch the replace box's AB
         // Scope find to a block of the sample, so the scope wash + its latched
         // toggle are on screen too.
         app.apply(Action::DragSelect {
@@ -2143,21 +2217,27 @@ mod tests {
         assert_ne!(app.doc.text(), original.as_str(), "the second press replaces");
     }
 
-    /// The chevron's state is the shape of the bar, not part of the query —
-    /// closing find drops the query text and leaves the shape alone, so
-    /// reopening comes back the way you left it.
+    /// Closing collapses the replace row, so the NEXT open starts clean: Ctrl+F
+    /// reopens find-only even if you had expanded replace before. Otherwise
+    /// Ctrl+F surprises you with a replace box you never asked for.
     #[test]
-    fn the_replace_row_survives_a_close() {
+    fn closing_collapses_the_replace_row() {
         let mut app = App::default();
-        assert!(!app.replace_open);
-        let _ = app.update(Msg::ToggleReplace);
-        assert!(app.replace_open);
         let _ = app.update(Msg::OpenFind);
+        let _ = app.update(Msg::ToggleReplace); // expand replace via the chevron
+        assert!(app.replace_open);
         let _ = app.update(Msg::FindQuery("self".into()));
         let _ = app.update(Msg::CloseFind);
         assert!(app.find_query.is_empty(), "close drops the query");
         assert!(app.doc.find_query().is_none(), "…and its matches");
-        assert!(app.replace_open, "…but not the chevron's state");
+        assert!(!app.replace_open, "…and collapses the replace row");
+        // A plain Ctrl+F now reopens find-only.
+        let _ = app.update(Msg::OpenFind);
+        assert!(!app.replace_open, "Ctrl+F is find-only");
+        // …while Ctrl+H still brings the replace row back.
+        let _ = app.update(Msg::CloseFind);
+        let _ = app.update(Msg::OpenReplace);
+        assert!(app.replace_open, "Ctrl+H reopens with replace");
     }
 
     /// The `Aa` toggle is part of the QUERY, not chrome: flipping it must
@@ -2204,6 +2284,25 @@ mod tests {
         assert_eq!(app.doc.find_match_count(), 0, "literal `s.lf` is not in the sample");
         let _ = app.update(Msg::ToggleRegex);
         assert!(app.doc.find_match_count() > 0, "as a regex it matches `self`");
+    }
+
+    /// The `AB` toggle carries into the replace: with it on, a rename keeps each
+    /// occurrence's casing; with it off, the replacement lands verbatim.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // App::default() runs real setup; can't struct-update
+    fn the_preserve_case_toggle_recases_replacements() {
+        let mut app = App::default();
+        // A doc with mixed-case occurrences of the needle. (Replacing the whole
+        // App would drop its seeded highlight/lint setup; only the doc matters.)
+        app.doc = Document::new("FOO Foo foo").unwrap();
+        let _ = app.update(Msg::OpenReplace);
+        let _ = app.update(Msg::FindQuery("foo".into())); // case-insensitive by default
+        let _ = app.update(Msg::ReplaceText("bar".into()));
+        assert!(!app.replace_preserve_case);
+        let _ = app.update(Msg::TogglePreserveCase);
+        assert!(app.replace_preserve_case, "the toggle latches app state");
+        let _ = app.update(Msg::ReplaceAll);
+        assert_eq!(app.doc.text(), "BAR Bar bar", "each match keeps its casing");
     }
 
     /// A half-typed regex is a normal state: no matches, no panic, and the bar
@@ -2258,23 +2357,22 @@ mod tests {
 
     /// Clicking a bar input must not leave the editor stealing Tab.
     ///
-    /// The repro, end to end: Tab out to the editor, CLICK the find input, press
-    /// Tab. It must move focus — not indent the document.
-    ///
-    /// A click inside the input focuses it *natively* and captures, and iced's
-    /// `Stack` stops dispatching on capture, so the editor's press handler — the
-    /// one that would unfocus it — never runs. Both stay focused, and Tab (the
-    /// one key `text_input` does not capture) falls through to the editor. This
-    /// has to drive the REAL widget tree, because the bug is in that
-    /// integration: no smaller test can see it.
+    /// Clicks in the bar route focus to the clicked field — two repros of the
+    /// same capture-starvation bug, both driving the REAL widget tree (nothing
+    /// smaller sees them): (1) clicking a field must not leave the editor
+    /// stale-focused and stealing Tab; (2) clicking one field after another must
+    /// move focus there, not bounce back. Both stem from a widget capturing a
+    /// click and the containing `Stack` then skipping a sibling that needed to
+    /// unfocus — fixed by making the boxes plain rows, not stacks.
     #[test]
-    fn clicking_a_bar_input_stops_the_editor_stealing_tab() {
+    fn bar_clicks_route_focus_to_the_clicked_field() {
         use iced::advanced::widget::Operation;
         use iced::advanced::{clipboard, renderer};
         use iced::keyboard::{key::Named, Key, Modifiers};
         use iced::{mouse, Event, Font, Pixels, Point, Size, Theme};
         use iced_runtime::task;
         use iced_runtime::user_interface::{Cache, UserInterface};
+        use std::slice::from_ref;
         use std::task::{Context, Poll, Waker};
 
         const W: f32 = 900.0;
@@ -2406,24 +2504,49 @@ mod tests {
         );
         app.apply(Action::Undo);
 
-        // THE REPRO. Click the find input (its box is at ~y=26, left of the
-        // toggles), then Tab. Before the fix, the click focused the input
-        // natively but never unfocused the editor (its press was captured, so the
-        // Stack stopped dispatching and the editor's unfocus never ran), leaving
-        // TWO widgets focused; Tab then reached the still-focused editor and
-        // indented. It must NOT.
-        // On the find input's box (measured: its #3C3C3C field covers x≈500,
-        // y≈14–38; x=600 is past it, over the toggles).
-        let on_input = mouse::Cursor::Available(Point::new(500.0, 26.0));
-        frame(&mut app, &mut cache, &mut pending, &[click], on_input);
-        frame(&mut app, &mut cache, &mut pending, &[], on_input); // apply resync
+        // REPRO 1 (editor steals Tab). Click the find field, then Tab. Before
+        // the fix the click focused the field natively but never unfocused the
+        // editor (its press was captured, the Stack stopped dispatching, and the
+        // editor's unfocus never ran), leaving TWO widgets focused; Tab then
+        // reached the still-focused editor and indented. It must NOT.
+        // x=440 is in the find field's text area (row 1), left of the in-box
+        // toggles.
+        let on_find = mouse::Cursor::Available(Point::new(440.0, 26.0));
+        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_find);
+        frame(&mut app, &mut cache, &mut pending, &[], on_find); // apply resync
         let before = app.doc.text().into_owned();
-        frame(&mut app, &mut cache, &mut pending, &[tab], on_input);
+        frame(&mut app, &mut cache, &mut pending, from_ref(&tab), on_find);
         assert_eq!(
             app.doc.text(),
             before.as_str(),
-            "the editor kept focus after the input was clicked and stole Tab to indent"
+            "the editor kept focus after the field was clicked and stole Tab to indent"
         );
+
+        // REPRO 2 (field ↔ field). Focus the REPLACE field, then click the FIND
+        // field: focus must move to find, not bounce back to replace. Before the
+        // fix, clicking find left replace stale-focused (its box's Stack was
+        // starved by find's capture), and the resync's batch order re-focused
+        // replace. Verified by which field a typed char lands in.
+        let on_replace = mouse::Cursor::Available(Point::new(440.0, 55.0)); // replace field, row 2
+        let type_z = Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Character("Z".into()),
+            modified_key: Key::Character("Z".into()),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: Modifiers::default(),
+            text: Some("Z".into()),
+            repeat: false,
+        });
+        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_replace);
+        frame(&mut app, &mut cache, &mut pending, &[], on_replace); // apply resync
+        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_find);
+        frame(&mut app, &mut cache, &mut pending, &[], on_find); // apply resync
+        let (fq, rt) = (app.find_query.clone(), app.replace_text.clone());
+        frame(&mut app, &mut cache, &mut pending, from_ref(&type_z), on_find);
+        assert_ne!(app.find_query, fq, "a char typed after clicking FIND must land in the find field");
+        assert_eq!(app.replace_text, rt, "…and not in the replace field");
     }
 
     /// The bar's global chords, and — the load-bearing one — that Tab only moves

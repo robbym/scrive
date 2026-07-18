@@ -66,6 +66,8 @@ pub mod icon {
     pub const REPLACE_ALL: char = '\u{eb3c}';
     /// `case-sensitive` (U+EAB1) — the find bar's `Aa` option toggle.
     pub const CASE_SENSITIVE: char = '\u{eab1}';
+    /// `preserve-case` (U+EB2E) — the replace bar's `AB` option toggle.
+    pub const PRESERVE_CASE: char = '\u{eb2e}';
     /// `whole-word` (U+EB7E) — the find bar's `ab|` option toggle.
     pub const WHOLE_WORD: char = '\u{eb7e}';
     /// `regex` (U+EB38) — the find bar's `.*` option toggle.

@@ -1926,7 +1926,15 @@ impl Document {
     /// never overwritten before it has been shown. One transaction ⇒ one undo
     /// step, and the match set needs no resync — it rides the commit through the
     /// shared view-rebase mover like any other edit.
-    pub fn replace_next(&mut self, replacement: &str, now_ms: u64) -> Option<Range<u32>> {
+    /// `preserve_case` (the replace bar's `AB` toggle) re-cases the replacement
+    /// to the match it lands on — an ALL-CAPS match takes an upper-cased
+    /// replacement, a Capitalized match a capitalized one.
+    pub fn replace_next(
+        &mut self,
+        replacement: &str,
+        preserve_case: bool,
+        now_ms: u64,
+    ) -> Option<Range<u32>> {
         self.find.maybe_rescan(&self.buffer, &mut self.decorations, now_ms);
         let extent = {
             let sel = self.selections.newest();
@@ -1938,16 +1946,21 @@ impl Document {
         let armed = !extent.is_empty()
             && self.find.active_range(&self.decorations).is_some_and(|r| r == extent);
         if armed {
-            // In regex mode the replacement is a template, so it must be
-            // expanded against THIS match's captures — resolved through the one
-            // owner of that rule, bounded to the match itself.
+            // The replacement is resolved through the one owner of that rule
+            // (regex templating + preserve-case), bounded to this match.
             let text = self.find.query().cloned().map_or_else(
                 || replacement.to_string(),
                 |q| {
-                    crate::find::replacements(&self.buffer, &q, extent.clone(), replacement)
-                        .into_iter()
-                        .next()
-                        .map_or_else(|| replacement.to_string(), |(_, t)| t)
+                    crate::find::replacements(
+                        &self.buffer,
+                        &q,
+                        extent.clone(),
+                        replacement,
+                        preserve_case,
+                    )
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| replacement.to_string(), |(_, t)| t)
                 },
             );
             if self.edit(vec![EditOp::new(extent, text)]).is_err() {
@@ -1975,15 +1988,20 @@ impl Document {
     /// `replacement`, so a query with millions of hits allocates proportionally
     /// before it commits. Bounded by the match count and paid once per press.
     ///
+    /// `preserve_case` (the replace bar's `AB` toggle) re-cases each replacement
+    /// to the match it lands on — an ALL-CAPS match takes an upper-cased
+    /// replacement, a Capitalized match a capitalized one.
+    ///
     /// [`FIND_MATCH_CAP`]: crate::find::FIND_MATCH_CAP
-    pub fn replace_all(&mut self, replacement: &str) -> usize {
+    pub fn replace_all(&mut self, replacement: &str, preserve_case: bool) -> usize {
         let Some(query) = self.find.query().cloned() else {
             return 0; // find is idle
         };
         // Scoped find replaces only inside its range — the scan bound is the one
         // place that has to know, so every other path inherits it.
         let within = self.find.scope().unwrap_or(0..self.buffer.len());
-        let plan = crate::find::replacements(&self.buffer, &query, within, replacement);
+        let plan =
+            crate::find::replacements(&self.buffer, &query, within, replacement, preserve_case);
         if plan.is_empty() {
             return 0; // no matches ⇒ no transaction, no undo step
         }
@@ -2902,7 +2920,7 @@ mod tests {
         let original = "foo bar foo baz foo";
         let mut d = doc(original);
         d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
-        assert_eq!(d.replace_all("QUX"), 3);
+        assert_eq!(d.replace_all("QUX", false), 3);
         assert_eq!(d.text(), "QUX bar QUX baz QUX");
         assert!(d.undo());
         assert_eq!(d.text(), original, "replace-all must undo as ONE step");
@@ -2920,7 +2938,7 @@ mod tests {
         let mut d = doc(&"a".repeat(n));
         d.set_find_query(Some(FindQuery { text: "a".into(), case_sensitive: false, ..Default::default() }), 0);
         assert_eq!(d.find_match_count(), crate::find::FIND_MATCH_CAP, "the live set caps");
-        assert_eq!(d.replace_all("b"), n, "replace-all must NOT cap");
+        assert_eq!(d.replace_all("b", false), n, "replace-all must NOT cap");
         assert_eq!(d.text(), "b".repeat(n), "every match past the cap replaced too");
     }
 
@@ -2930,12 +2948,12 @@ mod tests {
         d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
         // Nothing selected yet: the first press only NAVIGATES — text is never
         // overwritten before it has been shown.
-        assert_eq!(d.replace_next("X", 0), Some(0..3));
+        assert_eq!(d.replace_next("X", false, 0), Some(0..3));
         assert_eq!(d.text(), "foo bar foo", "the first press must not replace");
         // Now the selection IS the active match: replace it, then advance. The
         // returned range is POST-edit — "foo bar foo" − "foo" + "X" ⇒ the
         // surviving match slid 8..11 → 6..9.
-        assert_eq!(d.replace_next("X", 0), Some(6..9));
+        assert_eq!(d.replace_next("X", false, 0), Some(6..9));
         assert_eq!(d.text(), "X bar foo");
         // …and one undo takes the replacement back.
         assert!(d.undo());
@@ -2951,7 +2969,7 @@ mod tests {
         d.set_find_scope(Some(0..7), 0);
         assert_eq!(d.find_match_count(), 2, "only the in-scope matches survive");
         // …and replace-all inherits that without knowing the scope exists.
-        assert_eq!(d.replace_all("X"), 2, "replace-all must honor the scope");
+        assert_eq!(d.replace_all("X", false), 2, "replace-all must honor the scope");
         assert_eq!(d.text(), "X X | foo foo", "the out-of-scope matches are untouched");
         // Clearing the scope brings the rest back.
         d.set_find_scope(None, 0);
@@ -3114,7 +3132,7 @@ mod tests {
             0,
         );
         assert_eq!(d.find_match_count(), 3);
-        assert_eq!(d.replace_all("#"), 3);
+        assert_eq!(d.replace_all("#", false), 3);
         assert_eq!(d.text(), "a# b# c#");
         assert!(d.undo());
         assert_eq!(d.text(), original, "a regex replace-all undoes as ONE step");
@@ -3128,7 +3146,7 @@ mod tests {
             Some(FindQuery { text: r"fn (\w+)\(\)".into(), regex: true, ..Default::default() }),
             0,
         );
-        assert_eq!(d.replace_all("let $1 = 1;"), 2);
+        assert_eq!(d.replace_all("let $1 = 1;", false), 2);
         assert_eq!(d.text(), "let one = 1;\nlet two = 1;");
         assert!(d.undo());
         assert_eq!(d.text(), "fn one()\nfn two()", "still ONE undo step");
@@ -3137,7 +3155,7 @@ mod tests {
         // typed `$1` must land as a literal `$1`.
         let mut e = doc("aaa");
         e.set_find_query(Some(FindQuery { text: "aaa".into(), ..Default::default() }), 0);
-        assert_eq!(e.replace_all("$1"), 1);
+        assert_eq!(e.replace_all("$1", false), 1);
         assert_eq!(e.text(), "$1");
     }
 
@@ -3148,9 +3166,42 @@ mod tests {
             Some(FindQuery { text: r"fn (\w+)\(\)".into(), regex: true, ..Default::default() }),
             0,
         );
-        d.replace_next("x", 0); // first press: selects only
-        d.replace_next("[$1]", 0); // second: replaces the active match
+        d.replace_next("x", false, 0); // first press: selects only
+        d.replace_next("[$1]", false, 0); // second: replaces the active match
         assert_eq!(d.text(), "[one]\nfn two()");
+    }
+
+    #[test]
+    fn preserve_case_recases_replacements_to_their_match() {
+        // A literal rename that keeps each occurrence's casing: FOO→BAR,
+        // Foo→Bar, foo→bar, all from one replacement "bar".
+        let mut d = doc("FOO Foo foo fOo");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(d.replace_all("bar", true), 4);
+        // FOO⇒upper, Foo⇒capitalized, foo⇒lower, fOo⇒mixed (left as typed).
+        assert_eq!(d.text(), "BAR Bar bar bar");
+
+        // Off, the same replacement lands verbatim.
+        let mut e = doc("FOO Foo foo");
+        e.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        assert_eq!(e.replace_all("bar", false), 3);
+        assert_eq!(e.text(), "bar bar bar");
+    }
+
+    #[test]
+    fn preserve_case_applies_after_regex_expansion() {
+        // The re-casing keys off the whole match, applied to the expanded
+        // template — so `$1`-driven text is re-cased too.
+        let mut d = doc("GETVALUE getvalue");
+        d.set_find_query(
+            Some(FindQuery { text: "(get)(value)".into(), regex: true, ..Default::default() }),
+            0,
+        );
+        // Braced refs — `$2_$1` would read `$2_` as a group named "2_" (the
+        // greedy unbraced-ref rule), so delimit with `${…}`.
+        assert_eq!(d.replace_all("${2}_${1}", true), 2);
+        // GETVALUE (all upper) ⇒ VALUE_GET; getvalue (all lower) ⇒ value_get.
+        assert_eq!(d.text(), "VALUE_GET value_get");
     }
 
     #[test]
@@ -3177,9 +3228,9 @@ mod tests {
     #[test]
     fn replace_all_without_a_match_commits_nothing() {
         let mut d = doc("foo");
-        assert_eq!(d.replace_all("x"), 0, "no query ⇒ no-op");
+        assert_eq!(d.replace_all("x", false), 0, "no query ⇒ no-op");
         d.set_find_query(Some(FindQuery { text: "zzz".into(), case_sensitive: false, ..Default::default() }), 0);
-        assert_eq!(d.replace_all("x"), 0, "no matches ⇒ no-op");
+        assert_eq!(d.replace_all("x", false), 0, "no matches ⇒ no-op");
         assert_eq!(d.text(), "foo");
         assert!(!d.is_dirty(), "a no-op replace must not open an undo step");
         assert!(!d.undo());
