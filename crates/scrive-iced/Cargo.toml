@@ -10,7 +10,7 @@ keywords = ["editor", "iced", "widget", "text", "gui"]
 categories = ["gui", "text-editors"]
 
 [dependencies]
-scrive-core = { path = "../scrive-core", version = "0.1.0" }
+scrive-core = { path = "../scrive-core", version = "0.2.0" }
 # `advanced` unlocks the low-level `Widget` API (iced::advanced::*) the editor
 # widget implements directly, rather than as a canvas::Program.
 iced = { version = "0.14", features = ["advanced"] }
