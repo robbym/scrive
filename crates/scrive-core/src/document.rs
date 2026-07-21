@@ -78,6 +78,12 @@ pub struct Document {
     /// like the grammar — the core ships no language knowledge. `None`
     /// makes [`Document::toggle_line_comment`] a no-op.
     line_comment: Option<String>,
+    /// String / char-literal delimiters for comment/string-aware bracket matching
+    /// (opt-in per language, via [`Document::set_bracket_lexing`]). With the line
+    /// comment they form the [`BracketConfig`](crate::BracketConfig); all empty ⇒
+    /// purely structural bracket matching (the original behavior, zero overhead).
+    bracket_string_delims: Vec<u8>,
+    bracket_char_delim: Option<u8>,
     /// The expand-selection ladder: each [`Document::expand_selection`]
     /// pushes the pre-expansion set so `shrink_selection` can walk back down.
     /// Transient like `column` — any other gesture or edit clears it.
@@ -93,6 +99,12 @@ pub struct Document {
     reveal_seq: u64,
     /// The strategy of the last reveal request.
     reveal_mode: RevealMode,
+    /// Opt-in incremental-change log. Off by default (zero overhead per edit);
+    /// when [`Document::observe_changes`] enables it, every committed edit's
+    /// applied ops are appended for a host to [`drain`](Document::drain_changes)
+    /// — e.g. to mirror edits to a language server as `textDocument/didChange`.
+    observe_changes: bool,
+    changes: Vec<EditOp>,
     /// Memoized [`FoldMap`]. The render path queries it ~20× per frame, so it is
     /// cached rather than rebuilt (a fresh build is O(folds), which at document
     /// scale with everything collapsed would stall scrolling). A fold toggle
@@ -172,9 +184,13 @@ impl Document {
             folds: FoldSet::new(),
             find: FindState::new(),
             line_comment: None,
+            bracket_string_delims: Vec::new(),
+            bracket_char_delim: None,
             expand_stack: Vec::new(),
             reveal_seq: 0,
             reveal_mode: RevealMode::Fit,
+            observe_changes: false,
+            changes: Vec::new(),
             // Seed with a never-matching key so the first `fold_map()` builds it.
             fold_cache: RefCell::new(FoldMapCache { key: (u64::MAX, u64::MAX), map: FoldMap::empty() }),
         })
@@ -224,6 +240,37 @@ impl Document {
     /// toggle-comment.
     pub fn set_line_comment(&mut self, prefix: Option<&str>) {
         self.line_comment = prefix.map(str::to_owned);
+        // The line comment feeds comment-aware bracket matching too, so brackets
+        // inside `// …` stop being matched/colored/folded — rebuild once.
+        self.rebuild_brackets();
+    }
+
+    /// Configure comment/string-aware bracket matching: `string_delims` (e.g.
+    /// `b'"'`) open strings and `char_delim` (e.g. `b'\''`) opens a char literal,
+    /// so brackets inside them are not matched (colored, folded, indent-guided).
+    /// Line comments come from [`set_line_comment`](Document::set_line_comment).
+    /// All constructs are line-local; this rebuilds the bracket set (O(n), for a
+    /// setup-time config change, never per edit).
+    pub fn set_bracket_lexing(&mut self, string_delims: Vec<u8>, char_delim: Option<u8>) {
+        self.bracket_string_delims = string_delims;
+        self.bracket_char_delim = char_delim;
+        self.rebuild_brackets();
+    }
+
+    /// The comment/string skip config derived from the language settings.
+    fn bracket_config(&self) -> crate::bracket::BracketConfig {
+        crate::bracket::BracketConfig {
+            line_comments: self.line_comment.iter().cloned().collect(),
+            string_delims: self.bracket_string_delims.clone(),
+            char_delim: self.bracket_char_delim,
+        }
+    }
+
+    /// Rebuild the whole bracket set under the current config — O(n), for a config
+    /// change only.
+    fn rebuild_brackets(&mut self) {
+        let cfg = self.bracket_config();
+        self.brackets = crate::bracket::Brackets::match_text_with(&self.buffer.text(), &cfg);
     }
 
     /// The injected line-comment prefix, if any.
@@ -926,6 +973,9 @@ impl Document {
             self.selections.rebase(committed.patch());
 
             let tab = self.tab_size();
+            // Comment/string-aware bracket config, cloned before the `&mut self`
+            // views borrow so the mover can consult it.
+            let bracket_cfg = self.bracket_config();
             // Rebase every derived view through the patch — the single mover,
             // shared verbatim with undo/redo (see `rebase_views`). The auto-close
             // provenance is an `AutoClosePair` decoration, so it rides here too —
@@ -942,6 +992,7 @@ impl Document {
                 &self.buffer,
                 tab,
                 &committed,
+                &bracket_cfg,
             );
 
             // Now that the provenance decoration has ridden the patch, drop it if
@@ -980,6 +1031,17 @@ impl Document {
                     cache.key = (u64::MAX, u64::MAX);
                 }
             }
+            // Log the applied deltas for a host draining incremental changes
+            // (LSP `didChange`) — only when observing, so the common path pays
+            // nothing. Descending start order so sequential application within
+            // this batch is offset-stable; ops move into history next, so read
+            // them here. Their ranges are in the pre-edit coordinates the batch
+            // was applied against — exactly what a content-change wants.
+            if self.observe_changes {
+                let mut ops = committed.forward_ops().to_vec();
+                ops.sort_by_key(|op| core::cmp::Reverse(op.range.start));
+                self.changes.extend(ops);
+            }
             // Record history LAST, moving the forward + inverse op batches out of
             // `committed` with no clone (rebase_views already used its borrow of
             // the inverse; the fold-cache borrow above has been dropped, freeing
@@ -990,6 +1052,29 @@ impl Document {
             return Ok(Committed::from_patch(patch));
         }
         Ok(committed)
+    }
+
+    /// Enable or disable the incremental-change log. Off by default so the common
+    /// path pays nothing; a host mirroring edits to a language server
+    /// (`textDocument/didChange`) turns it on and drains
+    /// [`drain_changes`](Document::drain_changes) after each edit. Turning it off
+    /// clears any pending log. For full-document sync, leave this off and re-read
+    /// [`snapshot`](Document::snapshot) instead.
+    pub fn observe_changes(&mut self, on: bool) {
+        self.observe_changes = on;
+        if !on {
+            self.changes.clear();
+        }
+    }
+
+    /// Drain the incremental-change log: every applied edit since the last drain,
+    /// in commit order (offset-stable within each commit), as `EditOp` deltas
+    /// whose `range` is in the coordinates of the document just before that edit —
+    /// ready to translate into language-server content changes. Empty unless
+    /// [`observe_changes`](Document::observe_changes) is on.
+    #[must_use]
+    pub fn drain_changes(&mut self) -> Vec<EditOp> {
+        core::mem::take(&mut self.changes)
     }
 
     /// Undo the most recent undo unit. Returns `false` if there is nothing to
@@ -1008,6 +1093,7 @@ impl Document {
         // caret wherever it happened to be. Steps revert newest→oldest, so the LAST
         // callback is the oldest edit — the region's start.
         let mut caret_home: Option<u32> = None;
+        let bracket_cfg = self.bracket_config();
         let Self {
             history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
         } = self;
@@ -1015,7 +1101,7 @@ impl Document {
         let undone = history.undo(buffer, selections, |committed, buffer| {
             // The one mover — highlight, brackets, decorations, folds (position +
             // fold reveal) all ride it, so undo needs no per-feature resync.
-            rebase_views(&mut views, buffer, tab, committed);
+            rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
             if let Some(e) = committed.patch().edits().first() {
                 caret_home = Some(e.new.start);
             }
@@ -1043,13 +1129,14 @@ impl Document {
         // where it would sit had the edit just been made. Steps replay oldest→newest,
         // so the LAST callback is the newest edit — the region's end.
         let mut caret_home: Option<u32> = None;
+        let bracket_cfg = self.bracket_config();
         let Self {
             history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
         } = self;
         let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
         let redone = history.redo(buffer, selections, |committed, buffer| {
             // The same one mover as `undo` (folds ride it, position + fold reveal).
-            rebase_views(&mut views, buffer, tab, committed);
+            rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
             if let Some(e) = committed.patch().edits().last() {
                 caret_home = Some(e.new.end);
             }
@@ -2248,6 +2335,7 @@ fn rebase_views(
     buffer: &Buffer,
     tab: u32,
     committed: &Committed,
+    bracket_cfg: &crate::bracket::BracketConfig,
 ) -> core::ops::Range<u32> {
     // Highlight cache: splice the transaction's per-edit line spans (built
     // below). The size invariant (new_size = old_size − old_count + new_count)
@@ -2302,7 +2390,7 @@ fn rebase_views(
     // remains the load-time constructor and the tests' oracle). It returns the
     // reconcile window — the re-matched byte span, or `0..0` when only offsets
     // shifted (no structure changed) — the reconcile-skip signal below.
-    let reconcile_region = views.brackets.apply_edit(committed.patch(), buffer);
+    let reconcile_region = views.brackets.apply_edit(committed.patch(), buffer, bracket_cfg);
     // Decorations: the one eager mover for ALL bulk kinds — diagnostics, find
     // matches, snippet stops — ride here, so undo/redo need no per-decoration
     // handling.

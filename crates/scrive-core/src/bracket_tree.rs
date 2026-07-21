@@ -245,6 +245,23 @@ pub(crate) fn tree_from_text(text: &str) -> SumTree<BracketItem> {
     SumTree::from_items(items)
 }
 
+/// [`tree_from_text`], but skipping brackets the [`SkipContext`] flags as inside a
+/// comment / string / char literal — the comment-aware load-time constructor.
+pub(crate) fn tree_from_text_with(
+    text: &str,
+    cfg: &crate::bracket::BracketConfig,
+) -> SumTree<BracketItem> {
+    let mut items: Vec<BracketItem> = Vec::new();
+    let mut prev = 0u32;
+    for (off, b, skip) in crate::bracket::SkipContext::new(text.as_bytes(), cfg) {
+        if !skip && (is_opener(b) || is_closer(b)) {
+            items.push(BracketItem { gap: off - prev, ch: b });
+            prev = off;
+        }
+    }
+    SumTree::from_items(items)
+}
+
 /// The bracket char at exactly `offset`, or `None` if no bracket sits there — a
 /// byte→index bridge (`k` brackets lie before `offset`, so the item there is the
 /// `k`-th, kept only if its resolved offset is exactly `offset`). O(log), ZERO heap
@@ -425,6 +442,7 @@ pub(crate) fn apply_edit(
     tree: &SumTree<BracketItem>,
     patch: &Patch,
     buffer: &Buffer,
+    cfg: &crate::bracket::BracketConfig,
 ) -> (SumTree<BracketItem>, Range<u32>) {
     let edits = patch.edits();
     if edits.is_empty() {
@@ -433,54 +451,73 @@ pub(crate) fn apply_edit(
     // Fast path: a structure-neutral patch (no bracket char inserted, none deleted)
     // leaves the bracket SET and pairing identical — only offsets shift. With MANY
     // edits (document-scale multi-caret typing) the per-edit split/append splices
-    // below cost O(edits · log²) node allocations. Rebuild the delta-gap tree in ONE
-    // bulk pass instead (O(brackets), a single balanced
-    // `from_items`). Below the threshold the per-edit path is cheaper (a single
-    // structure-neutral keystroke re-anchors O(1) gaps in O(log)), so keep it there.
-    // Structural (bracket char changed) still takes the per-edit path; nothing
-    // reconciles either way here (`0..0`).
-    if edits.len() > 64 && is_structure_neutral(tree, patch, buffer) {
+    // below cost O(edits · log²) node allocations; rebuild in ONE bulk pass instead.
+    // But that "no bracket char ⇒ set unchanged" reasoning holds ONLY without
+    // comment/string awareness: with it, a typed `/` or `"` reshuffles skip-state
+    // and so the bracket set, touching no bracket char — so the fast path is taken
+    // only when the config is inactive.
+    if !cfg.is_active() && edits.len() > 64 && is_structure_neutral(tree, patch, buffer) {
         return (bulk_shift(tree, patch), 0..0);
     }
+    // The regions to rescan+splice, in NEW coords, as (new range, old byte length).
+    // Without awareness each edit is its own region. WITH awareness the rescan must
+    // see whole LINES — skip-state is line-local, so a `SkipContext` started at a
+    // line boundary is correct — so each edit widens to its line boundaries and
+    // same/adjacent-line edits merge. Still O(edited lines), never document-scale.
+    let regions: Vec<(Range<u32>, u32)> = if cfg.is_active() {
+        line_aligned_regions(patch, buffer)
+    } else {
+        edits.iter().map(|e| (e.new.clone(), e.old.end - e.old.start)).collect()
+    };
+
     // Reconcile's left edge, from the PRE-edit tree: the outermost opener enclosing
-    // the first edit's start (same byte in old/new coords — the prefix is untouched).
-    let rs0 = edits[0].new.start;
+    // the first region's start (same byte in old/new coords — the prefix is untouched).
+    let rs0 = regions[0].0.start;
     let seed_lo = enclosing_openers(tree, rs0).first().map_or(rs0, |e| e.off);
-    let re = edits[edits.len() - 1].new.end;
+    let re = regions[regions.len() - 1].0.end;
 
     let mut cur = tree.clone();
     let mut structural = false;
-    for e in edits {
-        // On the running tree (edits to the left already applied), this edit's new
-        // region is `[rs, re_new)`; the old region it replaces ends at `rs + old_len`
+    for (new_range, old_len) in &regions {
+        // On the running tree (regions to the left already applied), this region's
+        // new span is `[rs, re_new)`; the old span it replaces ends at `rs + old_len`
         // (the prefix left of `rs` is settled, so `rs` is the same byte in both).
-        let rs = e.new.start;
-        let re_new = e.new.end;
-        let old_len = e.old.end - e.old.start;
+        let rs = new_range.start;
+        let re_new = new_range.end;
         let re_old = rs + old_len;
         let delta = i64::from(re_new) - i64::from(re_old);
 
         // Split by COUNT, not byte: a delta-gap item is located at its span's END,
-        // so `split_at(ByteDim(rs))` would keep a bracket sitting exactly at `rs` on
-        // the left — but that bracket moves (insertion) or is removed (deletion), so
-        // it belongs to the suffix/region. The strict `summary_before(..).count`
-        // bounds (`< rs`, `< re_old`) are the correct index cuts.
+        // so the strict `summary_before(..).count` bounds are the correct index cuts.
         let k_rs = cur.summary_before(&ByteDim(rs)).count;
         let k_re_old = cur.summary_before(&ByteDim(re_old)).count;
         let before = cur.split_at(&CountDim(k_rs)).0;
         let before_end = before.extent::<ByteDim>().0;
         let removed = k_re_old - k_rs;
 
-        // Rescan the new region's bracket chars (single-byte ASCII; the byte index
-        // is the offset), delta-gap encoded from the last placed bracket.
+        // Rescan the new span's bracket chars (single-byte ASCII; the byte index is
+        // the offset), delta-gap encoded from the last placed bracket. When aware,
+        // `rs` is a line start, so the `SkipContext` starts fresh and correctly
+        // classifies each byte as inside a comment / string / char literal.
         let mut region_items: Vec<BracketItem> = Vec::new();
         let mut prev = before_end;
         if re_new > rs {
-            for (i, b) in buffer.slice(rs..re_new).bytes().enumerate() {
-                if is_opener(b) || is_closer(b) {
-                    let off = rs + i as u32;
-                    region_items.push(BracketItem { gap: off - prev, ch: b });
-                    prev = off;
+            let slice = buffer.slice(rs..re_new);
+            if cfg.is_active() {
+                for (i, byte, skip) in crate::bracket::SkipContext::new(slice.as_bytes(), cfg) {
+                    if !skip && (is_opener(byte) || is_closer(byte)) {
+                        let off = rs + i;
+                        region_items.push(BracketItem { gap: off - prev, ch: byte });
+                        prev = off;
+                    }
+                }
+            } else {
+                for (i, b) in slice.bytes().enumerate() {
+                    if is_opener(b) || is_closer(b) {
+                        let off = rs + i as u32;
+                        region_items.push(BracketItem { gap: off - prev, ch: b });
+                        prev = off;
+                    }
                 }
             }
         }
@@ -494,6 +531,42 @@ pub(crate) fn apply_edit(
         cur = mid.append(&fixed_suffix);
     }
     (cur, if structural { seed_lo..re.saturating_add(1) } else { 0..0 })
+}
+
+/// Widen each edit's new-coord span to line boundaries (skip-state is line-local),
+/// merging same/adjacent-line spans, as `(new range, old byte length)`. Bounded by
+/// the edited lines — a scattered multi-caret patch yields one small region per
+/// caret line, never one document-spanning region.
+fn line_aligned_regions(patch: &Patch, buffer: &Buffer) -> Vec<(Range<u32>, u32)> {
+    use crate::coords::Point;
+    let line_start = |off: u32| buffer.point_to_offset(Point::new(buffer.offset_to_point(off).row, 0));
+    let next_line_start = |off: u32| {
+        let row = buffer.offset_to_point(off).row;
+        if row + 1 < buffer.line_count() {
+            buffer.point_to_offset(Point::new(row + 1, 0))
+        } else {
+            buffer.len()
+        }
+    };
+    // (new_start, new_end, net delta), one per edit, merged where line spans touch.
+    let mut merged: Vec<(u32, u32, i64)> = Vec::new();
+    for e in patch.edits() {
+        let ns = line_start(e.new.start);
+        let ne = next_line_start(e.new.end);
+        let d = i64::from(e.new.end - e.new.start) - i64::from(e.old.end - e.old.start);
+        match merged.last_mut() {
+            Some(last) if ns <= last.1 => {
+                last.1 = last.1.max(ne);
+                last.2 += d;
+            }
+            _ => merged.push((ns, ne, d)),
+        }
+    }
+    // old length = new length − net delta (never negative: the region held the edits).
+    merged
+        .into_iter()
+        .map(|(ns, ne, d)| (ns..ne, (i64::from(ne - ns) - d).max(0) as u32))
+        .collect()
 }
 
 /// Whether `patch` changes no bracket structure — no bracket char inserted, none

@@ -10,7 +10,7 @@ mod support;
 use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use scrive_core::{Document, FindQuery, SelectionSet};
+use scrive_core::{BracketConfig, Brackets, Document, FindQuery, SelectionSet};
 
 /// A document with a single caret at `caret`.
 fn doc_at(text: &str, caret: u32) -> Document {
@@ -347,6 +347,21 @@ fn brackets(c: &mut Criterion) {
     let d = doc_at(&text, 0);
     g.bench_function("all_len_1m", |b| {
         b.iter(|| black_box(d.brackets().all().len()));
+    });
+    // Load-time bracket matching: the plain structural byte scan vs the
+    // comment/string-aware `SkipContext` scan (line comment `//` + string `"`),
+    // same 1 MB corpus. The ratio is the added cost of comment-awareness on the
+    // O(n) load path.
+    g.bench_function("match_text_1m", |b| {
+        b.iter(|| black_box(Brackets::match_text(&text)));
+    });
+    let cfg = BracketConfig {
+        line_comments: vec!["//".into()],
+        string_delims: vec![b'"'],
+        char_delim: None,
+    };
+    g.bench_function("match_text_aware_1m", |b| {
+        b.iter(|| black_box(Brackets::match_text_with(&text, &cfg)));
     });
     g.finish();
 }

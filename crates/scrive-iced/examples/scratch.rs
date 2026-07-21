@@ -12,72 +12,49 @@
 //! projections can be byte-diffed against a baseline PNG (chips, collapsed
 //! tails, gutter fold gaps all on screen at once).
 //!
-//! A real editor now: type, move (arrows / Home / End / Ctrl+arrows), backspace,
-//! enter, tab, click to place the caret — all applied to a `scrive_core::Document`
-//! through the [`scrive_iced::Editor`] widget's [`Action`]s.
+//! This example drives the batteries-included [`scrive_iced::CodeEditor`]: the
+//! app owns the editor, injects stub language-intelligence providers, and wires a
+//! stub compile loop (the debounced `FIXME` / `TODO` re-lint) through the editor's
+//! dirty signal + `set_diagnostics`. `examples/minimal.rs` is the bare-minimum
+//! integration; this one exercises the overrides and the recompile-on-edit hook.
 
 // On Windows, a release build is a GUI app with no console window; debug builds
-// keep the console so panics and the `--capture` messages stay visible. Ignored
-// on non-Windows targets.
+// keep the console so panics and the `--capture` messages stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[path = "shared/capture.rs"]
 mod capture;
 
+use std::ops::Range;
 use std::time::Instant;
 
-use iced::alignment::{Horizontal, Vertical};
-use iced::widget::operation::{focus, focus_next, focus_previous, is_focused};
-use iced::widget::{button, column, container, row, stack, text, text_input};
-use iced::{Alignment, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector};
-use std::ops::Range;
+use iced::{Element, Subscription, Task, Theme};
 
 use scrive_core::{
-    default_indent_size, is_completion_word_char, CompletionController, CompletionCx, CompletionItem,
-    CompletionKind, CompletionState, CompletionTrigger, Completions, Diagnostic, Document, FindQuery,
-    Hover, HoverCx, HoverInfo, InsertText, Point, Selection, SelectionId, SelectionSet, Severity,
-    SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome,
-    TokenTheme, LOOKBACK_LINES,
+    is_completion_word_char, CompletionCx, CompletionItem, CompletionKind, Completions, Diagnostic,
+    Granularity, Hover, HoverCx, HoverInfo, InsertText, Point, Severity, SignatureCx, SignatureHelp,
+    SignatureInfo, SyntaxDef,
 };
-use scrive_iced::{Action, Editor};
-
-/// Focusable ids. iced's `focus` operation focuses one and unfocuses all other
-/// focusables, so moving focus between the find input and the editor is a proper
-/// single-focus model (no double-typing).
-const FIND_INPUT: &str = "scrive-find-input";
-const REPLACE_INPUT: &str = "scrive-replace-input";
-const EDITOR: &str = "editor";
+use scrive_iced::{Action, CodeEditor, Event};
 
 /// The `--large <MB>` corpus, generated in `main` before the app starts.
 static LARGE_DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Skip the demo lint's full-text scan above this size: the stub stands in
-/// for a real compile loop (which consumes snapshots off-thread); scanning a
-/// 100 MB document on the UI thread per keystroke is not what it demonstrates.
+/// Skip the demo lint's full-text scan above this size: the stub stands in for a
+/// real compile loop (which consumes snapshots off-thread); scanning a 100 MB
+/// document on the UI thread per keystroke is not what it demonstrates.
 const RELINT_MAX_BYTES: u32 = 2 * 1_048_576;
 
-/// Debounce window (ms) for the demo re-lint. The stub compile pass scans
-/// the whole document; a real off-thread compiler is debounced the same way, so
-/// a burst of keystrokes coalesces into at most one scan per window instead of
-/// one O(N log N) scan per key. Mirrors find's `default_find_debounce` cadence
-/// (slightly longer — a lint pass is heavier than a match refill). Field-gate
-/// class: tune on the running app.
+/// Debounce window (ms) for the demo re-lint — a burst of keystrokes coalesces
+/// into at most one whole-document scan per window, mirroring how a real
+/// off-thread compiler would be debounced.
 const RELINT_DEBOUNCE_MS: u64 = 250;
 
-// Test-only tally of `App::relint` scan-body executions (post size-guard) — the
-// `relint_debounces_off_the_keystroke_path` test reads it to prove the
-// whole-document scan runs once per debounce window, not once per keystroke.
+// Test-only tally of `App::relint` scan-body executions — the debounce tests
+// read it to prove the whole-document scan runs once per window, not per key.
 #[cfg(test)]
 thread_local! {
     static RELINT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-// Test-only tally of synchronous mis-guess re-runs inside `HighlightPool::poll`
-// — the `poll_verifies_at_most_budget_per_frame` test reads its per-frame delta
-// to prove no more than `POLL_RERUN_BUDGET` heavy re-runs fire in one frame.
-#[cfg(test)]
-thread_local! {
-    static POLL_RERUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Synthetic Rust-shaped text for `--large <MB>` — the large-document stress
@@ -164,415 +141,151 @@ fn main() {
     .to_string()
 }
 
-// ======================================================================
-// Off-thread parallel + speculative highlight sweep.
-//
-// At `--large 100` (~3.2M lines) the top-down state chain makes a jump to the
-// bottom render fallback for ~16-20s of single-core work. This app-side pool
-// tokenizes the document as SEGMENTS on worker threads over an O(1) `Snapshot`
-// clone, stitches boundaries with the core's convergence rule
-// (`SegmentBoundary` equality), and feeds verified results back through
-// `Document::absorb_highlight`. The viewport is coloured immediately from a
-// GUESSED fresh state (speculative), then verified in place. Core stays sync
-// and thread-free; all threading lives here.
-// ======================================================================
-
-/// Documents at least this many bytes use the parallel sweep; smaller ones
-/// keep the synchronous path unchanged (so captures stay byte-identical).
-const PARALLEL_MIN_BYTES: u32 = 2 * 1_048_576;
-
-/// Max rows per sweep segment. Small enough that workers turn over quickly and
-/// the document splits into many more segments than workers, for load
-/// balancing and fine verified-progress grain (~40 ms of syntect each).
-const SEGMENT_MAX_ROWS: u32 = 32_768;
-
-/// Rows the speculative viewport paint backs off ABOVE the window, so a short
-/// local construct (a string/comment opened a few lines up) is usually
-/// absorbed by the guess.
-const SPECULATION_BACKOFF: u32 = 128;
-
-/// Verified-chain segments [`HighlightPool::poll`] absorbs per frame.
-/// Without it a frame whose channel handed back many contiguous-ready segments
-/// verifies them all at once — O(#segments) work (plus any mis-guess re-runs)
-/// in one paint. Bounding it paces total verification over ⌈#segments/budget⌉
-/// frames (the `active` flag keeps `window::frames` firing), each frame a
-/// constant. Field-gate class: start small, calibrate on `--large`.
-const POLL_VERIFY_BUDGET: usize = 4;
-
-/// Synchronous mis-guess re-runs [`HighlightPool::poll`] performs per frame —
-/// the HEAVY unit (a full `tokenize_segment` on the UI thread), so weighted
-/// tighter than the verify budget. A frame stops before a re-run that would
-/// exceed this, deferring it (and its `active`-kept reschedule) to the next
-/// frame. Field-gate class.
-const POLL_RERUN_BUDGET: usize = 1;
-
-/// One bulk chain segment to tokenize off-thread. `against` is the
-/// wrong-guessed old result on a corrected re-run (enables the early-stop
-/// splice); `rev` lets a worker drop a job an edit has superseded.
-struct Job {
-    idx: usize,
-    snapshot: std::sync::Arc<scrive_core::Snapshot>,
-    rows: Range<u32>,
-    start: scrive_core::SegmentStart,
-    spans_for: Range<u32>,
-    against: Option<scrive_core::SegmentTokens>,
-    rev: scrive_core::Revision,
-}
-
-/// A finished segment, echoing the revision so the coordinator can drop stale
-/// work.
-struct Done {
-    idx: usize,
-    seg: scrive_core::SegmentTokens,
-    rev: scrive_core::Revision,
-}
-
-/// The worker pool + verification coordinator. Threads are spawned once and
-/// live for the app; [`HighlightPool::start`] (re)dispatches a sweep. The
-/// workers tokenize only the BULK chain; the viewport is painted synchronously
-/// (see [`HighlightPool::speculate`]) — one window of rows is cheap on the UI
-/// thread and colours instantly, and wrong-guess re-runs also run on the UI
-/// thread (the early-stop makes them near-instant), so the verified chain
-/// advances as fast as the parallel Fresh results arrive.
-struct HighlightPool {
-    /// Grammar/theme handle — for the UI-thread speculation + re-runs (the
-    /// workers hold their own clones).
-    engine: scrive_core::HighlightEngine,
-    /// The document-top fresh state — the coordinator compares each segment's
-    /// guessed start against a prior segment's verified end with it.
-    fresh: scrive_core::SegmentBoundary,
-    /// The job queue (a deque; a re-run — critical-path — jumps not-yet-started
-    /// bulk segments). The `Condvar` parks idle workers so idle costs no CPU.
-    queue: std::sync::Arc<(std::sync::Mutex<std::collections::VecDeque<Job>>, std::sync::Condvar)>,
-    /// The live revision, shared with the workers: a worker drops a job whose
-    /// revision no longer matches BEFORE tokenizing it, so an edit's restart
-    /// does not burn full tokenizations on results `poll` would only discard.
-    cur_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    done_rx: std::sync::mpsc::Receiver<Done>,
-    _workers: Vec<std::thread::JoinHandle<()>>,
-    /// The snapshot the current sweep tokenizes; each job carries a clone.
-    snapshot: std::sync::Arc<scrive_core::Snapshot>,
-    rev: scrive_core::Revision,
-    /// The segment ranges of the current sweep (for re-dispatching a re-run).
-    seg_rows: Vec<Range<u32>>,
-    results: Vec<Option<scrive_core::SegmentTokens>>,
-    next_verify: usize,
-    /// The verified end boundary before `next_verify` (None => fresh / row 0).
-    prev_end: Option<scrive_core::SegmentBoundary>,
-    /// The padded viewport window — `spans_for` on chain segments + the paint.
-    window: Range<u32>,
-    active: bool,
-}
-
-impl HighlightPool {
-    /// Spawn the worker pool over a document's grammar/theme, then dispatch the
-    /// first sweep aimed at `viewport`. `None` without a grammar.
-    fn new(doc: &Document, viewport: Range<u32>) -> Option<Self> {
-        let engine = doc.highlight_engine()?;
-        let count = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).max(1))
-            .unwrap_or(1);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
-        let queue: std::sync::Arc<(std::sync::Mutex<std::collections::VecDeque<Job>>, std::sync::Condvar)> =
-            std::sync::Arc::new((std::sync::Mutex::new(std::collections::VecDeque::new()), std::sync::Condvar::new()));
-        let cur_rev = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(doc.revision().0));
-        let workers = (0..count)
-            .map(|_| {
-                let engine = engine.clone();
-                let queue = queue.clone();
-                let cur_rev = cur_rev.clone();
-                let done_tx = done_tx.clone();
-                std::thread::spawn(move || loop {
-                    // Park until a job is available; take it, then release the
-                    // lock so processing is concurrent.
-                    let job = {
-                        let (lock, cvar) = &*queue;
-                        let mut q = lock.lock().unwrap();
-                        while q.is_empty() {
-                            q = cvar.wait(q).unwrap();
-                        }
-                        q.pop_front().unwrap()
-                    };
-                    // Drop a stale job (an edit restarted the sweep) BEFORE
-                    // spending a full tokenization on it.
-                    if job.rev.0 != cur_rev.load(std::sync::atomic::Ordering::Relaxed) {
-                        continue;
-                    }
-                    let seg = scrive_core::tokenize_segment(
-                        &engine, &job.snapshot, job.rows, job.start, Some(job.spans_for),
-                        job.against.as_ref(),
-                    );
-                    let _ = done_tx.send(Done { idx: job.idx, seg, rev: job.rev });
-                })
-            })
-            .collect();
-        let fresh = engine.fresh_boundary();
-        let mut pool = Self {
-            engine,
-            fresh,
-            queue,
-            cur_rev,
-            done_rx,
-            _workers: workers,
-            snapshot: std::sync::Arc::new(doc.snapshot()),
-            rev: doc.revision(),
-            seg_rows: Vec::new(),
-            results: Vec::new(),
-            next_verify: 0,
-            prev_end: None,
-            window: 0..0,
-            active: false,
-        };
-        pool.start(doc, viewport);
-        Some(pool)
-    }
-
-    /// (Re)dispatch a full sweep at the document's current revision — the
-    /// initial run and the post-edit restart both come here. The verified
-    /// prefix already absorbed into the cache survives (it rides `on_commit`);
-    /// this simply re-sweeps from row 0 with a fresh snapshot.
-    fn start(&mut self, doc: &Document, viewport: Range<u32>) {
-        self.rev = doc.revision();
-        // Publish the new revision to the workers and DRAIN the stale queue, so
-        // a restart (per edit) does not pile prior-revision jobs ahead of the
-        // current chain — the workers would fully tokenize each only for `poll`
-        // to discard it, starving the newest sweep.
-        self.cur_rev.store(self.rev.0, std::sync::atomic::Ordering::Relaxed);
-        self.queue.0.lock().unwrap().clear();
-        self.snapshot = std::sync::Arc::new(doc.snapshot());
-        let n = self.snapshot.line_count();
-        self.set_window(viewport, n);
-        // ~1 segment per worker at least, capped so a huge document yields many
-        // more segments than workers (queued) for load balance + progress grain.
-        let workers = self._workers.len() as u32;
-        let segs = (n.div_ceil(SEGMENT_MAX_ROWS)).max(workers).max(1);
-        let seg_len = n.div_ceil(segs).max(1);
-        self.seg_rows = (0..n)
-            .step_by(seg_len as usize)
-            .map(|s| s..(s + seg_len).min(n))
-            .collect();
-        self.results = (0..self.seg_rows.len()).map(|_| None).collect();
-        self.next_verify = 0;
-        self.prev_end = None;
-        self.active = !self.seg_rows.is_empty();
-        let (lock, cvar) = &*self.queue;
-        let mut q = lock.lock().unwrap();
-        for (idx, rows) in self.seg_rows.iter().enumerate() {
-            q.push_back(Job {
-                idx,
-                snapshot: self.snapshot.clone(),
-                rows: rows.clone(),
-                start: scrive_core::SegmentStart::Fresh,
-                spans_for: self.window.clone(),
-                against: None,
-                rev: self.rev,
-            });
-        }
-        cvar.notify_all();
-    }
-
-    fn set_window(&mut self, viewport: Range<u32>, n: u32) {
-        // Through the core's ONE window owner (`padded_highlight_window`) so this
-        // pool paints/tokenizes exactly the rows the cache retains — the length
-        // cap matters because a collapsed mega-fold makes the visible range span
-        // the fold's hidden interior, which an uncapped `speculate` would
-        // tokenize synchronously on the UI thread.
-        self.window = scrive_core::padded_highlight_window(viewport, n);
-    }
-
-    /// Restart the sweep after an edit (fresh snapshot) AND repaint the viewport
-    /// now — the pair must go together: a bare `start` leaves the visible rows
-    /// showing pre-edit colours until the chain verifies down to them. The one
-    /// owner of that ordering (no update arm sequences `start`/`speculate` by
-    /// hand and risks getting it backwards, which `speculate`'s rev guard would
-    /// silently turn into a no-op).
-    fn restart(&mut self, doc: &mut Document, viewport: Range<u32>) {
-        self.start(doc, viewport.clone());
-        self.speculate(doc, viewport);
-    }
-
-    /// Re-aim the window on a scroll (no edit) AND repaint the newly-visible
-    /// rows now — the same pairing as [`Self::restart`], one owner.
-    fn reaim(&mut self, doc: &mut Document, viewport: Range<u32>) {
-        let n = doc.buffer().line_count();
-        self.set_window(viewport.clone(), n);
-        self.speculate(doc, viewport);
-    }
-
-    /// Paint the viewport window immediately from a GUESSED fresh state,
-    /// SYNCHRONOUSLY on the UI thread — one window of rows is a few ms, and the
-    /// result colours on the next frame with no worker wait. Absorbed
-    /// `verified=false`: spans show on the still-dirty rows, no checkpoints are
-    /// planted, and the parallel chain re-verifies them per line (O(1) if the
-    /// guess was right; a wrong guess is evicted and refilled). No-op once the
-    /// sweep is done (the sync phase-2 refill from correct checkpoints serves
-    /// moved windows then) or if the pool's snapshot is stale (an edit landed).
-    fn speculate(&self, doc: &mut Document, viewport: Range<u32>) {
-        if !self.active || self.rev != doc.revision() {
-            return;
-        }
-        let n = self.snapshot.line_count();
-        let _ = viewport;
-        let rows = self.window.start.saturating_sub(SPECULATION_BACKOFF)..self.window.end.min(n);
-        if rows.start >= rows.end {
-            return;
-        }
-        let seg = scrive_core::tokenize_segment(
-            &self.engine,
-            &self.snapshot,
-            rows,
-            scrive_core::SegmentStart::Fresh,
-            Some(self.window.clone()),
-            None,
-        );
-        doc.absorb_highlight(self.rev, seg, false);
-    }
-
-    /// Drain finished jobs and advance the verified chain, absorbing into
-    /// `doc`. BUDGETED: at most `POLL_VERIFY_BUDGET` segments and
-    /// `POLL_RERUN_BUDGET` synchronous mis-guess re-runs per frame, so one paint
-    /// never absorbs an unbounded contiguous-ready run (nor bursts many syntect
-    /// re-runs). A partial frame leaves `next_verify` where it stopped and stays
-    /// `active`, so the `window::frames` subscription (keyed on `active`)
-    /// re-fires and resumes next frame — zero new plumbing. Total verification
-    /// is unchanged, paced over ⌈#segments/budget⌉ frames; `active=false` only
-    /// once the whole document verifies.
-    fn poll(&mut self, doc: &mut Document) {
-        // Unbudgeted: draining the channel is a cheap pointer move per message
-        // (Design 0's point), and a result left in the channel would stall the
-        // chain that consumes it.
-        while let Ok(done) = self.done_rx.try_recv() {
-            if done.rev == self.rev {
-                self.results[done.idx] = Some(done.seg);
-            } // else stale — drop it
-        }
-        // `verified` counts every segment advanced this frame; `reruns` counts
-        // only the heavy synchronous re-runs (weighted tighter — the frame's
-        // real cost).
-        let mut verified = 0usize;
-        let mut reruns = 0usize;
-        while self.next_verify < self.results.len() {
-            if verified >= POLL_VERIFY_BUDGET {
-                break; // paced out this frame; `active` stays true → resume next
-            }
-            // Peek WITHOUT taking: a not-yet-ready slot ends the contiguous run,
-            // and a re-run we defer for budget must stay in `results` for the
-            // next frame.
-            let Some(seg_ref) = self.results[self.next_verify].as_ref() else { break };
-            let true_start_fresh =
-                self.next_verify == 0 || self.prev_end.as_ref() == Some(&self.fresh);
-            // A Fresh-guessed segment is verified iff the true start is fresh;
-            // otherwise the guess was wrong and it needs a synchronous re-run.
-            let needs_rerun = seg_ref.started_fresh() && !true_start_fresh;
-            if needs_rerun && reruns >= POLL_RERUN_BUDGET {
-                break; // one more heavy re-run would exceed the frame budget
-            }
-            let seg = self.results[self.next_verify].take().expect("peeked Some");
-            if needs_rerun {
-                // Wrong guess: re-run from the true prior end SYNCHRONOUSLY. The
-                // early-stop makes this near-instant in the common case (a Fresh
-                // guess differs from the mid-document true state only in
-                // syntect's first-line flag, so it re-converges at the first
-                // checkpoint — ~one stride), so the chain does not wait for a
-                // worker to free from the bulk sweep. A genuine deep-construct
-                // mis-guess costs more here (bounded by the construct's close) —
-                // the accepted degenerate case, now paced one-per-frame.
-                let start = scrive_core::SegmentStart::After(
-                    self.prev_end.clone().expect("prev segment is verified"),
-                );
-                let fixed = scrive_core::tokenize_segment(
-                    &self.engine,
-                    &self.snapshot,
-                    self.seg_rows[self.next_verify].clone(),
-                    start,
-                    None, // ignored: converge_against forces the old window
-                    Some(&seg),
-                );
-                let end = fixed.end_boundary().clone();
-                doc.absorb_highlight(self.rev, fixed, true);
-                self.prev_end = Some(end);
-                reruns += 1;
-                #[cfg(test)]
-                POLL_RERUNS.with(|c| c.set(c.get() + 1));
-            } else {
-                let end = seg.end_boundary().clone();
-                doc.absorb_highlight(self.rev, seg, true);
-                self.prev_end = Some(end);
-            }
-            self.next_verify += 1;
-            verified += 1;
-        }
-        if self.next_verify >= self.results.len() && self.active {
-            self.active = false;
-        }
-    }
-}
-
+/// The demo application: it owns a [`CodeEditor`] and runs a stub compile loop
+/// (the debounced `FIXME` / `TODO` re-lint) off the editor's dirty signal — the
+/// recompile-on-edit pattern a real host would use for a language server.
 pub struct App {
-    doc: Document,
-    /// Whether the app-side find bar is open; its live query text.
-    find_open: bool,
-    find_query: String,
-    /// The `Aa` / `ab|` / `.*` options. Each is part of the QUERY, not just
-    /// chrome: flipping one changes what matches, so all of them re-scan through
-    /// [`App::push_find_query`] exactly like a text change.
-    find_case: bool,
-    find_whole_word: bool,
-    find_regex: bool,
-    /// Whether the bar is expanded into find+replace (the chevron), and the live
-    /// replacement text. Reset on close ([`App::close_find`]) so the next open
-    /// starts from a known shape: Ctrl+F is find-only, Ctrl+H brings replace.
-    replace_open: bool,
-    replace_text: String,
-    /// Which field wears the focus ring. The box border lives on a container, so
-    /// it can't read the field's focus itself — these mirror it. Set directly for
-    /// focus changes the app drives (open / close / chevron), and synced from the
-    /// live widget focus ([`App::sync_rings`]) for the ones it can't predict
-    /// (a click, a Tab).
-    find_focused: bool,
-    replace_focused: bool,
-    /// The `AB` option — whether a replacement is re-cased to the match it lands
-    /// on. A REPLACE option, so unlike the find toggles it changes nothing until
-    /// a replace runs (no re-scan).
-    replace_preserve_case: bool,
-    /// Monotonic clock start — `find`'s debounced re-scan needs a `now_ms`.
+    editor: CodeEditor,
+    /// Monotonic clock start — the injected `now_ms` for the re-lint debounce.
     start: Instant,
-    /// The last visible buffer-row range the editor reported
-    /// (`Action::ViewportChanged`) — the ONE viewport fact. It aims three things
-    /// that must agree: the tokenize target (`viewport.end` — edits tokenize
-    /// only down to here, so highlighting keeps pace with what's on screen), the
-    /// core's highlight retention window, and the parallel sweep's `spans_for` /
-    /// restart target. (One field, so a future re-aim path can't update one and
-    /// desync the others.)
-    viewport: Range<u32>,
-    /// The completion controller (view-state) + the app's provider. The app
-    /// owns both (the provider needs `&mut`, which `view()` can't give), drives
-    /// them on edits/popup keys, and passes the popup list to the editor.
-    completion: CompletionController,
-    provider: StubCompletions,
-    /// The active snippet tab-stop session, if any — owns one position-tracked
-    /// range per stop; Tab/Shift+Tab move between them.
-    snippet: Option<SnippetSession>,
-    /// The signature-help provider (stub) + the current one-line box.
-    sig_provider: StubSignatures,
-    signature: Option<SignatureInfo>,
-    /// The hover provider (stub) + the open hover popup.
-    hover_provider: StubHover,
-    hover: Option<HoverInfo>,
-    /// The off-thread parallel/speculative highlight sweep — `Some` for a large
-    /// document (`PARALLEL_MIN_BYTES`), created on the first viewport report;
-    /// `None` for small docs (the synchronous path, unchanged). Aimed by the one
-    /// [`App::viewport`] field, so its window can't drift from the core's.
-    hl_pool: Option<HighlightPool>,
-    /// The demo re-lint is debounced OFF the keystroke path: an edit only
-    /// sets `relint_dirty` here (O(1)); a `now_ms`-gated tick (mirroring find's
-    /// `maybe_rescan`) then runs the whole-document stub scan at most once per
-    /// [`RELINT_DEBOUNCE_MS`], so a burst of keystrokes coalesces into one scan.
-    /// `last_relint_ms` anchors the debounce window (the injected clock's stamp
-    /// of the last completed scan). Between scans, diagnostics ride edits via the
-    /// decoration mover's stickiness, so continuity holds.
+    /// An edit armed the debounced re-lint; a `now_ms`-gated tick runs the scan.
     relint_dirty: bool,
     last_relint_ms: u64,
+}
+
+/// The app message: it only ever *maps* the editor's opaque [`Event`] (never
+/// matches on it), plus the app's own debounced re-lint tick.
+#[derive(Debug, Clone)]
+pub enum Message {
+    /// A message from the editor.
+    Editor(Event),
+    /// The debounced stub-compiler tick.
+    Relint,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        // `--large <MB>` swaps in the synthetic corpus (the field-gate doc).
+        let sample;
+        let source: &str = match LARGE_DOC.get() {
+            Some(s) => s,
+            None => {
+                sample = long_sample();
+                &sample
+            }
+        };
+        // Grammar + line comment are app-supplied language config (the core ships
+        // neither); the theme defaults to the bundled Scrive Dark. `.language`
+        // colours the document at load — no first scroll needed.
+        let grammar = SyntaxDef::from_sublime_syntax(include_str!("assets/rust.sublime-syntax"))
+            .expect("bundled Rust grammar parses");
+        let editor = CodeEditor::new(source)
+            .language(grammar)
+            .line_comment(Some("//"))
+            // Rust: `"` strings; char literals off (`'` is also a lifetime marker),
+            // so brackets inside a string like `"{:?}"` are not matched/coloured.
+            .bracket_lexing(vec![b'"'], None)
+            .completions(StubCompletions::new())
+            .hover(StubHover)
+            .signature(StubSignatures);
+        let mut app = Self { editor, start: Instant::now(), relint_dirty: false, last_relint_ms: 0 };
+        app.relint(); // seed the stub diagnostics (the sample carries a TODO)
+        app
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Editor(event) => {
+                let task = self.editor.update(event).map(Message::Editor);
+                // An edit arms the debounced re-lint (this app's stand-in for an
+                // off-thread compile), read off the editor's dirty signal.
+                if self.editor.take_dirty() {
+                    self.relint_dirty = true;
+                }
+                task
+            }
+            Message::Relint => {
+                self.maybe_relint(self.now_ms());
+                Task::none()
+            }
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        self.editor.view().map(Message::Editor)
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        let editor = self.editor.subscription().map(Message::Editor);
+        // The debounced re-lint tick: frames only while an edit left a pending
+        // re-lint; `maybe_relint`'s clock gate runs the scan at most once/window,
+        // and clearing the flag drops this subscription (idle-zero-work).
+        let relint = if self.relint_dirty {
+            iced::window::frames().map(|_| Message::Relint)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([editor, relint])
+    }
+
+    /// Milliseconds since app start — the injected clock for the re-lint debounce.
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// The debounced trailing edge of the demo re-lint: if an edit armed a re-lint
+    /// and the window elapsed on the injected clock, run the whole-document stub
+    /// scan once and re-arm. Returns whether it scanned (the debounce tests observe
+    /// this; the app ignores it).
+    fn maybe_relint(&mut self, now: u64) -> bool {
+        if !self.relint_dirty || now.saturating_sub(self.last_relint_ms) < RELINT_DEBOUNCE_MS {
+            return false;
+        }
+        self.relint();
+        self.relint_dirty = false;
+        self.last_relint_ms = now;
+        true
+    }
+
+    /// A stub diagnostics pass — a stand-in for the app-side compile loop: flags
+    /// `FIXME` (error) and `TODO` (warning) markers so squiggles, the diagnostic
+    /// hover, F8 navigation, and the scrollbar marks are all exercisable without a
+    /// real language server. Reads the editor's document and publishes through
+    /// `CodeEditor::set_diagnostics` (revision-stamped, dropped if stale).
+    fn relint(&mut self) {
+        if self.editor.document().buffer().len() > RELINT_MAX_BYTES {
+            return; // demo-lint threshold — see RELINT_MAX_BYTES
+        }
+        #[cfg(test)]
+        RELINT_RUNS.with(|c| c.set(c.get() + 1));
+        let mut diags = Vec::new();
+        {
+            let buffer = self.editor.document().buffer();
+            for row in 0..buffer.line_count() {
+                let line = buffer.line(row);
+                let line_start = buffer.point_to_offset(Point::new(row, 0));
+                for (needle, sev, msg) in [
+                    ("FIXME", Severity::Error, "unresolved FIXME (demo lint)"),
+                    ("TODO", Severity::Warning, "unresolved TODO (demo lint)"),
+                ] {
+                    let mut from = 0usize;
+                    while let Some(i) = line[from..].find(needle) {
+                        let start = line_start + (from + i) as u32;
+                        diags.push(Diagnostic::new(start..start + needle.len() as u32, sev, msg));
+                        from = from + i + needle.len();
+                    }
+                }
+            }
+        }
+        let rev = self.editor.document().revision();
+        let _ = self.editor.set_diagnostics(rev, diags);
+    }
 }
 
 /// A stand-in `Hover` provider: a fixed Rust vocabulary → markdown doc, keyed by
@@ -753,1298 +466,6 @@ impl Completions for StubCompletions {
     }
 }
 
-/// What an applied action means for completion / signature help (captured before
-/// the action is consumed by `apply`'s match).
-#[derive(Clone, Copy)]
-enum CompletionEvent {
-    Typed(char),
-    Deleting,
-    CaretOrClose,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        // `--large <MB>` swaps in the synthetic corpus (the field-gate doc).
-        let sample;
-        let source: &str = match LARGE_DOC.get() {
-            Some(s) => s,
-            None => {
-                sample = long_sample();
-                &sample
-            }
-        };
-        let mut doc = Document::new(source).expect("sample fits the u32 offset space");
-        // Grammar + theme are app-supplied assets: scrive-core is
-        // language-agnostic and ships neither. The doc owns the incremental
-        // highlight cache from here on.
-        // The comment prefix is app-supplied language config, like the grammar.
-        doc.set_line_comment(Some("//"));
-        doc.set_syntax(
-            SyntaxDef::from_sublime_syntax(include_str!("assets/rust.sublime-syntax"))
-                .expect("bundled Rust grammar parses"),
-            TokenTheme::from_tm_theme(include_str!("assets/scrive-dark.tmTheme"))
-                .expect("bundled theme parses"),
-        );
-        // No load-time tokenization: the first
-        // `ViewportChanged` tokenizes the visible rows, and the idle sweep
-        // subscription (window::frames, active only while a dirty frontier
-        // remains) progresses the rest in budgeted batches. Untokenized rows
-        // render in the fallback style — never a stall.
-        let mut app = Self {
-            doc,
-            find_open: false,
-            find_query: String::new(),
-            find_case: false,
-            find_whole_word: false,
-            find_regex: false,
-            replace_open: false,
-            replace_text: String::new(),
-            find_focused: false,
-            replace_focused: false,
-            replace_preserve_case: false,
-            start: Instant::now(),
-            viewport: 0..0,
-            completion: CompletionController::new(),
-            provider: StubCompletions::new(),
-            snippet: None,
-            sig_provider: StubSignatures,
-            signature: None,
-            hover_provider: StubHover,
-            hover: None,
-            hl_pool: None,
-            relint_dirty: false,
-            last_relint_ms: 0,
-        };
-        app.relint(); // seed the stub diagnostics (the sample carries a TODO)
-        app
-    }
-}
-
-// `PartialEq` so the chord table can be asserted directly (`Action` already
-// derives it, and every other payload is a `String`/`bool`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Msg {
-    Editor(Action),
-    /// Open the find bar (Ctrl+F) and focus its input.
-    OpenFind,
-    /// Open the find bar with the replace row already expanded (Ctrl+H).
-    OpenReplace,
-    /// Tab / Shift+Tab: move focus to the next / previous input.
-    CycleFocus { back: bool },
-    /// A synced focus-ring result: `on` is whether the `replace`/find field holds
-    /// the live widget focus (see [`App::sync_rings`]).
-    Focused { replace: bool, on: bool },
-    /// A left press landed somewhere — re-assert single focus (see
-    /// [`App::resync_focus`]).
-    PointerDown,
-    /// Close the find bar (Escape / ✕), clear the query, refocus the editor.
-    CloseFind,
-    /// The find query text changed — re-scan synchronously.
-    FindQuery(String),
-    /// The `Aa` / `ab|` / `.*` option toggles: flip one and re-scan.
-    ToggleCase,
-    ToggleWholeWord,
-    ToggleRegex,
-    /// The find-in-selection toggle: scope find to the current selection, or
-    /// clear the scope if one is already set.
-    ToggleFindInSelection,
-    /// Go to the next / previous match (Enter / Shift+Enter / buttons).
-    FindNext,
-    FindPrev,
-    /// Alt+Enter in the find bar: every live match becomes a selection.
-    FindSelectAll,
-    /// The chevron: expand/collapse the bar's replace row.
-    ToggleReplace,
-    /// The replacement text changed — no scan; the query is untouched.
-    ReplaceText(String),
-    /// Replace the active match and advance (Enter in the replace input / the
-    /// replace button).
-    ReplaceOne,
-    /// Replace every match in one undo step (the replace-all button).
-    ReplaceAll,
-    /// The `AB` toggle: flip whether a replacement preserves the match's case.
-    TogglePreserveCase,
-    /// One idle-sweep tick (window::frames while a dirty highlight frontier
-    /// remains): tokenize the next budgeted batch toward convergence.
-    HighlightSweep,
-    /// One debounced re-lint tick (window::frames while `relint_dirty`): run the
-    /// whole-document stub lint if the debounce window has elapsed, else a no-op.
-    /// The tick self-cancels once the scan clears `relint_dirty`.
-    MaybeRelint,
-}
-
-impl App {
-    /// Close the find bar: drop the query text and its matches/decorations. The
-    /// ONE owner of "close find" — both Escape paths (editor-focused `Collapse`
-    /// and input-focused `CloseFind`, which a single Escape fires together) call
-    /// it, so they cannot diverge into two meanings of "close".
-    ///
-    /// Closing also collapses the replace row, so the NEXT open starts from a
-    /// clean shape: Ctrl+F reopens find-only, Ctrl+H reopens with replace. The
-    /// alternative — persisting the expanded row across a close — means Ctrl+F
-    /// surprises you with a replace box you didn't ask for.
-    fn close_find(&mut self) {
-        self.find_open = false;
-        self.replace_open = false;
-        self.find_focused = false;
-        self.replace_focused = false;
-        self.find_query.clear();
-        self.doc.set_find_query(None, self.now_ms());
-    }
-
-    /// Read the live widget focus back into the ring flags — for the focus
-    /// changes the app can't predict (a click, a Tab). Each field's box border
-    /// mirrors its flag; the query is one frame behind, which is imperceptible.
-    fn sync_rings() -> Task<Msg> {
-        Task::batch([
-            is_focused(FIND_INPUT).map(|on| Msg::Focused { replace: false, on }),
-            is_focused(REPLACE_INPUT).map(|on| Msg::Focused { replace: true, on }),
-        ])
-    }
-
-    /// Re-assert SINGLE focus after a press — the repair for a genuine
-    /// double-focus hole in the stack.
-    ///
-    /// A click inside a bar input focuses that input *natively* and captures the
-    /// event, and iced's `Stack` stops dispatching the moment a child captures
-    /// (`stack.rs`: `if shell.is_event_captured() { return; }`). The editor sits
-    /// under that overlay, so its `update` never runs — and it is the editor's
-    /// own press handler that would have unfocused it. Two widgets are then both
-    /// convinced they hold focus.
-    ///
-    /// That was invisible for as long as every key the bar cares about was
-    /// captured by the input (a character, Enter, Escape) — the editor never saw
-    /// them. Tab is the first key `text_input` does NOT capture, so it falls
-    /// through to a stale-focused editor, which indents instead of moving focus.
-    ///
-    /// `focus(id)` unfocuses every OTHER focusable, so focusing whichever input
-    /// iced reports as focused is exactly the repair. When the press landed in
-    /// the editor instead, neither input is focused and both arms are no-ops —
-    /// the editor already handled its own focus correctly.
-    fn resync_focus() -> Task<Msg> {
-        Task::batch([
-            is_focused(FIND_INPUT).then(|f| if f { focus(FIND_INPUT) } else { Task::none() }),
-            is_focused(REPLACE_INPUT).then(|f| if f { focus(REPLACE_INPUT) } else { Task::none() }),
-        ])
-    }
-
-    /// Push the live query text + its options into the document — the ONE place
-    /// a [`FindQuery`] is built.
-    ///
-    /// Every input that can change what matches routes through here (the text,
-    /// and each option toggle), so the bar's controls cannot disagree about the
-    /// live query: an option is not chrome, it is part of the query, and
-    /// flipping one re-scans exactly like typing does. An empty text means "no
-    /// query" — never match-all.
-    fn push_find_query(&mut self) {
-        let query = (!self.find_query.is_empty()).then(|| {
-            // `FindQuery` is `#[non_exhaustive]`, so build via `new` + the option
-            // fields rather than a struct literal.
-            let mut q = FindQuery::new(self.find_query.clone());
-            q.case_sensitive = self.find_case;
-            q.whole_word = self.find_whole_word;
-            q.regex = self.find_regex;
-            q
-        });
-        let now = self.now_ms();
-        self.doc.set_find_query(query, now); // synchronous scan
-    }
-
-    pub fn update(&mut self, msg: Msg) -> Task<Msg> {
-        match msg {
-            // The editor reported a new visible range (scroll / resize /
-            // autoscroll): aim the highlight retention window there
-            // (virtualization — spans/states are kept only around the
-            // viewport) and tokenize highlights down to its end. Not an
-            // edit — no find re-scan, no history — so it bypasses `apply`.
-            Msg::Editor(Action::ViewportChanged(rows)) => {
-                // The one viewport fact feeds all three aims (field, core window,
-                // pool) from here so they can't diverge.
-                self.viewport = rows.clone();
-                self.doc.set_highlight_window(rows.clone());
-                if self.doc.buffer().len() >= PARALLEL_MIN_BYTES {
-                    // Large document: the off-thread sweep owns dirt-clearing;
-                    // the viewport is PAINTED synchronously now (a few ms for
-                    // one window) and verified in place by the chain. Do NOT run
-                    // the whole-doc synchronous walk here (it would race the
-                    // pool). Create the pool on first sight.
-                    let App { hl_pool, doc, .. } = self;
-                    match hl_pool {
-                        Some(pool) => pool.reaim(doc, rows),
-                        None => {
-                            if let Some(pool) = HighlightPool::new(doc, rows.clone()) {
-                                pool.speculate(doc, rows);
-                                *hl_pool = Some(pool);
-                            }
-                        }
-                    }
-                } else {
-                    // Small document: the synchronous path, unchanged.
-                    self.doc.tokenize_highlight(rows.end);
-                }
-                self.hover = None; // scroll closes the hover
-                Task::none()
-            }
-            // Completion popup navigation (captured by the editor while open) —
-            // drive the controller; no document edit except on accept.
-            Msg::Editor(Action::PopupUp) => {
-                self.completion.move_selection(false);
-                Task::none()
-            }
-            Msg::Editor(Action::PopupDown) => {
-                self.completion.move_selection(true);
-                Task::none()
-            }
-            Msg::Editor(Action::PopupDismiss) => {
-                self.completion.escape();
-                Task::none()
-            }
-            Msg::Editor(Action::PopupAccept) => {
-                self.accept_completion();
-                Task::none()
-            }
-            Msg::Editor(Action::PopupClickAccept(idx)) => {
-                self.completion.set_selected(idx);
-                self.accept_completion();
-                Task::none()
-            }
-            // Snippet tab-stop navigation (captured by the editor while a session
-            // is active).
-            Msg::Editor(Action::SnippetTab) => {
-                self.snippet_tab(true);
-                Task::none()
-            }
-            Msg::Editor(Action::SnippetTabPrev) => {
-                self.snippet_tab(false);
-                Task::none()
-            }
-            Msg::Editor(Action::SnippetCancel) => {
-                if let Some(mut s) = self.snippet.take() {
-                    s.cancel(self.doc.decorations_mut());
-                }
-                Task::none()
-            }
-            Msg::Editor(Action::SignatureClose) => {
-                self.signature = None;
-                Task::none()
-            }
-            // Hover: the pointer rested over `offset` — diagnostics first
-            // (the message rides the decoration store, so hovering a
-            // squiggle shows why it's flagged), then the word provider's docs.
-            Msg::Editor(Action::HoverQuery(offset)) => {
-                let diags: Vec<(Range<u32>, String)> = self
-                    .doc
-                    .diagnostics_in(offset..offset + 1)
-                    .map(|(r, sev, msg)| (r, format!("**{}:** {msg}", severity_label(sev))))
-                    .collect();
-                let cx = self.build_hover_cx(offset);
-                let word = (cx.word.start != cx.word.end).then(|| self.hover_provider.hover(&cx)).flatten();
-                self.hover = if diags.is_empty() {
-                    word
-                } else {
-                    // The popup anchors on the squiggled span; provider docs
-                    // (if any) append below the diagnostic messages.
-                    let range = diags[0].0.clone();
-                    let mut md: Vec<String> = diags.into_iter().map(|(_, m)| m).collect();
-                    if let Some(w) = word {
-                        md.push(String::new());
-                        md.push(w.markdown);
-                    }
-                    Some(HoverInfo { markdown: md.join("\n"), range })
-                };
-                Task::none()
-            }
-            Msg::Editor(Action::HoverDismiss) => {
-                self.hover = None;
-                Task::none()
-            }
-            Msg::Editor(Action::ToggleFold { opener }) => {
-                self.doc.toggle_fold_opener(opener);
-                Task::none()
-            }
-            Msg::Editor(Action::FoldAtCarets { unfold }) => {
-                self.doc.fold_at_carets(unfold);
-                Task::none()
-            }
-            // Escape with the find bar open closes the BAR and keeps the
-            // selections (matching mainstream editors) — vital after
-            // Alt+Enter built a multi-caret set the plain Collapse would
-            // destroy. (The subscription's CloseFind covers the input-focused
-            // press; this covers the editor-focused one.)
-            Msg::Editor(Action::Collapse) if self.find_open => {
-                self.close_find();
-                Task::none()
-            }
-            Msg::Editor(action) => {
-                self.apply(action);
-                Task::none()
-            }
-            Msg::OpenFind => {
-                self.find_open = true;
-                // Seed (or RE-seed) the query from a non-empty, single-line editor
-                // selection (as mainstream editors do): Ctrl+F searches the selection, and pressing
-                // it again after selecting something else replaces the query. An
-                // empty selection leaves the current query untouched.
-                let sel = self.doc.selections().newest();
-                let seed = (!sel.is_empty())
-                    .then(|| self.doc.buffer().slice(sel.start()..sel.end()).into_owned())
-                    .filter(|t| !t.contains('\n'));
-                if let Some(text) = seed {
-                    self.find_query = text;
-                    self.push_find_query();
-                }
-                self.find_focused = true; // focus lands on the find field
-                self.replace_focused = false;
-                focus(FIND_INPUT) // focus the input, unfocusing the editor
-            }
-            Msg::OpenReplace => {
-                // Ctrl+H is Ctrl+F with the replace row already out. The query
-                // seeding and focus rules are `OpenFind`'s job — reuse them
-                // rather than growing a second copy that can drift.
-                self.replace_open = true;
-                self.update(Msg::OpenFind)
-            }
-            // Only reachable when nothing captured Tab (see the subscription),
-            // so this never fights the editor's indent. Buttons are not
-            // focusable in iced, so the cycle is exactly find → replace →
-            // editor, skipping the icon row.
-            Msg::CycleFocus { back } => {
-                // Tab's landing field can't be predicted here, so read it back
-                // into the rings after the move.
-                let moved = if back { focus_previous() } else { focus_next() };
-                moved.chain(Self::sync_rings())
-            }
-            // Only while the bar is open: with no inputs in the tree there is no
-            // second focusable to desync against, and this would cost two
-            // tree-walking operations on every click in the editor. The click's
-            // landing field can't be predicted either, so sync the rings.
-            Msg::PointerDown if self.find_open => {
-                Task::batch([Self::resync_focus(), Self::sync_rings()])
-            }
-            Msg::Focused { replace, on } => {
-                if replace {
-                    self.replace_focused = on;
-                } else {
-                    self.find_focused = on;
-                }
-                Task::none()
-            }
-            Msg::CloseFind if self.find_open => {
-                self.close_find(); // drop matches + decorations
-                focus(EDITOR) // hand focus back to the editor
-            }
-            Msg::FindQuery(q) => {
-                self.find_query = q;
-                self.push_find_query();
-                Task::none()
-            }
-            Msg::ToggleCase => {
-                self.find_case = !self.find_case;
-                self.push_find_query(); // the flag changes what matches: re-scan
-                Task::none()
-            }
-            Msg::ToggleWholeWord => {
-                self.find_whole_word = !self.find_whole_word;
-                self.push_find_query();
-                Task::none()
-            }
-            Msg::ToggleRegex => {
-                self.find_regex = !self.find_regex;
-                self.push_find_query();
-                Task::none()
-            }
-            Msg::ToggleFindInSelection if self.find_open => {
-                // The scope lives in the document (it has to ride every edit),
-                // so there is no app-side copy to flip — read the live one and
-                // set its opposite. A scope the user cannot produce (no
-                // selection) simply leaves find unscoped.
-                let scope = if self.doc.find_scope().is_some() {
-                    None
-                } else {
-                    let sel = self.doc.selections().newest();
-                    (!sel.is_empty()).then(|| sel.start()..sel.end())
-                };
-                let now = self.now_ms();
-                self.doc.set_find_scope(scope, now);
-                Task::none()
-            }
-            Msg::FindNext if self.find_open => {
-                let now = self.now_ms();
-                self.doc.find_next(now);
-                Task::none()
-            }
-            Msg::FindPrev if self.find_open => {
-                let now = self.now_ms();
-                self.doc.find_prev(now);
-                Task::none()
-            }
-            Msg::FindSelectAll if self.find_open => {
-                // Every match becomes a caret; typing replaces them all. Focus
-                // returns to the editor (matching mainstream editors); the bar stays open.
-                if self.doc.select_find_matches() {
-                    return focus(EDITOR);
-                }
-                Task::none()
-            }
-            Msg::ToggleReplace => {
-                self.replace_open = !self.replace_open;
-                // Expanding puts the caret where the user is about to type;
-                // collapsing hands it back to the query rather than stranding
-                // focus on a row that no longer exists.
-                self.replace_focused = self.replace_open;
-                self.find_focused = !self.replace_open;
-                focus(if self.replace_open { REPLACE_INPUT } else { FIND_INPUT })
-            }
-            Msg::ReplaceText(t) => {
-                self.replace_text = t;
-                Task::none() // the query is untouched: nothing to re-scan
-            }
-            Msg::ReplaceOne if self.find_open => {
-                let now = self.now_ms();
-                let before = self.doc.revision();
-                self.doc.replace_next(&self.replace_text, self.replace_preserve_case, now);
-                // The first press only NAVIGATES (it shows the match before
-                // overwriting it), which commits nothing — running the post-edit
-                // tail then would arm a re-lint for an edit that never happened.
-                if self.doc.revision() != before {
-                    self.after_edit(CompletionEvent::CaretOrClose);
-                }
-                Task::none()
-            }
-            Msg::ReplaceAll if self.find_open => {
-                if self.doc.replace_all(&self.replace_text, self.replace_preserve_case) > 0 {
-                    self.after_edit(CompletionEvent::CaretOrClose);
-                }
-                Task::none()
-            }
-            Msg::TogglePreserveCase => {
-                self.replace_preserve_case = !self.replace_preserve_case;
-                Task::none() // a replace option: nothing to re-scan
-            }
-            // Find-nav keys arriving while the bar is closed: ignore (the guards
-            // above only match when `find_open`). The editor still handles its own
-            // Enter/Escape via the widget when it holds focus.
-            // The idle sweep: one budgeted batch per frame toward the whole
-            // document; the subscription drops itself once converged.
-            Msg::HighlightSweep => {
-                let App { doc, hl_pool, viewport, .. } = self;
-                // The pool drives only while the document is still large; if an
-                // edit shrank it below the threshold, it falls to the sync path
-                // and the pool goes inert (its last sweep finishes, no restart)
-                // — so it never redundantly re-sweeps a now-small document.
-                // It resumes if the document grows back.
-                let large = doc.buffer().len() >= PARALLEL_MIN_BYTES;
-                match hl_pool {
-                    Some(pool) if large => {
-                        if pool.rev != doc.revision() {
-                            // An edit landed: re-sweep from a fresh snapshot AND
-                            // repaint the viewport now (the verified prefix in the
-                            // cache survives). The restart+repaint pairing lives in
-                            // one owner (`HighlightPool::restart`), so an edit's
-                            // colours land next frame instead of waiting for the
-                            // chain to verify down to the visible segment.
-                            pool.restart(doc, viewport.clone());
-                        } else {
-                            // Always poll: drains finished jobs (so nothing
-                            // piles up) and advances the verified chain; a no-op
-                            // once the sweep is done.
-                            pool.poll(doc);
-                        }
-                        // Once the sweep is idle, the synchronous phase-2 path
-                        // refills any window rows the sweep evicted (from the
-                        // now-correct checkpoints). It can't race the pool: all
-                        // dirt is cleared, so the dirty walk is a no-op and only
-                        // the window refill runs.
-                        if !pool.active {
-                            let n = doc.buffer().line_count();
-                            doc.tokenize_highlight(n);
-                        }
-                    }
-                    other => {
-                        // Small document (shrunk below the threshold, or never
-                        // large): deactivate any lingering pool so the frame
-                        // subscription can settle to idle-zero-work, and drive
-                        // the sync path.
-                        if let Some(pool) = other {
-                            pool.active = false;
-                        }
-                        let n = doc.buffer().line_count();
-                        doc.tokenize_highlight(n);
-                    }
-                }
-                Task::none()
-            }
-            // The debounced re-lint tick (window::frames while `relint_dirty`):
-            // run the whole-document stub scan iff the window elapsed, then let
-            // the subscription drop itself once the flag clears.
-            Msg::MaybeRelint => {
-                self.maybe_relint(self.now_ms());
-                Task::none()
-            }
-            Msg::CloseFind
-            | Msg::FindNext
-            | Msg::FindPrev
-            | Msg::FindSelectAll
-            | Msg::ReplaceOne
-            | Msg::ReplaceAll
-            | Msg::ToggleFindInSelection
-            | Msg::PointerDown => Task::none(),
-        }
-    }
-
-    /// Milliseconds since app start — the injected clock for find's debounce.
-    fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
-    }
-
-    /// The debounced trailing edge of the demo re-lint: if an edit marked
-    /// the document dirty and the debounce window has elapsed on the injected
-    /// clock, run the whole-document stub scan once and re-arm the window.
-    /// Mirrors [`Document::maybe_rescan_find`]. Returns whether it scanned (the
-    /// debounce test observes this; the app ignores it).
-    fn maybe_relint(&mut self, now: u64) -> bool {
-        if !self.relint_dirty || now.saturating_sub(self.last_relint_ms) < RELINT_DEBOUNCE_MS {
-            return false;
-        }
-        self.relint();
-        self.relint_dirty = false;
-        self.last_relint_ms = now;
-        true
-    }
-
-    fn apply(&mut self, action: Action) {
-        // Capture what this action means for completion before the match
-        // consumes `action`.
-        let comp_event = match &action {
-            Action::Type(c) => CompletionEvent::Typed(*c),
-            Action::Backspace | Action::DeleteWordBack | Action::Delete | Action::DeleteWordForward => {
-                CompletionEvent::Deleting
-            }
-            _ => CompletionEvent::CaretOrClose,
-        };
-        match action {
-            Action::Type(ch) => self.doc.type_char(ch),
-            Action::Backspace => self.doc.backspace(),
-            Action::Delete => self.doc.delete_forward(),
-            Action::DeleteWordBack => self.doc.delete_word_back(),
-            Action::DeleteWordForward => self.doc.delete_word_forward(),
-            Action::Enter => self.doc.enter(),
-            Action::Tab => self.doc.tab(),
-            Action::Outdent => self.doc.outdent(),
-            Action::ToggleComment => self.doc.toggle_line_comment(),
-            Action::DeleteLine => self.doc.delete_line(),
-            Action::InsertLine { down } => self.doc.insert_line(down),
-            Action::Cut => self.doc.cut(),
-            Action::Paste { text, entire_line } => self.doc.paste(&text, entire_line),
-            Action::Move { motion, extend } => self.doc.move_carets(motion, extend),
-            Action::PlaceCaret(offset) => {
-                // A single caret at the clicked offset.
-                use scrive_core::{Selection, SelectionId, SelectionSet};
-                let mut set = SelectionSet::new(0);
-                set.set_single(Selection::caret(SelectionId(0), offset));
-                // Replace via a no-op-safe path: move a fresh set in.
-                self.doc.set_selections(set);
-            }
-            Action::DragSelect { granularity, origin, head } => {
-                self.doc.drag_select(granularity, origin, head);
-            }
-            Action::AddCaret(offset) => self.doc.add_caret(offset),
-            Action::AddNextOccurrence => self.doc.add_next_occurrence(),
-            Action::SelectAllOccurrences => self.doc.select_all_occurrences(),
-            Action::AddCaretVertical { down } => self.doc.add_caret_vertical(down),
-            Action::JumpToBracket => self.doc.jump_to_bracket(),
-            Action::NextDiagnostic { forward } => {
-                self.doc.next_diagnostic(forward);
-            }
-            Action::ExpandSelection => self.doc.expand_selection(),
-            Action::ShrinkSelection => self.doc.shrink_selection(),
-            Action::Collapse => self.doc.collapse_selections(),
-            Action::SelectAll => self.doc.select_all(),
-            Action::Undo => {
-                self.doc.undo();
-            }
-            Action::Redo => {
-                self.doc.redo();
-            }
-            Action::ColumnSelect(dir) => self.doc.column_select(dir),
-            Action::ColumnDrag { anchor, active } => self.doc.column_drag(anchor, active),
-            Action::MoveLine { down } => self.doc.move_line(down),
-            Action::CopyLine { down } => self.doc.copy_line(down),
-            // Handled in `update` before reaching `apply` (viewport report +
-            // popup / snippet navigation); unreachable here but keeps the match
-            // exhaustive.
-            Action::ViewportChanged(_)
-            | Action::PopupUp
-            | Action::PopupDown
-            | Action::PopupAccept
-            | Action::PopupClickAccept(_)
-            | Action::PopupDismiss
-            | Action::SnippetTab
-            | Action::SnippetTabPrev
-            | Action::SnippetCancel
-            | Action::SignatureClose
-            | Action::HoverQuery(_)
-            | Action::HoverDismiss
-            | Action::ToggleFold { .. }
-            | Action::FoldAtCarets { .. } => {} // handled in update() before apply()
-        }
-        self.after_edit(comp_event);
-    }
-
-    /// The find bar's option toggles + the nav/close cluster share this — the
-    /// find-in-selection button latches off the DOCUMENT's live scope, not an
-    /// app-side copy, so an edit that collapses the scope un-latches the button
-    /// with no code here at all.
-    fn scoped(&self) -> bool {
-        self.doc.find_scope().is_some()
-    }
-
-    /// Everything that must follow a document mutation — the ONE owner of the
-    /// post-edit tail. Both edit entry points run it: the keystroke path
-    /// ([`App::apply`]) and the replace verbs. Keeping it in one place is what
-    /// stops a second entry point from silently doing half of it (a replace that
-    /// forgot `tokenize_highlight` would paint stale colors; one that forgot
-    /// `relint_dirty` would strand the diagnostics).
-    fn after_edit(&mut self, comp_event: CompletionEvent) {
-        // Bring the incremental highlight cache current down to the reported
-        // viewport bottom only — convergence stops at the edited lines for a
-        // normal edit, and the viewport bound caps a state-cascade to the screen.
-        self.doc.tokenize_highlight(self.viewport.end);
-        // Keep find fresh while editing: matches ride the edit via
-        // the decoration mover; a debounced re-scan then picks up appearing /
-        // disappearing matches (incl. anything an undo restored).
-        let now = self.now_ms();
-        self.doc.maybe_rescan_find(now);
-        // Drive completion off the edit: typing opens/filters, deleting
-        // refilters, anything else closes the popup.
-        self.drive_completion(comp_event);
-        // Drive signature help: `(` opens the box; while open, edits/moves
-        // re-query (a `None` reply closes it).
-        self.drive_signature(comp_event);
-        // Cancel a snippet session if the caret/edit left every stop.
-        self.reconcile_snippet();
-        // Any edit closes an open hover.
-        self.hover = None;
-        // Re-lint after the edit, but OFF the keystroke path: only mark the
-        // document dirty (O(1)). A `now_ms`-gated `window::frames` tick then runs
-        // the whole-document stub scan at most once per `RELINT_DEBOUNCE_MS`
-        // (`maybe_relint`), so a keystroke never triggers the O(N log N) scan
-        // directly. Diagnostics ride the edit via the decoration
-        // mover's stickiness until the next scan, so continuity holds.
-        self.relint_dirty = true;
-    }
-
-    /// A stub diagnostics pass — a stand-in for the app-side compile loop:
-    /// flags `FIXME` (error) and `TODO` (warning) markers so squiggles, the
-    /// diagnostic hover, F8 navigation, and the scrollbar marks are all
-    /// exercisable in the demo without a real language server. Scans line by
-    /// line (the markers never span a newline): typical rows borrow straight
-    /// from the rope, so an edit never pays a whole-document copy.
-    fn relint(&mut self) {
-        if self.doc.buffer().len() > RELINT_MAX_BYTES {
-            return; // demo-lint threshold — see RELINT_MAX_BYTES
-        }
-        // Count each whole-document scan the debounce coalesces (post
-        // size-guard, so it tallies only real scans).
-        #[cfg(test)]
-        RELINT_RUNS.with(|c| c.set(c.get() + 1));
-        let mut diags = Vec::new();
-        {
-            let buffer = self.doc.buffer();
-            for row in 0..buffer.line_count() {
-                let line = buffer.line(row);
-                let line_start = buffer.point_to_offset(Point::new(row, 0));
-                for (needle, sev, msg) in [
-                    ("FIXME", Severity::Error, "unresolved FIXME (demo lint)"),
-                    ("TODO", Severity::Warning, "unresolved TODO (demo lint)"),
-                ] {
-                    let mut from = 0usize;
-                    while let Some(i) = line[from..].find(needle) {
-                        let start = line_start + (from + i) as u32;
-                        diags.push(Diagnostic::new(start..start + needle.len() as u32, sev, msg));
-                        from = from + i + needle.len();
-                    }
-                }
-            }
-        }
-        let rev = self.doc.revision();
-        let _ = self.doc.set_diagnostics(rev, diags);
-    }
-
-    /// The word range around `offset` (scanning both directions with
-    /// `is_completion_word_char`) — the word under the hover pointer.
-    fn word_around(&self, offset: u32) -> Range<u32> {
-        let p = self.doc.buffer().offset_to_point(offset);
-        let line = self.doc.buffer().line(p.row);
-        let line_start = offset - p.col;
-        let col = p.col as usize;
-        let start = line[..col]
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| is_completion_word_char(*c))
-            .last()
-            .map_or(col, |(i, _)| i);
-        let mut end = col;
-        for c in line[col..].chars().take_while(|c| is_completion_word_char(*c)) {
-            end += c.len_utf8();
-        }
-        (line_start + start as u32)..(line_start + end as u32)
-    }
-
-    /// Build a hover request for the word under `offset`. The lookback runs
-    /// through the word's END, so the provider reads the full word from its tail.
-    fn build_hover_cx(&self, offset: u32) -> HoverCx {
-        let word = self.word_around(offset);
-        let position = self.doc.buffer().offset_to_point(offset);
-        let start_row = position.row.saturating_sub(LOOKBACK_LINES - 1);
-        let lb_start = self.doc.buffer().point_to_offset(Point::new(start_row, 0));
-        HoverCx {
-            doc: self.doc.buffer().doc_id(),
-            revision: self.doc.revision().0,
-            position,
-            word: word.clone(),
-            lookback: self.doc.buffer().slice(lb_start..word.end).into_owned(),
-        }
-    }
-
-    /// Drive the signature-help box: `(` opens it; while open, every
-    /// relevant edit/move re-queries and a `None` reply closes it.
-    fn drive_signature(&mut self, event: CompletionEvent) {
-        let query = matches!(event, CompletionEvent::Typed('(')) || self.signature.is_some();
-        if query {
-            let cx = self.build_sig_cx();
-            self.signature = self.sig_provider.signature(&cx);
-        }
-    }
-
-    /// Build a signature request from the current document state.
-    fn build_sig_cx(&self) -> SignatureCx {
-        let head = self.doc.selections().newest().head();
-        let position = self.doc.buffer().offset_to_point(head);
-        let start_row = position.row.saturating_sub(LOOKBACK_LINES - 1);
-        let lb_start = self.doc.buffer().point_to_offset(Point::new(start_row, 0));
-        SignatureCx {
-            doc: self.doc.buffer().doc_id(),
-            revision: self.doc.revision().0,
-            position,
-            lookback: self.doc.buffer().slice(lb_start..head).into_owned(),
-        }
-    }
-
-    /// Drive the completion controller after an edit.
-    fn drive_completion(&mut self, event: CompletionEvent) {
-        match event {
-            CompletionEvent::Typed(c) => {
-                let trigger = if is_completion_word_char(c) {
-                    CompletionTrigger::Typed(c)
-                } else if matches!(c, '(' | ',' | '=' | ':' | '.' | ' ') {
-                    CompletionTrigger::TriggerChar(c)
-                } else {
-                    self.completion.on_boundary();
-                    return;
-                };
-                let cx = self.build_cx(trigger);
-                let word = self.completion_word_text();
-                self.completion.on_input(&cx, &word, &mut self.provider);
-            }
-            CompletionEvent::Deleting => {
-                if self.completion.is_open() {
-                    let word = self.completion_word_text();
-                    match word.chars().last() {
-                        Some(c) => {
-                            let cx = self.build_cx(CompletionTrigger::Typed(c));
-                            self.completion.on_input(&cx, &word, &mut self.provider);
-                        }
-                        None => self.completion.close(),
-                    }
-                }
-            }
-            CompletionEvent::CaretOrClose => self.completion.close(),
-        }
-    }
-
-    /// Accept the popup's selected item: replace the completion word with
-    /// the item's insertion (a snippet expands, caret at its final stop), sealed
-    /// as one edit; a snippet expands and starts an interactive tab-stop session,
-    /// selecting the first stop. Fires the retrigger if requested.
-    fn accept_completion(&mut self) {
-        let Some(item) = self.completion.accept() else { return };
-        let replace = item.replace.clone().unwrap_or_else(|| self.completion_word());
-        self.set_selection_range(replace.clone());
-
-        // Insert the item, capturing the expanded snippet (if any) to start a
-        // session from.
-        let expanded = match &item.insert {
-            InsertText::Plain(s) => {
-                self.doc.insert_text(s);
-                None
-            }
-            InsertText::Snippet(body) => match Snippet::parse(body) {
-                Ok(snip) => {
-                    let indent = self.line_indent(replace.start);
-                    let e = snip.for_insertion(&indent, default_indent_size() as usize);
-                    self.doc.insert_text(&e.text);
-                    Some(e)
-                }
-                Err(_) => {
-                    self.doc.insert_text(body);
-                    None
-                }
-            },
-        };
-
-        // Cancel any prior session; start a new one for a multi-stop snippet.
-        if let Some(mut s) = self.snippet.take() {
-            s.cancel(self.doc.decorations_mut());
-        }
-        if let Some(e) = expanded {
-            match SnippetSession::start(&e, replace.start, self.doc.decorations_mut()) {
-                Some((session, first)) => {
-                    self.set_selection_range(first);
-                    self.snippet = Some(session);
-                }
-                None => {
-                    // Only a final stop — collapse the caret there.
-                    let fin = e.stops.last().map_or(e.text.len() as u32, |s| s.range.start);
-                    self.set_caret(replace.start + fin);
-                }
-            }
-        }
-        self.doc.tokenize_highlight(self.viewport.end);
-        self.doc.maybe_rescan_find(self.now_ms());
-
-        if item.retrigger && self.snippet.is_none() {
-            let cx = self.build_cx(CompletionTrigger::Manual);
-            let word = self.completion_word_text();
-            self.completion.on_input(&cx, &word, &mut self.provider);
-        }
-    }
-
-    /// Tab / Shift+Tab through the active snippet session: select the next
-    /// stop, or end the session at the final stop.
-    fn snippet_tab(&mut self, forward: bool) {
-        let Some(mut session) = self.snippet.take() else { return };
-        match session.tab(forward, self.doc.decorations_mut()) {
-            TabOutcome::Move(range) => {
-                self.set_selection_range(range);
-                self.snippet = Some(session);
-            }
-            TabOutcome::Finish(offset) => self.set_caret(offset),
-            TabOutcome::Stay => self.snippet = Some(session),
-        }
-    }
-
-    /// Cancel the snippet session if the primary caret has left every stop (a
-    /// caret move or an edit outside all stops). Never a transaction.
-    fn reconcile_snippet(&mut self) {
-        if self.snippet.is_none() {
-            return;
-        }
-        let head = self.doc.selections().newest().head();
-        let escaped = self.snippet.as_ref().unwrap().edit_escapes(&(head..head), self.doc.decorations());
-        if escaped {
-            let mut s = self.snippet.take().unwrap();
-            s.cancel(self.doc.decorations_mut());
-        }
-    }
-
-    /// Move the primary caret to `offset`.
-    fn set_caret(&mut self, offset: u32) {
-        let mut set = SelectionSet::new(0);
-        set.set_single(Selection::caret(SelectionId(0), offset));
-        self.doc.set_selections(set);
-    }
-
-    /// Select `range` as the primary selection.
-    fn set_selection_range(&mut self, range: Range<u32>) {
-        let mut set = SelectionSet::new(0);
-        set.set_single(Selection::from_anchor(SelectionId(0), range.start, range.end));
-        self.doc.set_selections(set);
-    }
-
-    /// The completion-word byte range ending at the primary caret (empty at a
-    /// boundary), computed with `is_completion_word_char`.
-    fn completion_word(&self) -> Range<u32> {
-        let head = self.doc.selections().newest().head();
-        let p = self.doc.buffer().offset_to_point(head);
-        let line_start = head - p.col;
-        let prefix = &self.doc.buffer().line(p.row)[..p.col as usize];
-        let word_start = prefix
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| is_completion_word_char(*c))
-            .last()
-            .map_or(prefix.len(), |(i, _)| i);
-        (line_start + word_start as u32)..head
-    }
-
-    /// The text of the completion word under the caret.
-    fn completion_word_text(&self) -> String {
-        let w = self.completion_word();
-        self.doc.buffer().slice(w.start..w.end).into_owned()
-    }
-
-    /// The leading whitespace of the line containing byte `offset`.
-    fn line_indent(&self, offset: u32) -> String {
-        let row = self.doc.buffer().offset_to_point(offset).row;
-        self.doc.buffer().line(row).chars().take_while(|c| *c == ' ' || *c == '\t').collect()
-    }
-
-    /// Build a completion request from the current document state.
-    fn build_cx(&self, trigger: CompletionTrigger) -> CompletionCx {
-        let head = self.doc.selections().newest().head();
-        let position = self.doc.buffer().offset_to_point(head);
-        // The lookback slice (up to `LOOKBACK_LINES`) is only read when the
-        // provider will actually run. A word char typed while the popup is
-        // already open just refilters locally (`CompletionController::on_input`)
-        // and never reads it — so skip the up-to-40-line slice copy on that hot
-        // per-keystroke path; build it only when a provider call is coming.
-        let refilter_only =
-            self.completion.is_open() && matches!(trigger, CompletionTrigger::Typed(_));
-        let lookback = if refilter_only {
-            String::new()
-        } else {
-            let start_row = position.row.saturating_sub(LOOKBACK_LINES - 1);
-            let lb_start = self.doc.buffer().point_to_offset(Point::new(start_row, 0));
-            self.doc.buffer().slice(lb_start..head).into_owned()
-        };
-        CompletionCx {
-            doc: self.doc.buffer().doc_id(),
-            revision: self.doc.revision().0,
-            position,
-            word: self.completion_word(),
-            lookback,
-            trigger,
-        }
-    }
-
-    pub fn view(&self) -> Element<'_, Msg> {
-        // Addressable by id (focus + future multi-pane); the editor reads
-        // highlight spans straight from the document's cache and the completion
-        // popup from the controller.
-        let popup = match self.completion.state() {
-            CompletionState::Open(list) => Some(list),
-            _ => None,
-        };
-        let editor = Editor::new(&self.doc, Msg::Editor)
-            .popup(popup)
-            .snippet_active(self.snippet.is_some())
-            .signature(self.signature.as_ref())
-            .hover(self.hover.as_ref())
-            .id(EDITOR);
-        if self.find_open {
-            // Float the find bar over the editor, top-right (where mainstream
-            // editors place it): a Stack layer, right-aligned with a margin. The right margin clears
-            // the vertical scrollbar lane so the bar never sits over it. The
-            // overlay is transparent except the bar, so clicks pass through.
-            let overlay = container(self.find_bar())
-                .width(Length::Fill)
-                .align_x(Horizontal::Right)
-                .padding(iced::Padding::new(8.0).right(8.0 + scrive_iced::SCROLLBAR_WIDTH));
-            stack([editor.into(), overlay.into()]).into()
-        } else {
-            editor.into()
-        }
-    }
-
-    /// The app-side find bar: a floating panel holding a query row (input +
-    /// match count + prev/next/close) and, once the chevron expands it, a
-    /// replace row (input + replace/replace-all). The widget owns no find keys —
-    /// the app drives the Document methods.
-    fn find_bar(&self) -> Element<'_, Msg> {
-        let count = self.doc.find_match_count();
-        // A half-typed regex (`(`, `[a-`) is a NORMAL state, not a failure — but
-        // it must say so. Reporting the honest zero matches as "No results"
-        // would imply the pattern is fine and the document simply lacks it.
-        let invalid = self.doc.find_pattern_error().is_some();
-        let label = if invalid {
-            "Invalid regex".to_string()
-        } else {
-            match self.doc.active_find_match() {
-                Some(i) => format!("{} of {}", i + 1, count),
-                None if count > 0 => format!("{count} matches"),
-                None if self.find_query.is_empty() => String::new(),
-                None => "No results".to_string(),
-            }
-        };
-        // Error red for anything the user has to notice or fix; otherwise the
-        // neutral `#CCCCCC`.
-        let label_color = if invalid || label == "No results" {
-            Color::from_rgb8(0xF4, 0x87, 0x71)
-        } else {
-            Color::from_rgb8(0xCC, 0xCC, 0xCC)
-        };
-        // Both inputs share this width (so the two boxes align under each other),
-        // wide enough to breathe with the in-box toggles present.
-        const INPUT_W: f32 = 264.0;
-        // Fixed so the nav buttons never shuffle as the match count's digit
-        // count changes (e.g. "1 of 5" ↔ "50 of 500"), but LEFT-aligned and only
-        // as wide as the labels that actually recur — "Invalid regex" (13
-        // chars), "No results", a mid-size count. The "10000 of 10000" cap-edge
-        // label overflows this by a hair and is allowed to; it is a
-        // once-in-a-corpus state, not worth widening the whole bar for.
-        const COUNT_W: f32 = 78.0;
-        // The one gap between every control in the panel — shared so the
-        // derived toggle-cluster width below matches the row it mirrors.
-        const SPACING: f32 = 4.0;
-        // One row's height. Pinned rather than left to iced's intrinsic
-        // `text_input` sizing, because the chevron must span the rows EXACTLY:
-        // deriving both from one number is what stops them drifting apart. A
-        // hair over the input's natural height (25 px at size 13 + padding 4),
-        // so nothing clips. `Length::Fill` cannot do this job — a Fill child in
-        // a Shrink row propagates upward and stretches the whole panel to the
-        // viewport.
-        const ROW_H: f32 = 26.0;
-        // Colors are neutral dark-theme grays (theme-agnostic) so the find bar
-        // reads as standard editor chrome over the dark editor theme.
-        //
-        // The box look lives on the CONTAINER (see `box_of`), so the field is
-        // TRANSPARENT and sits inside it beside the in-box buttons as an ordinary
-        // row sibling — NOT overlaid in a `Stack`. That is load-bearing for
-        // focus: a `Stack` early-returns on capture, so once one field captured a
-        // click the OTHER field's stack skipped it and left it stale-focused
-        // (two fields both "focused", and a click would bounce back to the wrong
-        // one). A plain row lets every field see the click and the non-clicked
-        // ones unfocus themselves, the way iced's single-focus is meant to work.
-        //
-        // ONE style for BOTH fields — it captures nothing, so it is `Copy`.
-        let input_style = |_theme: &Theme, _status: text_input::Status| text_input::Style {
-            background: Color::TRANSPARENT.into(),
-            border: iced::border::rounded(0.0),
-            icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-            placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
-            value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-            selection: Color::from_rgb8(0x26, 0x4F, 0x78),
-        };
-        // Every button OUTSIDE an input is this wide; all but the chevron are
-        // square. The buttons that live INSIDE an input box are a touch smaller
-        // so they clear the box's border.
-        const BTN_W: f32 = 22.0;
-        const IN_BTN: f32 = 20.0;
-        const IN_GAP: f32 = 3.0; // between in-box buttons
-        const IN_MARGIN: f32 = 3.0; // from the box's right edge
-        // Flat icon buttons: transparent at rest, translucent gray on hover.
-        // `on` LATCHES that background and adds the focus-blue border, so an
-        // engaged option (`Aa`) reads as pressed at rest rather than only under
-        // the pointer — a toggle whose state you cannot see is a trap.
-        // `w`/`h` are parameters so the same button serves the outside row, the
-        // in-box clusters, and the two-row-tall chevron.
-        // Glyphs are Codicons, rendered in the bundled font.
-        let sized_btn = |glyph: char, on: bool, msg, w: f32, h: f32| {
-            button(
-                text(glyph.to_string())
-                    .font(scrive_iced::CODICON)
-                    .size(15)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Horizontal::Center)
-                    .align_y(Vertical::Center),
-            )
-            .width(Length::Fixed(w))
-            .height(Length::Fixed(h))
-            .padding(0)
-            .on_press(msg)
-            .style(move |_theme, status| {
-                let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: (on || hover).then(|| Color::from_rgba8(90, 93, 94, 0.314).into()),
-                    text_color: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-                    border: if on {
-                        iced::border::rounded(5.0).width(1.0).color(Color::from_rgb8(0x00, 0x7F, 0xD4))
-                    } else {
-                        iced::border::rounded(5.0)
-                    },
-                    shadow: Shadow::default(),
-                    snap: true,
-                }
-            })
-        };
-        // Outside-the-box variants: a latching option toggle, and a plain action.
-        let icon_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, BTN_W, BTN_W);
-        let btn = |glyph: char, msg| sized_btn(glyph, false, msg, BTN_W, BTN_W);
-        // In-box variant (`Aa`, replace, …), a touch smaller so it clears the
-        // box's edges. `box_of` places `[Fill field | buttons]` in a styled
-        // container of the fixed box width — both boxes come out identical
-        // regardless of how many buttons each holds.
-        let in_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, IN_BTN, IN_BTN);
-        let box_of =
-            |field, buttons, focused| box_of(field, buttons, focused, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
-
-        // The find box: query field + the `Aa`/`ab|`/`.*` option toggles inside
-        // it. Each toggle is part of the QUERY, not chrome — flipping one
-        // re-scans, which is why they live with the query text.
-        let find_box = box_of(
-            text_input("Find", &self.find_query)
-                .id(FIND_INPUT)
-                .on_input(Msg::FindQuery)
-                // Enter-in-the-input navigates. `on_submit` fires only while the
-                // INPUT holds focus, so an Enter typed in the editor can never
-                // double-dispatch into find navigation; Shift+Enter previous-match
-                // is the ↑ button (on_submit is modifier-blind), and Alt+Enter
-                // select-all stays a subscription chord.
-                .on_submit(Msg::FindNext)
-                .padding(iced::Padding::new(4.0).left(2.0))
-                .size(13)
-                .width(Length::Fill)
-                .style(input_style)
-                .into(),
-            vec![
-                in_btn(scrive_iced::icon::CASE_SENSITIVE, self.find_case, Msg::ToggleCase).into(),
-                in_btn(scrive_iced::icon::WHOLE_WORD, self.find_whole_word, Msg::ToggleWholeWord)
-                    .into(),
-                in_btn(scrive_iced::icon::REGEX, self.find_regex, Msg::ToggleRegex).into(),
-            ],
-            self.find_focused,
-        );
-        let find_row = row![
-            find_box,
-            text(label)
-                .size(12)
-                .color(label_color)
-                .width(Length::Fixed(COUNT_W))
-                .align_x(Horizontal::Left),
-            btn(scrive_iced::icon::ARROW_UP, Msg::FindPrev), // previous match
-            btn(scrive_iced::icon::ARROW_DOWN, Msg::FindNext), // next match
-            // Find in selection — a latched toggle, sitting with the nav cluster
-            // where VS Code puts it rather than with the in-box option toggles.
-            icon_btn(scrive_iced::icon::SELECTION, self.scoped(), Msg::ToggleFindInSelection),
-            btn(scrive_iced::icon::CLOSE, Msg::CloseFind), // close
-        ]
-        .spacing(SPACING)
-        .height(Length::Fixed(ROW_H))
-        .align_y(Alignment::Center);
-        let rows = if self.replace_open {
-            // The replace box mirrors the find box: same width, with its ONE
-            // option — preserve-case (`AB`) — inside it. The replace / replace-all
-            // buttons sit OUTSIDE to the right (as VS Code does), the way the
-            // find row's nav buttons sit outside the find box.
-            let replace_box = box_of(
-                text_input("Replace", &self.replace_text)
-                    .id(REPLACE_INPUT)
-                    .on_input(Msg::ReplaceText)
-                    // Enter here replaces the active match and advances — the same
-                    // INPUT-focused rule as the query's `on_submit`, so an Enter
-                    // typed in the editor still only makes a newline.
-                    .on_submit(Msg::ReplaceOne)
-                    .padding(iced::Padding::new(4.0).left(2.0))
-                    .size(13)
-                    .width(Length::Fill)
-                    .style(input_style)
-                    .into(),
-                vec![in_btn(
-                    scrive_iced::icon::PRESERVE_CASE,
-                    self.replace_preserve_case,
-                    Msg::TogglePreserveCase,
-                )
-                .into()],
-                self.replace_focused,
-            );
-            let replace_row = row![
-                replace_box,
-                btn(scrive_iced::icon::REPLACE, Msg::ReplaceOne), // replace the active match
-                btn(scrive_iced::icon::REPLACE_ALL, Msg::ReplaceAll), // …and every other one
-            ]
-            .spacing(SPACING)
-            .height(Length::Fixed(ROW_H))
-            .align_y(Alignment::Center);
-            column![find_row, replace_row].spacing(SPACING)
-        } else {
-            column![find_row]
-        };
-        container(
-            row![
-                // The chevron is a handle on the WHOLE panel, so it spans both
-                // rows rather than sitting beside them as one more 22×22 button
-                // — its hit target grows with the bar it toggles, which is both
-                // VS Code's shape and the honest one: it acts on the panel, not
-                // on the query row it happens to sit next to.
-                sized_btn(
-                    if self.replace_open {
-                        scrive_iced::icon::CHEVRON_DOWN
-                    } else {
-                        scrive_iced::icon::CHEVRON_RIGHT
-                    },
-                    false,
-                    Msg::ToggleReplace,
-                    BTN_W,
-                    // Exactly the rows it spans — both derived from `ROW_H`.
-                    if self.replace_open { ROW_H * 2.0 + SPACING } else { ROW_H },
-                ),
-                rows,
-            ]
-            .spacing(SPACING)
-            .align_y(Alignment::Center),
-        )
-        .padding([6, 8])
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0x25, 0x25, 0x26).into()),
-            border: iced::border::rounded(8.0).color(Color::from_rgb8(0x45, 0x45, 0x45)).width(1.0),
-            shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.36),
-                offset: Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            },
-            ..container::Style::default()
-        })
-        .into()
-    }
-
-    fn subscription(&self) -> Subscription<Msg> {
-        // The highlight sweep tick: one budgeted tick per frame while a dirty
-        // frontier or a window gap remains, OR while the off-thread pool is
-        // still verifying; the subscription drops at convergence, so an idle
-        // document does zero work per frame.
-        let sweeping = self.doc.highlight_frontier().is_some()
-            || self.hl_pool.as_ref().is_some_and(|p| p.active);
-        let sweep = if sweeping {
-            iced::window::frames().map(|_| Msg::HighlightSweep)
-        } else {
-            Subscription::none()
-        };
-        // The debounced re-lint tick: fire frames only while an edit left a
-        // pending re-lint; the `now_ms` gate in `maybe_relint` runs the actual
-        // scan at most once per window, and clearing the flag drops this
-        // subscription — idle-zero-work otherwise. A distinct map closure from
-        // `sweep` (its own `TypeId`) so iced tracks the two frame recipes apart.
-        let relint = if self.relint_dirty {
-            iced::window::frames().map(|_| Msg::MaybeRelint)
-        } else {
-            Subscription::none()
-        };
-        // Find keys are app chrome: caught here, not widget keys.
-        // `listen_with` (unlike `listen`) delivers events *regardless of capture
-        // status* — the native text_input captures Escape and blurs itself, so
-        // `listen` never saw it; here we still get it and can close the bar in
-        // one press. It filter-maps, so non-find keys produce no message, and the
-        // editor's own captured keystrokes still route through the widget. The
-        // closure is a fn (non-capturing), so `find_open` is gated in `update`.
-        let keys = iced::event::listen_with(|event, status, _window| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key, modifiers, ..
-            }) => find_chord(&key, modifiers, status),
-            // A press can move focus NATIVELY, behind the app's back, and leave
-            // two widgets focused — see `App::resync_focus`. Watched here rather
-            // than through a widget callback because the press that causes it is
-            // captured by the input and never surfaces as one.
-            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-                Some(Msg::PointerDown)
-            }
-            _ => None,
-        });
-        Subscription::batch([keys, sweep, relint])
-    }
-}
-
-/// A severity's display name for the diagnostic hover.
-fn severity_label(sev: Severity) -> &'static str {
-    match sev {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Info => "info",
-        Severity::Hint => "hint",
-    }
-}
-
 /// An original dark theme for the demo's iced chrome (find bar, popups,
 /// scrollbar), matching the `Scrive Dark` syntax theme.
 pub fn scrive_dark() -> Theme {
@@ -2063,110 +484,25 @@ pub fn scrive_dark() -> Theme {
     )
 }
 
-/// One input box: a `Fill` text field beside its in-box buttons, in a styled
-/// container of the fixed box width (VS Code's shape).
-///
-/// A plain **row**, deliberately NOT a `Stack` overlay. A `Stack` early-returns
-/// once any child captures an event, so when one box's field captured a click
-/// the OTHER box's stack skipped its field and left it stale-"focused" — two
-/// fields both believing they held focus, so a later click could bounce back to
-/// the wrong one. A row lets every field see the click, and the non-clicked ones
-/// unfocus themselves, which is how iced's single-focus is meant to work. The
-/// box look lives on the container, so the field is transparent and the buttons
-/// are ordinary siblings.
-///
-/// Both boxes pass the same `w`, so they come out identical widths whatever
-/// their button count. A free fn, not a closure, for the usual lifetime reason
-/// (the field/buttons' lifetime must equal the returned element's).
-fn box_of<'a>(
-    field: Element<'a, Msg>,
-    buttons: Vec<Element<'a, Msg>>,
-    focused: bool,
-    w: f32,
-    h: f32,
-    gap: f32,
-    margin: f32,
-) -> Element<'a, Msg> {
-    container(
-        row![field, row(buttons).spacing(gap).align_y(Alignment::Center)]
-            .spacing(gap)
-            .align_y(Alignment::Center),
-    )
-    .width(Length::Fixed(w))
-    .height(Length::Fixed(h))
-    .padding(iced::Padding::from([0.0, margin]))
-    // The focus ring lives here (the box is the container), driven by the
-    // app-tracked `focused` flag since a container can't read its field's focus.
-    .style(move |_theme: &Theme| container::Style {
-        background: Some(Color::from_rgb8(0x3C, 0x3C, 0x3C).into()),
-        border: iced::border::rounded(4.0).width(1.0).color(if focused {
-            Color::from_rgb8(0x00, 0x7F, 0xD4) // focus ring
-        } else {
-            Color::TRANSPARENT
-        }),
-        ..container::Style::default()
-    })
-    .into()
-}
-
-/// The find bar's global chord table — a free fn, so it is testable without a
-/// window (the same shape as the widget's own `interpret_key`).
-///
-/// `status` is what the widget tree did with the key BEFORE this saw it, and it
-/// is load-bearing for Tab: see the `Named::Tab` arm.
-fn find_chord(
-    key: &iced::keyboard::Key,
-    modifiers: iced::keyboard::Modifiers,
-    status: iced::event::Status,
-) -> Option<Msg> {
-    use iced::keyboard::{key::Named, Key};
-    let ctrl = modifiers.command() || modifiers.control();
-    match key {
-        Key::Character(c) if ctrl && c.as_str() == "f" => Some(Msg::OpenFind),
-        // Ctrl+H — find, with the replace row already expanded.
-        Key::Character(c) if ctrl && c.as_str() == "h" => Some(Msg::OpenReplace),
-        Key::Named(Named::Escape) => Some(Msg::CloseFind),
-        // Alt+Enter: select all matches — safe as a global chord because the
-        // editor deliberately ignores Alt+Enter (no newline dispatched
-        // alongside it). Plain Enter is NOT handled here: in the input it
-        // navigates via `on_submit`; in the editor it must only type a newline.
-        Key::Named(Named::Enter) if modifiers.alt() => Some(Msg::FindSelectAll),
-        // Tab moves focus between the bar's inputs — but ONLY when nothing else
-        // took the key. The editor CAPTURES Tab (it indents), so gating on
-        // `Ignored` is exactly what keeps indent working while the bar is open:
-        // a focused editor swallows Tab before this is ever called. iced's
-        // `text_input` leaves keys it does not handle uncaptured (its match's
-        // arms are `_ => {}`, no `capture_event`), so a focused input falls
-        // through to here instead. Buttons are not focusable in iced, so the
-        // cycle is exactly find → replace → editor.
-        Key::Named(Named::Tab) if status == iced::event::Status::Ignored => {
-            Some(Msg::CycleFocus { back: modifiers.shift() })
-        }
-        _ => None,
-    }
-}
-
 fn theme(_state: &App) -> Theme {
     scrive_dark()
 }
 
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
-    // `--large <MB>` (default 10): open a synthetic Rust-shaped document of
-    // that size instead of the sample — the large-document stress case
-    // (type, scroll, jump to end; colors fill in behind the idle sweep).
+    // `--large <MB>` (default 10): open a synthetic Rust-shaped document of that
+    // size instead of the sample — the large-document stress case (the parallel
+    // highlight sweep colours it in behind the idle sweep).
     if let Some(i) = args.iter().position(|a| a == "--large") {
         let mb: usize = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10);
         let _ = LARGE_DOC.set(gen_large(mb));
     }
     if let Some(i) = args.iter().position(|a| a == "--capture") {
         let path = args.get(i + 1).map_or("scratch.png", String::as_str);
-        // Render the syntax-highlighted Rust sample in the Scrive Dark theme.
-        // The static harness discards published messages, so it stands in for
-        // the app loop's first ViewportChanged: tokenize the (budget-capped)
-        // first batch so the visible rows carry their colors.
-        let mut app = App::default();
-        app.doc.tokenize_highlight(app.doc.buffer().line_count());
+        // `CodeEditor::new(..).language(..)` colours the document at construction
+        // (the cold-load seed), so the visible rows carry their colours with no
+        // viewport report needed.
+        let app = App::new();
         let (w, h) = capture::render_to_png(app.view(), 900, 560, &scrive_dark(), &[], path);
         eprintln!("captured {w}x{h} -> {path}");
         return Ok(());
@@ -2175,48 +511,42 @@ fn main() -> iced::Result {
     // collapsible pair, then render one frame — maximal fold geometry on screen.
     if let Some(i) = args.iter().position(|a| a == "--capture-folds") {
         let path = args.get(i + 1).map_or("scratch-folds.png", String::as_str);
-        let mut app = App::default();
-        app.doc.tokenize_highlight(app.doc.buffer().line_count());
-        for (open, ..) in app.doc.collapsible_pairs() {
-            app.doc.toggle_fold_opener(open);
-        }
+        let mut app = App::new();
+        app.editor.fold_all();
         let (w, h) = capture::render_to_png(app.view(), 900, 560, &scrive_dark(), &[], path);
         eprintln!("captured {w}x{h} -> {path}");
         return Ok(());
     }
-
     // Find+replace layout harness (see the module doc): open the bar with the
-    // replace row expanded over a live query and an active match, then render
-    // one frame — chevron, both inputs, the match count, and every button on
-    // screen at once. Headless tests cannot see pixels; this is how the bar's
-    // layout gets judged.
+    // replace row expanded over a live query and an active match, then render one
+    // frame — chevron, both inputs, the match count, and every button on screen.
     if let Some(i) = args.iter().position(|a| a == "--capture-find") {
         let path = args.get(i + 1).map_or("scratch-find.png", String::as_str);
-        let mut app = App::default();
-        app.doc.tokenize_highlight(app.doc.buffer().line_count());
-        let _ = app.update(Msg::OpenReplace); // find + the replace row out
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let _ = app.update(Msg::ReplaceText("this".into()));
+        let mut app = App::new();
+        let ev = |e| Message::Editor(e);
+        let _ = app.update(ev(Event::OpenReplace)); // find + the replace row out
+        let _ = app.update(ev(Event::FindQuery("self".into())));
+        let _ = app.update(ev(Event::ReplaceText("this".into())));
         // Latch two of the three options, so both the engaged and the resting
         // toggle style are on screen to compare.
-        let _ = app.update(Msg::ToggleCase);
-        let _ = app.update(Msg::ToggleWholeWord);
-        let _ = app.update(Msg::TogglePreserveCase); // latch the replace box's AB
+        let _ = app.update(ev(Event::ToggleCase));
+        let _ = app.update(ev(Event::ToggleWholeWord));
+        let _ = app.update(ev(Event::TogglePreserveCase)); // latch the replace box's AB
         // Scope find to a block of the sample, so the scope wash + its latched
         // toggle are on screen too.
-        app.apply(Action::DragSelect {
-            granularity: scrive_core::Granularity::Char,
+        let _ = app.update(ev(Event::Editor(Action::DragSelect {
+            granularity: Granularity::Char,
             origin: 0,
             head: 600,
-        });
-        let _ = app.update(Msg::ToggleFindInSelection);
-        let _ = app.update(Msg::FindNext); // activate a match ⇒ a real "N of M"
+        })));
+        let _ = app.update(ev(Event::ToggleFindInSelection));
+        let _ = app.update(ev(Event::FindNext)); // activate a match ⇒ a real "N of M"
         let (w, h) = capture::render_to_png(app.view(), 900, 560, &scrive_dark(), &[], path);
         eprintln!("captured {w}x{h} -> {path}");
         return Ok(());
     }
 
-    let app = iced::application(App::default, App::update, App::view)
+    let app = iced::application(App::new, App::update, App::view)
         .title("scrive — scratch")
         .theme(theme)
         .subscription(App::subscription);
@@ -2232,482 +562,28 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
 
-    /// Replace-all driven through the BAR (not the core verb directly) must land
-    /// as one transaction: a single undo restores the document byte-for-byte.
-    /// This is the app-side half of the one-undo-step claim — it proves the
-    /// message path commits once, not once per match.
-    #[test]
-    fn replace_all_through_the_bar_is_one_undo_step() {
-        let mut app = App::default();
-        // Owned: `text()` borrows the document, and every `update` below needs it
-        // mutably.
-        let original = app.doc.text().into_owned();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        assert!(app.doc.find_match_count() > 0, "the sample must contain the needle");
-        let _ = app.update(Msg::ReplaceText("this".into()));
-        let _ = app.update(Msg::ReplaceAll);
-        assert!(!app.doc.text().contains("self"), "every match replaced");
-        assert!(app.doc.text().contains("this"));
-        app.apply(Action::Undo);
-        assert_eq!(app.doc.text(), original.as_str(), "replace-all must undo as ONE step");
-    }
-
-    /// The replace button shows the match before it overwrites it: the first
-    /// press only navigates, the second replaces.
-    #[test]
-    fn the_replace_button_selects_before_it_replaces() {
-        let mut app = App::default();
-        let original = app.doc.text().into_owned();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let _ = app.update(Msg::ReplaceText("this".into()));
-        let _ = app.update(Msg::ReplaceOne);
-        assert_eq!(app.doc.text(), original.as_str(), "the first press only navigates");
-        let _ = app.update(Msg::ReplaceOne);
-        assert_ne!(app.doc.text(), original.as_str(), "the second press replaces");
-    }
-
-    /// Closing collapses the replace row, so the NEXT open starts clean: Ctrl+F
-    /// reopens find-only even if you had expanded replace before. Otherwise
-    /// Ctrl+F surprises you with a replace box you never asked for.
-    #[test]
-    fn closing_collapses_the_replace_row() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::ToggleReplace); // expand replace via the chevron
-        assert!(app.replace_open);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let _ = app.update(Msg::CloseFind);
-        assert!(app.find_query.is_empty(), "close drops the query");
-        assert!(app.doc.find_query().is_none(), "…and its matches");
-        assert!(!app.replace_open, "…and collapses the replace row");
-        // A plain Ctrl+F now reopens find-only.
-        let _ = app.update(Msg::OpenFind);
-        assert!(!app.replace_open, "Ctrl+F is find-only");
-        // …while Ctrl+H still brings the replace row back.
-        let _ = app.update(Msg::CloseFind);
-        let _ = app.update(Msg::OpenReplace);
-        assert!(app.replace_open, "Ctrl+H reopens with replace");
-    }
-
-    /// The `Aa` toggle is part of the QUERY, not chrome: flipping it must
-    /// re-scan and change the live match set, not merely restyle the button.
-    #[test]
-    fn the_case_toggle_rescans() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        // The sample has `Self` (the type) and `self` (the receiver), so the
-        // case flag is observable in the count.
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let insensitive = app.doc.find_match_count();
-        let _ = app.update(Msg::ToggleCase);
-        assert!(app.find_case);
-        let sensitive = app.doc.find_match_count();
-        assert!(
-            sensitive < insensitive,
-            "case-sensitive must drop the `Self` matches ({sensitive} vs {insensitive})"
-        );
-        assert!(app.doc.find_query().is_some_and(|q| q.case_sensitive));
-        // …and back.
-        let _ = app.update(Msg::ToggleCase);
-        assert_eq!(app.doc.find_match_count(), insensitive);
-    }
-
-    /// The `ab|` and `.*` toggles are part of the query too: each re-scans and
-    /// changes the live match set, and they compose (a whole-word regex).
-    #[test]
-    fn the_whole_word_and_regex_toggles_rescan() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let plain = app.doc.find_match_count();
-        // Whole word drops the `self` inside longer identifiers, if any, and can
-        // never ADD matches.
-        let _ = app.update(Msg::ToggleWholeWord);
-        assert!(app.doc.find_query().is_some_and(|q| q.whole_word));
-        assert!(app.doc.find_match_count() <= plain);
-        let _ = app.update(Msg::ToggleWholeWord);
-        assert_eq!(app.doc.find_match_count(), plain, "…and toggling back restores it");
-
-        // Regex: `.` is a metacharacter only with the option on.
-        let _ = app.update(Msg::FindQuery("s.lf".into()));
-        assert_eq!(app.doc.find_match_count(), 0, "literal `s.lf` is not in the sample");
-        let _ = app.update(Msg::ToggleRegex);
-        assert!(app.doc.find_match_count() > 0, "as a regex it matches `self`");
-    }
-
-    /// The `AB` toggle carries into the replace: with it on, a rename keeps each
-    /// occurrence's casing; with it off, the replacement lands verbatim.
-    #[test]
-    #[allow(clippy::field_reassign_with_default)] // App::default() runs real setup; can't struct-update
-    fn the_preserve_case_toggle_recases_replacements() {
-        let mut app = App::default();
-        // A doc with mixed-case occurrences of the needle. (Replacing the whole
-        // App would drop its seeded highlight/lint setup; only the doc matters.)
-        app.doc = Document::new("FOO Foo foo").unwrap();
-        let _ = app.update(Msg::OpenReplace);
-        let _ = app.update(Msg::FindQuery("foo".into())); // case-insensitive by default
-        let _ = app.update(Msg::ReplaceText("bar".into()));
-        assert!(!app.replace_preserve_case);
-        let _ = app.update(Msg::TogglePreserveCase);
-        assert!(app.replace_preserve_case, "the toggle latches app state");
-        let _ = app.update(Msg::ReplaceAll);
-        assert_eq!(app.doc.text(), "BAR Bar bar", "each match keeps its casing");
-    }
-
-    /// A half-typed regex is a normal state: no matches, no panic, and the bar
-    /// says *why* rather than implying the document simply lacks the text.
-    #[test]
-    fn a_half_typed_regex_reports_invalid_rather_than_no_results() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::ToggleRegex);
-        let _ = app.update(Msg::FindQuery("(".into()));
-        assert_eq!(app.doc.find_match_count(), 0);
-        assert!(app.doc.find_pattern_error().is_some(), "the bar has a reason to show");
-        // Editing while the pattern is broken must not panic.
-        app.apply(Action::Type('x'));
-        // Finishing it resumes matching.
-        let _ = app.update(Msg::FindQuery("(self)".into()));
-        assert!(app.doc.find_pattern_error().is_none());
-        assert!(app.doc.find_match_count() > 0);
-    }
-
-    /// Find-in-selection scopes to the live selection, restricts the match set,
-    /// and toggles back off. Its latched state is the DOCUMENT's scope, so there
-    /// is no app-side copy that could disagree with what is actually searched.
-    #[test]
-    fn find_in_selection_scopes_to_the_selection() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let all = app.doc.find_match_count();
-        assert!(all > 1);
-        // Select a prefix of the document, then scope to it.
-        app.apply(Action::PlaceCaret(0));
-        let half = app.doc.buffer().len() / 2;
-        app.apply(Action::DragSelect {
-            granularity: scrive_core::Granularity::Char,
-            origin: 0,
-            head: half,
-        });
-        let _ = app.update(Msg::ToggleFindInSelection);
-        assert!(app.scoped(), "the button latches off the document's scope");
-        let scoped = app.doc.find_match_count();
-        assert!(scoped < all, "the scope must drop the out-of-range matches");
-        assert!(
-            app.doc.find_matches_in(0..u32::MAX).all(|(m, _)| m.end <= half),
-            "no match may sit outside the scope"
-        );
-        // …and toggling off restores the full set.
-        let _ = app.update(Msg::ToggleFindInSelection);
-        assert!(!app.scoped());
-        assert_eq!(app.doc.find_match_count(), all);
-    }
-
-    /// Clicking a bar input must not leave the editor stealing Tab.
-    ///
-    /// Clicks in the bar route focus to the clicked field — two repros of the
-    /// same capture-starvation bug, both driving the REAL widget tree (nothing
-    /// smaller sees them): (1) clicking a field must not leave the editor
-    /// stale-focused and stealing Tab; (2) clicking one field after another must
-    /// move focus there, not bounce back. Both stem from a widget capturing a
-    /// click and the containing `Stack` then skipping a sibling that needed to
-    /// unfocus — fixed by making the boxes plain rows, not stacks.
-    #[test]
-    fn bar_clicks_route_focus_to_the_clicked_field() {
-        use iced::advanced::widget::Operation;
-        use iced::advanced::{clipboard, renderer};
-        use iced::keyboard::{key::Named, Key, Modifiers};
-        use iced::{mouse, Event, Font, Pixels, Point, Size, Theme};
-        use iced_runtime::task;
-        use iced_runtime::user_interface::{Cache, UserInterface};
-        use std::slice::from_ref;
-        use std::task::{Context, Poll, Waker};
-
-        const W: f32 = 900.0;
-        const H: f32 = 560.0;
-        let mut renderer = iced_renderer::fallback::Renderer::Secondary(
-            iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
-        );
-        let theme = scrive_dark();
-        let mut app = App::default();
-        let mut cache = Cache::new();
-        // Messages queued for the NEXT frame — the queue iced's runtime keeps
-        // between the update pass and the operation pass. Their tasks are driven
-        // at the top of the next frame, against that frame's built UI.
-        let mut pending: Vec<Msg> = vec![Msg::OpenReplace];
-
-        // One frame. Faithful enough to drive the focus operations these messages
-        // emit — which the recorder's simpler `drain` cannot, because it drops the
-        // task stream at the first `Pending` and loses the continuation. The
-        // trick: a `widget::operate` task yields its op, and re-polling the SAME
-        // stream AFTER the op runs yields whatever the op's result fed into
-        // (`is_focused(id).then(focus)` becomes the `focus` op only once the
-        // `is_focused` op has produced its bool). So each stream is polled,
-        // operated, and RE-polled in a loop.
-        let mut frame = |app: &mut App,
-                         cache: &mut Cache,
-                         pending: &mut Vec<Msg>,
-                         events: &[Event],
-                         cursor: mouse::Cursor| {
-            // Streams must be built BEFORE the UI borrows `app` immutably — the
-            // relevant tasks (focus / resync) emit only operations, never app
-            // messages, so nothing here needs a mid-flight `app.update`.
-            let mut streams: Vec<_> = pending
-                .drain(..)
-                .filter_map(|m| task::into_stream(app.update(m)))
-                .collect();
-            let mut ui: UserInterface<'_, Msg, Theme, iced::Renderer> = UserInterface::build(
-                app.view(),
-                Size::new(W, H),
-                std::mem::take(cache),
-                &mut renderer,
-            );
-            let waker = Waker::noop();
-            let mut cx = Context::from_waker(waker);
-            for mut stream in streams.drain(..) {
-                loop {
-                    match stream.as_mut().poll_next(&mut cx) {
-                        Poll::Ready(Some(iced_runtime::Action::Widget(op))) => {
-                            // Run the op (following its chain — `focus_next`
-                            // counts then moves), which feeds its result back into
-                            // the stream; the loop re-polls for the continuation.
-                            let mut current = Some(op);
-                            while let Some(mut op) = current.take() {
-                                ui.operate(&renderer, op.as_mut());
-                                if let iced::advanced::widget::operation::Outcome::Chain(next) =
-                                    op.finish()
-                                {
-                                    current = Some(next);
-                                }
-                            }
-                        }
-                        // These focus tasks never output an app message; if one
-                        // ever did, deferring it to the next frame is the honest
-                        // thing (we cannot `app.update` while the UI borrows it).
-                        Poll::Ready(Some(iced_runtime::Action::Output(m))) => pending.push(m),
-                        Poll::Ready(Some(_)) => {}
-                        Poll::Ready(None) | Poll::Pending => break,
-                    }
-                }
-            }
-            let mut published: Vec<Msg> = Vec::new();
-            let (_, statuses) =
-                ui.update(events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
-            ui.draw(&mut renderer, &theme, &renderer::Style::default(), cursor);
-            *cache = ui.into_cache();
-            // Editor actions the widget published (e.g. Tab → indent) are plain
-            // doc mutations with no widget operations, so apply them NOW rather
-            // than deferring — otherwise a caller sees stale text this frame.
-            for m in published {
-                let _ = app.update(m);
-            }
-            // Stand in for the `listen_with` subscription: iced hands it each
-            // event WITH the status the widget tree produced, which is exactly
-            // what the Tab gate reads.
-            for (ev, status) in events.iter().zip(statuses) {
-                let msg = match ev {
-                    Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                        key, modifiers, ..
-                    }) => find_chord(key, *modifiers, status),
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                        Some(Msg::PointerDown)
-                    }
-                    _ => None,
-                };
-                pending.extend(msg);
-            }
-        };
-
-        let away = mouse::Cursor::Available(Point::new(W / 2.0, H - 8.0));
-        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
-        let tab = Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key: Key::Named(Named::Tab),
-            modified_key: Key::Named(Named::Tab),
-            physical_key: iced::keyboard::key::Physical::Unidentified(
-                iced::keyboard::key::NativeCode::Unidentified,
-            ),
-            location: iced::keyboard::Location::Standard,
-            modifiers: Modifiers::default(),
-            text: None,
-            repeat: false,
-        });
-
-        // Settle: two empty frames so `OpenReplace`'s focus op applies and the
-        // bar's inputs are in the tree.
-        frame(&mut app, &mut cache, &mut pending, &[], away);
-        frame(&mut app, &mut cache, &mut pending, &[], away);
-
-        // Baseline: CLICK the editor (`away` is deep in the text). The press
-        // focuses the editor natively AND routes through `PointerDown` →
-        // `resync_focus`, which clears the find input. Tab then indents, proving
-        // the editor holds focus.
-        frame(&mut app, &mut cache, &mut pending, std::slice::from_ref(&click), away);
-        frame(&mut app, &mut cache, &mut pending, &[], away); // apply resync
-        let before = app.doc.text().into_owned();
-        frame(&mut app, &mut cache, &mut pending, std::slice::from_ref(&tab), away);
-        assert_ne!(
-            app.doc.text(),
-            before.as_str(),
-            "precondition: after clicking the editor, Tab must indent"
-        );
-        app.apply(Action::Undo);
-
-        // REPRO 1 (editor steals Tab). Click the find field, then Tab. Before
-        // the fix the click focused the field natively but never unfocused the
-        // editor (its press was captured, the Stack stopped dispatching, and the
-        // editor's unfocus never ran), leaving TWO widgets focused; Tab then
-        // reached the still-focused editor and indented. It must NOT.
-        // x=440 is in the find field's text area (row 1), left of the in-box
-        // toggles.
-        let on_find = mouse::Cursor::Available(Point::new(440.0, 26.0));
-        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_find);
-        frame(&mut app, &mut cache, &mut pending, &[], on_find); // apply resync
-        let before = app.doc.text().into_owned();
-        frame(&mut app, &mut cache, &mut pending, from_ref(&tab), on_find);
-        assert_eq!(
-            app.doc.text(),
-            before.as_str(),
-            "the editor kept focus after the field was clicked and stole Tab to indent"
-        );
-
-        // REPRO 2 (field ↔ field). Focus the REPLACE field, then click the FIND
-        // field: focus must move to find, not bounce back to replace. Before the
-        // fix, clicking find left replace stale-focused (its box's Stack was
-        // starved by find's capture), and the resync's batch order re-focused
-        // replace. Verified by which field a typed char lands in.
-        let on_replace = mouse::Cursor::Available(Point::new(440.0, 55.0)); // replace field, row 2
-        let type_z = Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key: Key::Character("Z".into()),
-            modified_key: Key::Character("Z".into()),
-            physical_key: iced::keyboard::key::Physical::Unidentified(
-                iced::keyboard::key::NativeCode::Unidentified,
-            ),
-            location: iced::keyboard::Location::Standard,
-            modifiers: Modifiers::default(),
-            text: Some("Z".into()),
-            repeat: false,
-        });
-        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_replace);
-        frame(&mut app, &mut cache, &mut pending, &[], on_replace); // apply resync
-        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_find);
-        frame(&mut app, &mut cache, &mut pending, &[], on_find); // apply resync
-        let (fq, rt) = (app.find_query.clone(), app.replace_text.clone());
-        frame(&mut app, &mut cache, &mut pending, from_ref(&type_z), on_find);
-        assert_ne!(app.find_query, fq, "a char typed after clicking FIND must land in the find field");
-        assert_eq!(app.replace_text, rt, "…and not in the replace field");
-
-        // The focus rings track the live field focus. A click's landing field is
-        // read back via the async `is_focused` → `Msg::Focused` round-trip, so
-        // settle a few frames before asserting. (Find is focused now.)
-        for _ in 0..3 {
-            frame(&mut app, &mut cache, &mut pending, &[], on_find);
-        }
-        assert!(app.find_focused && !app.replace_focused, "find ring on after clicking find");
-        frame(&mut app, &mut cache, &mut pending, from_ref(&click), on_replace);
-        for _ in 0..3 {
-            frame(&mut app, &mut cache, &mut pending, &[], on_replace);
-        }
-        assert!(app.replace_focused && !app.find_focused, "replace ring follows the click to replace");
-    }
-
-    /// The bar's global chords, and — the load-bearing one — that Tab only moves
-    /// focus when nothing else took the key.
-    ///
-    /// The editor captures Tab to indent (`interpret_key` → `capture_event`), so
-    /// a `Captured` status MUST yield nothing here: otherwise opening the find
-    /// bar would break Tab-to-indent in the editor, which is exactly the kind of
-    /// global-chord collision the app-side chrome has to avoid.
-    #[test]
-    fn tab_cycles_focus_only_when_nothing_else_took_the_key() {
-        use iced::event::Status;
-        use iced::keyboard::{key::Named, Key, Modifiers};
-        const TAB: Key = Key::Named(Named::Tab);
-
-        // A focused editor captured it ⇒ it is an indent, not a focus move.
-        assert_eq!(find_chord(&TAB, Modifiers::default(), Status::Captured), None);
-        assert_eq!(find_chord(&TAB, Modifiers::SHIFT, Status::Captured), None);
-        // Nobody took it (a focused text_input leaves Tab uncaptured) ⇒ cycle.
-        assert_eq!(
-            find_chord(&TAB, Modifiers::default(), Status::Ignored),
-            Some(Msg::CycleFocus { back: false })
-        );
-        assert_eq!(
-            find_chord(&TAB, Modifiers::SHIFT, Status::Ignored),
-            Some(Msg::CycleFocus { back: true })
-        );
-
-        // The rest of the table, so a new arm cannot quietly shadow one.
-        let ign = Status::Ignored;
-        assert_eq!(
-            find_chord(&Key::Character("f".into()), Modifiers::CTRL, ign),
-            Some(Msg::OpenFind)
-        );
-        assert_eq!(
-            find_chord(&Key::Character("h".into()), Modifiers::CTRL, ign),
-            Some(Msg::OpenReplace)
-        );
-        assert_eq!(find_chord(&Key::Named(Named::Escape), Modifiers::default(), ign), Some(Msg::CloseFind));
-        assert_eq!(
-            find_chord(&Key::Named(Named::Enter), Modifiers::ALT, ign),
-            Some(Msg::FindSelectAll)
-        );
-        // Plain Enter is the input's `on_submit` / the editor's newline — never
-        // a global chord.
-        assert_eq!(find_chord(&Key::Named(Named::Enter), Modifiers::default(), ign), None);
-        // An unmodified letter must never be a chord.
-        assert_eq!(find_chord(&Key::Character("f".into()), Modifiers::default(), ign), None);
-    }
-
-    /// Ctrl+H is Ctrl+F with the replace row already out, seeding the query the
-    /// same way (it delegates to `OpenFind`).
-    #[test]
-    fn ctrl_h_opens_find_with_the_replace_row_out() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenReplace);
-        assert!(app.find_open);
-        assert!(app.replace_open);
-    }
-
-    /// A replace press that only navigates commits nothing, so it must not arm
-    /// the re-lint — the post-edit tail runs for edits, not for gestures.
-    #[test]
-    fn a_navigate_only_replace_press_does_not_arm_the_relint() {
-        let mut app = App::default();
-        let _ = app.update(Msg::OpenFind);
-        let _ = app.update(Msg::FindQuery("self".into()));
-        let _ = app.update(Msg::ReplaceText("this".into()));
-        app.relint_dirty = false;
-        let _ = app.update(Msg::ReplaceOne); // navigates only — no commit
-        assert!(!app.relint_dirty, "a navigate-only press must not arm a re-lint");
-        let _ = app.update(Msg::ReplaceOne); // this one edits
-        assert!(app.relint_dirty, "…but a real replace must");
-    }
-
-    /// The demo re-lint must be debounced OFF the keystroke path: a burst of
-    /// keystrokes inside one debounce window triggers ZERO whole-document scans
-    /// (each key is O(1) — it only flips `relint_dirty`), and a single trailing
-    /// tick past the window runs EXACTLY ONE scan, then self-cancels. Guards
-    /// against the whole-document O(N log N) scan running once per keystroke.
+    /// The stub compile loop is debounced OFF the keystroke path: a burst of edits
+    /// arms one re-lint, and only the trailing tick past the window runs the single
+    /// whole-document scan. Proves recompile-on-edit driven by the editor's dirty
+    /// signal coalesces correctly.
     #[test]
     fn relint_debounces_off_the_keystroke_path() {
-        let mut app = App::default();
-        // The seed scan (`App::default`) already ran once — measure the delta.
+        let mut app = App::new();
+        // The seed scan (`App::new`) already ran once — measure the delta.
         let base = RELINT_RUNS.with(std::cell::Cell::get);
 
-        // Anchor the debounce window at a fixed fake "now" on the injected clock;
-        // start clean so only edits below can arm a re-lint.
+        // Anchor the debounce window at a fixed fake "now"; start clean so only the
+        // edits below can arm a re-lint.
         let t0 = 100_000u64;
         app.last_relint_ms = t0;
         app.relint_dirty = false;
 
         // A burst of keystrokes, all inside one debounce window. Each edit only
-        // flips the flag; ticks arriving mid-burst are gated → no scan runs.
+        // arms the flag (via the editor's dirty signal); ticks arriving mid-burst
+        // are gated → no scan runs.
         const N: usize = 25;
         for _ in 0..N {
-            app.apply(Action::Type('x'));
+            let _ = app.update(Message::Editor(Event::Editor(Action::Type('x'))));
             assert!(!app.maybe_relint(t0 + 10), "a tick inside the window must not scan");
         }
         assert_eq!(RELINT_RUNS.with(std::cell::Cell::get) - base, 0, "the burst ran ZERO whole-doc scans");
@@ -2728,17 +604,17 @@ mod tests {
     /// genuinely re-runs the whole-document pass, not merely toggling a flag.
     #[test]
     fn relint_trailing_scan_makes_diagnostics_current() {
-        let mut app = App::default();
+        let mut app = App::new();
         let t0 = 100_000u64;
         app.last_relint_ms = t0;
         app.relint_dirty = false;
 
         // Type a fresh `FIXME` at the end of the buffer (no existing diagnostic
         // there, so the check is independent of the sample's contents).
-        let start = app.doc.buffer().len();
-        app.apply(Action::PlaceCaret(start));
+        let start = app.editor.document().buffer().len();
+        let _ = app.update(Message::Editor(Event::Editor(Action::PlaceCaret(start))));
         for ch in "FIXME".chars() {
-            app.apply(Action::Type(ch));
+            let _ = app.update(Message::Editor(Event::Editor(Action::Type(ch))));
         }
         let typed = start..start + 5;
 
@@ -2746,7 +622,8 @@ mod tests {
         // (diagnostics only ride existing positions via stickiness).
         assert!(!app.maybe_relint(t0 + 10), "still inside the debounce window");
         let flagged_before = app
-            .doc
+            .editor
+            .document()
             .diagnostics_in(typed.clone())
             .any(|(r, sev, _)| r == typed && matches!(sev, Severity::Error));
         assert!(!flagged_before, "the freshly-typed FIXME is not flagged mid-burst");
@@ -2754,125 +631,10 @@ mod tests {
         // The trailing scan brings diagnostics current.
         assert!(app.maybe_relint(t0 + RELINT_DEBOUNCE_MS + 1), "the trailing tick scans");
         let flagged_after = app
-            .doc
+            .editor
+            .document()
             .diagnostics_in(typed.clone())
             .any(|(r, sev, _)| r == typed && matches!(sev, Severity::Error));
         assert!(flagged_after, "after the debounced scan the FIXME is flagged");
-    }
-
-    /// A `Document` carrying the bundled Rust grammar/theme — the parallel
-    /// highlight sweep (`HighlightPool`) needs an engine to exist.
-    fn grammar_doc(source: &str) -> Document {
-        let mut doc = Document::new(source).expect("fits the u32 offset space");
-        doc.set_syntax(
-            SyntaxDef::from_sublime_syntax(include_str!("assets/rust.sublime-syntax"))
-                .expect("bundled Rust grammar parses"),
-            TokenTheme::from_tm_theme(include_str!("assets/scrive-dark.tmTheme"))
-                .expect("bundled theme parses"),
-        );
-        doc
-    }
-
-    /// `HighlightPool::poll` must PACE the verified chain: one frame
-    /// absorbs at most `POLL_VERIFY_BUDGET` segments and performs at most
-    /// `POLL_RERUN_BUDGET` heavy synchronous mis-guess re-runs, then leaves the
-    /// pool `active` (so the `window::frames` subscription re-fires) until the
-    /// whole document verifies over several frames.
-    ///
-    /// Guards against a single `poll` draining every contiguous-ready segment
-    /// (and every ready re-run) in one call: a frame must advance `next_verify`
-    /// by at most the budget and keep `active` true until the whole chain is
-    /// verified, so verification spreads across frames instead of blocking one.
-    #[test]
-    fn poll_verifies_at_most_budget_per_frame() {
-        // 12 one-row segments (> POLL_VERIFY_BUDGET, so it cannot finish in one
-        // frame). Rows 2 and 4 open a Rust string with an unterminated
-        // `"`, so the Fresh-GUESSED segment that follows a string-context end is
-        // a genuine mis-guess — this exercises the re-run budget too.
-        const N: usize = 12;
-        let mut lines = [""; N];
-        lines[2] = "\"";
-        lines[4] = "\"";
-        let source = lines.join("\n");
-        let mut doc = grammar_doc(&source);
-        assert_eq!(doc.buffer().line_count(), N as u32, "one row per segment");
-
-        let mut pool = HighlightPool::new(&doc, 0..N as u32).expect("grammar → engine");
-
-        // Neutralize the worker sweep `new` dispatched so `results` is entirely
-        // under test control: retag the pool to a revision no worker used (their
-        // in-flight `Done`s then mismatch and are dropped on drain, and
-        // `absorb_highlight` no-ops — irrelevant to the pacing this test
-        // asserts), stop the workers, and drain the channel.
-        pool.rev = scrive_core::Revision(u64::MAX);
-        pool.cur_rev.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-        pool.queue.0.lock().unwrap().clear();
-        while pool.done_rx.try_recv().is_ok() {}
-
-        // One ready `Some(SegmentTokens)` per row, each a Fresh guess.
-        pool.snapshot = std::sync::Arc::new(doc.snapshot());
-        pool.seg_rows = (0..N as u32).map(|r| r..r + 1).collect();
-        pool.window = pool.snapshot.line_count()..pool.snapshot.line_count();
-        pool.results = pool
-            .seg_rows
-            .iter()
-            .map(|rows| {
-                Some(scrive_core::tokenize_segment(
-                    &pool.engine,
-                    &pool.snapshot,
-                    rows.clone(),
-                    scrive_core::SegmentStart::Fresh,
-                    None,
-                    None,
-                ))
-            })
-            .collect();
-        pool.next_verify = 0;
-        pool.prev_end = None;
-        pool.active = true;
-
-        // Setup invariants: every seeded segment is a Fresh guess, and an
-        // unterminated `"` really does leave a non-fresh (string-context) end —
-        // so the segment after it is a genuine mis-guess. (If these fail the
-        // grammar changed and the pacing assertions below would test nothing.
-        // `SegmentBoundary` is not `Debug`, so compare with `!=`, not
-        // `assert_ne!`.)
-        assert!(
-            pool.results.iter().all(|s| s.as_ref().unwrap().started_fresh()),
-            "all seeded segments are Fresh guesses",
-        );
-        assert!(
-            pool.results[2].as_ref().unwrap().end_boundary() != &pool.fresh,
-            "an unterminated `\"` leaves the string context open (non-fresh end)",
-        );
-
-        // Drive `poll` to convergence one frame at a time, asserting the
-        // per-frame budgets and the reschedule gate hold on every frame.
-        let mut frames = 0usize;
-        loop {
-            let before = pool.next_verify;
-            let reruns_before = POLL_RERUNS.with(std::cell::Cell::get);
-            pool.poll(&mut doc);
-            let delta = pool.next_verify - before;
-            let reruns = POLL_RERUNS.with(std::cell::Cell::get) - reruns_before;
-            frames += 1;
-
-            assert!(delta <= POLL_VERIFY_BUDGET, "frame absorbed {delta} > verify budget");
-            assert!(reruns <= POLL_RERUN_BUDGET as u64, "frame ran {reruns} > rerun budget");
-            if pool.next_verify < pool.results.len() {
-                assert!(pool.active, "a partial frame stays active so the subscription re-fires");
-                assert!(delta >= 1, "a partial frame must make progress (no live-lock)");
-            }
-            if !pool.active {
-                break;
-            }
-            assert!(frames <= N + 4, "must converge, not spin");
-        }
-
-        // Converged: the whole chain verified, and it took MORE than one frame
-        // — the proof that verification is paced, not drained in a single call.
-        assert_eq!(pool.next_verify, N, "every segment verified");
-        assert!(!pool.active, "active clears only once the document is fully verified");
-        assert!(frames > 1, "verification was paced across frames, not drained in one");
     }
 }

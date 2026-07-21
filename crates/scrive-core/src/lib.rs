@@ -55,7 +55,7 @@ mod sum_tree; // the one augmented balanced tree every position-tracked structur
 pub mod transaction;
 pub mod verbs;
 
-pub use bracket::{Bracket, Brackets};
+pub use bracket::{Bracket, BracketConfig, Brackets};
 pub use buffer::{Buffer, DocId, EolFlavor, LoadError, Revision, Snapshot};
 pub use coords::{Bias, Point};
 pub use decorations::{

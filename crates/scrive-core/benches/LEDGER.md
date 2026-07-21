@@ -282,3 +282,39 @@ benches cannot see the fragmented steady state at all (`iter_batched` hands
 every iteration a pristine rope from `from_str`), so the gain from a shallower
 tree during a *real* editing session is not measured here — only the canary
 speaks to it, and it is the larger of the two effects.
+
+## Brackets — comment/string awareness (`SkipContext`)
+
+Optional comment/string-aware bracket matching (`BracketConfig` + the line-local
+`SkipContext` adapter): brackets inside line comments / strings / char literals
+are no longer matched, coloured, folded, or indent-guided. Opt-in and zero-cost
+off; block comments / multi-line strings deliberately out of scope (non-local
+state would break the O(edit) bound).
+
+`brackets/match_text` vs `brackets/match_text_aware` (1 MB corpus, `//` + `"`):
+
+| | median | vs plain |
+|---|---|---|
+| `match_text` (structural byte scan) | ~3.3 ms | 1.0× |
+| `match_text_aware` (`SkipContext`)  | ~5.2 ms | ~1.6× |
+
+Load stays O(n): a ~1.6× constant — the state machine plus a first-byte-guarded
+line-comment `starts_with` (the guard cut it from ~2.0×). ~160 ms extrapolated to
+a 1.4M-line file, a rounding error next to a full syntect tokenize (~9.8 s) —
+which is the whole reason the scan is a self-contained lexer, not a ride on the
+lazy highlight layer.
+
+**Per-edit** stays O(edit): a keystroke widens to its line (skip-state is
+line-local, so `SkipContext` restarts fresh at the boundary), one line-region
+spliced in O(log n) — the same document-size scaling as the structural path.
+Correctness is the `incremental_matches_scratch_with_comment_awareness` oracle
+(600 random single- and multi-edit commits over comment/string content), deep-
+equal to a scratch `match_text_with` after every commit.
+
+**Residual, honestly:** the config-active path cannot take the >64-edit
+structure-neutral *bulk-shift* fast path — with awareness a non-bracket byte
+(`/`, `"`) can change the bracket set, so that path's core assumption fails.
+Document-scale multi-caret typing WITH a config set is therefore O(carets·log²)
+per commit rather than bulk O(brackets): bounded by caret count (the edit
+dimension), not document size — no doc-scaling regression — but a real constant
+on that one scenario. Not benched here; a `keystroke_aware` cell would pin it.

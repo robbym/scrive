@@ -36,7 +36,9 @@ Two crates, with the dependency pointing one way:
 - **Syntax highlighting** via an incremental, viewport-windowed
   [syntect](https://github.com/trishume/syntect) cache; the app supplies the
   grammar and theme (the core ships neither).
-- **Bracket-pair colorization, matching, and indent guides.**
+- **Bracket-pair colorization, matching, and indent guides** — optionally
+  comment/string-aware, so brackets inside line comments, strings, and char
+  literals are skipped (opt-in per language; line-local).
 - **Code folding** — foldable ranges, gutter chevrons, nested and inline
   (sub-line) collapse, and fold-aware movement.
 - **Find and replace** — literal, whole-word, or regex search (with `$1` capture
@@ -60,22 +62,55 @@ copies of one fact drift apart cannot occur, on the forward path or on undo.
 
 The editor is a direct `iced::advanced::Widget` rather than a `canvas::Program`,
 because only the low-level widget API participates in iced's focus/operation
-protocol. It is a **controlled widget**: it borrows the `Document` immutably for
-drawing and emits semantic actions (`Type`, `Move`, `FindNext`, …); the
-application owns the `Document` and applies the actions, so the widget never
-mutates state behind the app's back.
+protocol. The low-level `Editor` is a **controlled widget**: it borrows the
+`Document` immutably for drawing and emits semantic actions (`Type`, `Move`,
+`Undo`, …); the application owns the `Document` and applies the actions, so the
+widget never mutates state behind the app's back. The `CodeEditor` tier wraps
+that widget, owns the `Document` itself, and runs the plumbing for you.
 
-## Example
+## Quick start
 
-```bash
-cargo run -p scrive-iced --example scratch
+`CodeEditor` owns the document and runs highlighting, find, focus, and language
+intelligence internally — integrating is three wires plus registering the
+bundled font:
+
+```rust
+use iced::{Element, Subscription, Task};
+use scrive_iced::{CodeEditor, Event};
+
+struct App { editor: CodeEditor }
+
+#[derive(Debug, Clone)]
+enum Message { Editor(Event) }
+
+impl App {
+    fn new() -> Self { Self { editor: CodeEditor::new("fn main() {}\n") } }
+    fn update(&mut self, m: Message) -> Task<Message> {
+        match m { Message::Editor(e) => self.editor.update(e).map(Message::Editor) }
+    }
+    fn view(&self) -> Element<'_, Message> { self.editor.view().map(Message::Editor) }
+    fn subscription(&self) -> Subscription<Message> {
+        self.editor.subscription().map(Message::Editor)
+    }
+}
 ```
 
-opens a real editor over a sample Rust document — type, select, find (Ctrl+F),
-fold, and undo/redo. The host application **must** load
-`scrive_iced::CODICON_FONT` at startup
-(`iced::application(..).font(scrive_iced::CODICON_FONT)`) so the fold-gutter
-chevrons and find-bar icons render.
+Attach a grammar with `.language(grammar)` (highlighting is coloured at load, no
+scroll needed) and override defaults with `.theme(..)`, `.find(..)`,
+`.completions(..)`, `.hover(..)`, and `.signature(..)`. For full control, drop to
+the low-level `Editor` widget. The host **must** register the bundled font —
+`iced::application(..).font(scrive_iced::CODICON_FONT)` — so the fold chevrons
+and find-bar icons render.
+
+## Examples
+
+```bash
+cargo run -p scrive-iced --example minimal   # the CodeEditor quick start above
+cargo run -p scrive-iced --example scratch   # the low-level Editor widget, full control
+```
+
+`scratch` opens a real editor over a sample Rust document — type, select, find
+(Ctrl+F), fold, and undo/redo.
 
 ## License
 

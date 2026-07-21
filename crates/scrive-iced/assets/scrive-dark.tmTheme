@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key>
+  <string>Scrive Dark</string>
+  <key>author</key>
+  <string>scrive</string>
+  <key>comment</key>
+  <string>An original dark theme for the scrive example. Maps the standard TextMate scopes the grammar emits. MIT-licensed with the crate; no third-party theme is bundled.</string>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>background</key><string>#1C1E24</string>
+        <key>foreground</key><string>#DFE1E6</string>
+        <key>caret</key><string>#DFE1E6</string>
+        <key>selection</key><string>#34394A</string>
+        <key>lineHighlight</key><string>#24272F</string>
+        <key>invisibles</key><string>#3A3F49</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Comment</string>
+      <key>scope</key><string>comment</string>
+      <key>settings</key><dict><key>foreground</key><string>#6A6F7A</string><key>fontStyle</key><string>italic</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Keyword</string>
+      <key>scope</key><string>keyword, keyword.control, keyword.operator, storage.modifier</string>
+      <key>settings</key><dict><key>foreground</key><string>#EC6A88</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Type</string>
+      <key>scope</key><string>storage.type, support.type, entity.name.type</string>
+      <key>settings</key><dict><key>foreground</key><string>#4FB6C7</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Function</string>
+      <key>scope</key><string>entity.name.function, support.function</string>
+      <key>settings</key><dict><key>foreground</key><string>#E0B658</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>String</string>
+      <key>scope</key><string>string, string.quoted</string>
+      <key>settings</key><dict><key>foreground</key><string>#A3C76D</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Number and constant</string>
+      <key>scope</key><string>constant.numeric, constant.language, constant.character</string>
+      <key>settings</key><dict><key>foreground</key><string>#B08CE0</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Attribute</string>
+      <key>scope</key><string>meta.attribute</string>
+      <key>settings</key><dict><key>foreground</key><string>#C99668</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Punctuation</string>
+      <key>scope</key><string>punctuation</string>
+      <key>settings</key><dict><key>foreground</key><string>#9AA0AB</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>

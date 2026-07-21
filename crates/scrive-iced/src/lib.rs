@@ -6,19 +6,55 @@
 //! iced's focus/operation protocol), with a gutter, N-caret selections, syntect
 //! highlighting, diagnostic squiggles, a completion popup, and hover.
 //!
-//! [`Editor`] renders a [`scrive_core::Document`] and emits [`Action`]s the
-//! application applies to its document. See `examples/scratch.rs` for the
-//! wiring and a runnable window.
+//! # Two tiers
+//!
+//! - [`CodeEditor`] — **start here.** The batteries-included tier: it owns a
+//!   [`scrive_core::Document`] and runs the highlighting, find, focus, and
+//!   language-intelligence plumbing internally, so integrating is three wires
+//!   ([`update`](CodeEditor::update), [`view`](CodeEditor::view),
+//!   [`subscription`](CodeEditor::subscription)) plus registering
+//!   [`required_fonts`] at startup. Highlighting is coloured at load with no
+//!   scroll needed; the find bar, selection, undo, and folding are on by default.
+//!   See `examples/minimal.rs`.
+//! - [`Editor`] — the low-level *controlled* widget: it renders a `Document` and
+//!   emits semantic [`Action`]s the application applies by hand. Full control,
+//!   all the plumbing on you. See `examples/scratch.rs`.
+//!
+//! The minimal integration:
+//!
+//! ```no_run
+//! use iced::{Element, Subscription, Task};
+//! use scrive_iced::{CodeEditor, Event};
+//!
+//! struct App { editor: CodeEditor }
+//!
+//! #[derive(Debug, Clone)]
+//! enum Message { Editor(Event) }
+//!
+//! impl App {
+//!     fn new() -> Self { Self { editor: CodeEditor::new("fn main() {}\n") } }
+//!     fn update(&mut self, m: Message) -> Task<Message> {
+//!         match m { Message::Editor(e) => self.editor.update(e).map(Message::Editor) }
+//!     }
+//!     fn view(&self) -> Element<'_, Message> { self.editor.view().map(Message::Editor) }
+//!     fn subscription(&self) -> Subscription<Message> {
+//!         self.editor.subscription().map(Message::Editor)
+//!     }
+//! }
+//! ```
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod clipboard;
+pub mod code_editor;
 pub mod editor;
 mod geo;
+mod highlight_pool;
 pub mod metrics;
 pub mod popup;
 
+pub use code_editor::{CodeEditor, Event};
 pub use editor::{default_autoscroll_margin, Action, Editor, SCROLLBAR_WIDTH};
 pub use metrics::Metrics;
 
@@ -42,6 +78,21 @@ pub const CODICON: iced::Font = iced::Font::with_name("codicon");
 #[must_use]
 pub fn required_fonts() -> &'static [&'static [u8]] {
     &[CODICON_FONT]
+}
+
+/// The bundled **Scrive Dark** syntax theme — an original, MIT-licensed dark
+/// theme (the one that shipped with 0.1.0). It is the sensible default so a host
+/// gets colored text from a grammar alone, without supplying a `.tmTheme`: the
+/// batteries-included editor tier applies it unless the host overrides it with
+/// another [`TokenTheme`](scrive_core::TokenTheme).
+///
+/// The theme is compiled in, so parsing it cannot fail at runtime — a malformed
+/// asset is a packaging bug the crate's own tests catch, not a caller error.
+/// That is why this returns the theme directly rather than a `Result`.
+#[must_use]
+pub fn scrive_dark_theme() -> scrive_core::TokenTheme {
+    scrive_core::TokenTheme::from_tm_theme(include_str!("../assets/scrive-dark.tmTheme"))
+        .expect("bundled Scrive Dark theme parses")
 }
 
 /// Codicon glyph codepoints scrive draws. Names and values are from the codicon
@@ -76,4 +127,15 @@ pub mod icon {
     /// The codicon set names this glyph `list-selection`; `selection` is an
     /// alias for it, and is what VS Code calls the same button.
     pub const SELECTION: char = '\u{eb85}';
+}
+
+#[cfg(test)]
+mod tests {
+    /// The compiled-in Scrive Dark theme must parse — the `expect` in
+    /// [`super::scrive_dark_theme`] would otherwise panic in every host that
+    /// takes the default. This is the packaging guard the doc comment promises.
+    #[test]
+    fn bundled_scrive_dark_theme_parses() {
+        let _ = super::scrive_dark_theme();
+    }
 }

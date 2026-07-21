@@ -30,7 +30,8 @@ use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_runtime::{task, Action};
 use iced_tiny_skia::graphics::Viewport;
 
-use scratch::{scrive_dark, App, Msg};
+use scratch::{scrive_dark, App, Message};
+use scrive_iced::Event as CeEvent;
 
 const W: u32 = 900;
 const H: u32 = 560;
@@ -41,7 +42,7 @@ enum Step {
     Ev(Event),
     /// An app message, fed straight into `App::update` (the chrome the widget
     /// does not own — find bar open/close, query, navigation).
-    Msg(Msg),
+    Msg(Message),
 }
 
 /// A KeyPressed carrying `text` (what the editor types) and modifiers.
@@ -107,24 +108,24 @@ fn script() -> Vec<(Vec<Step>, u16)> {
     // Find & replace: open the replace bar (Ctrl+H), search a word, step a
     // match, then replace every occurrence at once.
     beat(vec![press(Named::Home, Modifiers::CTRL)], 20);
-    beat(vec![Step::Msg(Msg::OpenReplace)], 34);
+    beat(vec![Step::Msg(Message::Editor(CeEvent::OpenReplace))], 34);
     for q in ["r", "re", "rea", "read", "readi", "readin", "reading"] {
-        beat(vec![Step::Msg(Msg::FindQuery(q.into()))], 11);
+        beat(vec![Step::Msg(Message::Editor(CeEvent::FindQuery(q.into())))], 11);
     }
     beat(vec![], 55);
     // Walk the matches — the active one brightens, the count updates.
-    beat(vec![Step::Msg(Msg::FindNext)], 46);
-    beat(vec![Step::Msg(Msg::FindNext)], 46);
+    beat(vec![Step::Msg(Message::Editor(CeEvent::FindNext))], 46);
+    beat(vec![Step::Msg(Message::Editor(CeEvent::FindNext))], 46);
     beat(vec![], 30);
     // Type the replacement into the second row.
     for r in ["s", "sa", "sam", "samp", "sampl", "sample"] {
-        beat(vec![Step::Msg(Msg::ReplaceText(r.into()))], 12);
+        beat(vec![Step::Msg(Message::Editor(CeEvent::ReplaceText(r.into())))], 12);
     }
     beat(vec![], 55);
     // Replace all — every `reading` becomes `sample` in one step.
-    beat(vec![Step::Msg(Msg::ReplaceAll)], 85);
+    beat(vec![Step::Msg(Message::Editor(CeEvent::ReplaceAll))], 85);
     // Close to a clean view of the replaced text — the payoff — then hold.
-    beat(vec![Step::Msg(Msg::CloseFind)], 18);
+    beat(vec![Step::Msg(Message::Editor(CeEvent::CloseFind))], 18);
     beat(vec![], 120);
     // Undo the replace so the rest of the tour runs on the original text (Undo
     // goes to the editor now the bar has handed focus back).
@@ -160,7 +161,7 @@ fn script() -> Vec<(Vec<Step>, u16)> {
 
 /// Drain a `Task` synchronously: ready message outputs go back into the inbox,
 /// widget operations (focus, scroll) queue for the next UI build.
-fn drain(task: iced::Task<Msg>, inbox: &mut Vec<Msg>, ops: &mut Vec<Box<dyn Operation>>) {
+fn drain(task: iced::Task<Message>, inbox: &mut Vec<Message>, ops: &mut Vec<Box<dyn Operation>>) {
     let Some(mut stream) = task::into_stream(task) else {
         return;
     };
@@ -199,7 +200,7 @@ fn main() {
 
     let mut app = App::default();
     let mut cache = Cache::new();
-    let mut inbox: Vec<Msg> = Vec::new();
+    let mut inbox: Vec<Message> = Vec::new();
     let mut ops: Vec<Box<dyn Operation>> = Vec::new();
 
     // Encode frames as we go: (rgba, delay). Coalesce identical frames.
@@ -221,9 +222,9 @@ fn main() {
         let events = [Event::Window(iced::window::Event::RedrawRequested(
             std::time::Instant::now(),
         ))];
-        let mut ui: UserInterface<'_, Msg, Theme, iced::Renderer> =
+        let mut ui: UserInterface<'_, Message, Theme, iced::Renderer> =
             UserInterface::build(app.view(), logical, cache, &mut renderer);
-        let mut published: Vec<Msg> = Vec::new();
+        let mut published: Vec<Message> = Vec::new();
         let _ = ui.update(&events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
         cache = ui.into_cache();
         inbox.extend(published);
@@ -253,12 +254,12 @@ fn main() {
         }
 
         // Build → apply queued widget ops → dispatch events → draw.
-        let mut ui: UserInterface<'_, Msg, Theme, iced::Renderer> =
+        let mut ui: UserInterface<'_, Message, Theme, iced::Renderer> =
             UserInterface::build(app.view(), logical, cache, &mut renderer);
         for mut op in ops.drain(..) {
             ui.operate(&renderer, op.as_mut());
         }
-        let mut published: Vec<Msg> = Vec::new();
+        let mut published: Vec<Message> = Vec::new();
         let _ = ui.update(&events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
         ui.draw(&mut renderer, &theme, &renderer::Style::default(), cursor);
         cache = ui.into_cache();

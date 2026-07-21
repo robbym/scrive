@@ -132,7 +132,10 @@ fn span_from(style: Style, range: Range<usize>) -> HighlightSpan {
     }
 }
 
-/// A parsed highlight theme — opaque over syntect's `Theme`.
+/// A parsed highlight theme — opaque over syntect's `Theme`. `Clone` is cheap
+/// (a syntect `Theme` is a small style table), so an integrating widget can
+/// retain a theme and re-apply it across a document reload or grammar swap.
+#[derive(Clone)]
 pub struct TokenTheme(Theme);
 
 impl TokenTheme {

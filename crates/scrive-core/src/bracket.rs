@@ -4,11 +4,16 @@
 //! each bracket's nesting depth and matched-partner offset and flagging the
 //! unmatched.
 //!
-//! Matches **all** brackets regardless of string or comment context: this is a
-//! purely structural scan with no lexer state, so a `)` inside a string still
-//! counts as a bracket. Excluding string/comment brackets would need a scope
-//! class threaded through from the highlight layer, which carries only a
-//! resolved color, not lexical context.
+//! By default a purely structural scan — every `()[]{}` counts, even inside a
+//! string or comment. An optional [`BracketConfig`] makes it comment/string
+//! *aware*: a lightweight, line-local `SkipContext` lexer (NOT the highlight
+//! layer — that carries only resolved colors, no lexical scope, and runs lazily
+//! while brackets are eager and whole-document) excludes brackets inside line
+//! comments, strings, and char literals, so they are not colored, matched,
+//! folded, or indent-guided. It is opt-in and zero-cost when off. Block comments
+//! and multi-line strings are deliberately out of scope: their lexer state is
+//! non-local, which would make an edit's cost scale with the document — the whole
+//! reason the scan stays line-local and restartable at every line boundary.
 //!
 //! [`Brackets`] is a thin façade over one `SumTree<BracketItem>` (see
 //! `bracket_tree`) that stores only PRIMARY facts — each bracket's char and
@@ -46,6 +51,130 @@ pub(crate) fn is_bracket_byte(c: u8) -> bool {
     matches!(c, b'(' | b')' | b'[' | b']' | b'{' | b'}')
 }
 
+/// Language config for comment/string-aware bracket matching: which delimiters
+/// open a line comment / string / char literal, so brackets inside them are not
+/// counted. **All constructs are line-local** — the state resets at every `\n`,
+/// so block comments and multi-line strings are deliberately *not* handled (that
+/// would make an edit's cost scale with the document; see the module doc). The
+/// `Default` (empty) config is *no awareness* — every bracket counts, the
+/// original purely-structural behavior, at zero added cost.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BracketConfig {
+    /// Line-comment markers (e.g. `"//"`, `"#"`). From a marker to end of line is
+    /// a comment.
+    pub line_comments: Vec<String>,
+    /// String delimiters (e.g. `b'"'`). A delimiter opens a string until the same
+    /// delimiter or end of line; `\` escapes the next byte.
+    pub string_delims: Vec<u8>,
+    /// Char-literal delimiter (e.g. `b'\''`), if any. Off by default: in some
+    /// languages `'` is ambiguous (Rust lifetimes), so it is opt-in per language.
+    pub char_delim: Option<u8>,
+}
+
+impl BracketConfig {
+    /// Whether any awareness is configured. When `false`, the bracket scan takes
+    /// the original zero-overhead structural path.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.line_comments.is_empty() || !self.string_delims.is_empty() || self.char_delim.is_some()
+    }
+}
+
+/// The lexer state of the [`SkipContext`] adapter — a small unified machine, not a
+/// chain of per-construct passes, because comment/string precedence is positional
+/// (whichever delimiter opens first at a byte wins).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    Code,
+    LineComment,
+    /// Inside a string opened by this delimiter byte.
+    Str(u8),
+    /// Inside a char literal opened by this delimiter byte.
+    Char(u8),
+}
+
+/// Annotates a byte stream with "is this byte inside a comment / string / char
+/// literal" — the one owner of skip context, so the bracket matcher shrinks to
+/// `if !skip && is_bracket_byte(b)`. Yields `(offset, byte, skip)`.
+///
+/// **Line-local:** the state resets to `Code` at every `\n`, so the adapter is
+/// restartable at any line boundary with a fresh state — the property that keeps
+/// incremental re-matching O(edit) rather than O(document).
+pub(crate) struct SkipContext<'a> {
+    bytes: &'a [u8],
+    i: usize,
+    cfg: &'a BracketConfig,
+    state: Skip,
+    /// The previous string/char byte was an unescaped `\`.
+    escaped: bool,
+}
+
+impl<'a> SkipContext<'a> {
+    pub(crate) fn new(bytes: &'a [u8], cfg: &'a BracketConfig) -> Self {
+        Self { bytes, i: 0, cfg, state: Skip::Code, escaped: false }
+    }
+
+    /// Advance one byte, updating the state, and return whether *this* byte is in
+    /// a skip context (a bracket here must be ignored).
+    fn step(&mut self, b: u8) -> bool {
+        // A newline ends every line-local construct.
+        if b == b'\n' {
+            let was_skip = self.state != Skip::Code;
+            self.state = Skip::Code;
+            self.escaped = false;
+            return was_skip; // `\n` is never a bracket; the value is moot
+        }
+        match self.state {
+            Skip::LineComment => true,
+            Skip::Str(delim) | Skip::Char(delim) => {
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == delim {
+                    self.state = Skip::Code;
+                }
+                true
+            }
+            Skip::Code => {
+                // Guard the (multi-byte) `starts_with` on a first-byte match, so a
+                // non-comment byte pays only one comparison per marker, not a slice
+                // scan — most bytes are not a comment opener.
+                let opens_comment = self.cfg.line_comments.iter().any(|m| {
+                    let mb = m.as_bytes();
+                    mb.first() == Some(&b) && self.bytes[self.i..].starts_with(mb)
+                });
+                if opens_comment {
+                    self.state = Skip::LineComment;
+                    return true;
+                }
+                if self.cfg.string_delims.contains(&b) {
+                    self.state = Skip::Str(b);
+                    return true;
+                }
+                if Some(b) == self.cfg.char_delim {
+                    self.state = Skip::Char(b);
+                    return true;
+                }
+                false
+            }
+        }
+    }
+}
+
+impl Iterator for SkipContext<'_> {
+    /// `(byte offset, byte, is-in-skip-context)`.
+    type Item = (u32, u8, bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let b = *self.bytes.get(self.i)?;
+        let off = self.i as u32;
+        let skip = self.step(b);
+        self.i += 1;
+        Some((off, b, skip))
+    }
+}
+
 /// One bracket occurrence in the document — fully derived on demand (nothing here
 /// is stored; the tree holds only the char and position).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -80,6 +209,17 @@ impl Brackets {
     #[must_use]
     pub fn match_text(text: &str) -> Self {
         Self { tree: bracket_tree::tree_from_text(text) }
+    }
+
+    /// [`Self::match_text`], but skipping brackets inside comments / strings / char
+    /// literals per `cfg`. An inactive (`Default`) config takes the exact
+    /// zero-overhead structural path — the two are byte-identical then.
+    #[must_use]
+    pub fn match_text_with(text: &str, cfg: &BracketConfig) -> Self {
+        if !cfg.is_active() {
+            return Self::match_text(text);
+        }
+        Self { tree: bracket_tree::tree_from_text_with(text, cfg) }
     }
 
     /// All brackets, in document order — the O(n) cold path (fold-source scans, the
@@ -194,8 +334,8 @@ impl Brackets {
     /// (the rest are relative and do not move). No cross-boundary partner pointer
     /// is stored, so none can be left stale by the splice; the
     /// incremental≡`match_text` oracle enforces the equivalence.
-    pub fn apply_edit(&mut self, patch: &Patch, buffer: &Buffer) -> Range<u32> {
-        let (tree, region) = bracket_tree::apply_edit(&self.tree, patch, buffer);
+    pub fn apply_edit(&mut self, patch: &Patch, buffer: &Buffer, cfg: &BracketConfig) -> Range<u32> {
+        let (tree, region) = bracket_tree::apply_edit(&self.tree, patch, buffer, cfg);
         self.tree = tree;
         region
     }
@@ -209,6 +349,68 @@ mod tests {
 
     fn bat(b: &Brackets, o: u32) -> Bracket {
         b.at(o).expect("a bracket at that offset")
+    }
+
+    /// Offsets of the surviving (counted) brackets, in order.
+    fn offs(b: &Brackets) -> Vec<u32> {
+        b.all().iter().map(|x| x.offset).collect()
+    }
+
+    fn cfg() -> BracketConfig {
+        BracketConfig {
+            line_comments: vec!["//".into()],
+            string_delims: vec![b'"'],
+            char_delim: None,
+        }
+    }
+
+    #[test]
+    fn inactive_config_is_identical_to_plain_match() {
+        let text = "(a)//(b)\n\"(\"[]";
+        assert_eq!(
+            Brackets::match_text_with(text, &BracketConfig::default()).all(),
+            Brackets::match_text(text).all(),
+        );
+    }
+
+    #[test]
+    fn skips_brackets_in_line_comments_and_resets_at_newline() {
+        // ( 0  ) 2   // at 4,5   ( 7  ) 9   \n 10   ( 11  ) 13
+        let b = Brackets::match_text_with("(a) // (b)\n(c)", &cfg());
+        assert_eq!(offs(&b), vec![0, 2, 11, 13], "the comment's ( ) at 7,9 are skipped");
+    }
+
+    #[test]
+    fn skips_brackets_in_strings() {
+        // " 0  ( 1  " 2  ( 3   → the ( at 1 is inside the string; the ( at 3 is code
+        let b = Brackets::match_text_with("\"(\"(", &cfg());
+        assert_eq!(offs(&b), vec![3]);
+    }
+
+    #[test]
+    fn precedence_is_positional_not_a_fixed_layer_order() {
+        // `"//"()` — the // is INSIDE the string, so it is not a comment; the ()
+        // after the string is code and counts. A chain of comment-then-string
+        // adapters would wrongly flag the whole line as a comment here.
+        let b = Brackets::match_text_with("\"//\"()", &cfg());
+        assert_eq!(offs(&b), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_backslash_escapes_the_closing_quote() {
+        // "\")"(  — the escaped quote does not close, so ) stays in the string;
+        // the trailing ( is code.  " 0  \ 1  " 2  ) 3  " 4  ( 5
+        let b = Brackets::match_text_with("\"\\\")\"(", &cfg());
+        assert_eq!(offs(&b), vec![5]);
+    }
+
+    #[test]
+    fn char_delim_is_opt_in() {
+        let c = BracketConfig { char_delim: Some(b'\''), ..Default::default() };
+        // '(') — the ( is in a char literal (skipped); the trailing ) is code
+        assert_eq!(offs(&Brackets::match_text_with("'(')", &c)), vec![3]);
+        // Without char_delim, the ( counts (default: ' is not special).
+        assert_eq!(offs(&Brackets::match_text_with("'(')", &BracketConfig::default())), vec![1, 3]);
     }
 
     #[test]
@@ -332,7 +534,7 @@ mod tests {
     /// `apply_edit` — the exact call shape `rebase_views` will use.
     fn edit(b: &mut Brackets, buf: &mut Buffer, ops: Vec<EditOp>) -> Range<u32> {
         let committed = apply(buf, ops).expect("test edits are disjoint and in-bounds");
-        b.apply_edit(committed.patch(), buf)
+        b.apply_edit(committed.patch(), buf, &BracketConfig::default())
     }
 
     /// Oracle test: ~500 seeded-random edits (biased toward bracket chars,
@@ -395,9 +597,82 @@ mod tests {
                 offs.into_iter().map(|o| EditOp::insert(o, "z")).collect()
             };
             let committed = apply(&mut buf, ops.clone()).expect("generated ops are disjoint");
-            b.apply_edit(committed.patch(), &buf);
+            b.apply_edit(committed.patch(), &buf, &BracketConfig::default());
             let ctx = format!("edit {i} (seed {seed:#x}): {ops:?}");
             assert_oracle(&b, &buf, &ctx);
+        }
+    }
+
+    /// Oracle test for the comment/string-AWARE incremental path: the same random
+    /// edit stress, but with an active config and a byte pool that toggles
+    /// comment/string state (`/`, `"`, `\`, newlines). After every commit — single
+    /// edits, replacements, and scattered/same-line MULTI-edit patches (the
+    /// line-aligned region merge) — the incremental `apply_edit` must deep-equal a
+    /// from-scratch `match_text_with`. This is the correctness proof for the
+    /// line-aligned splice.
+    #[test]
+    fn incremental_matches_scratch_with_comment_awareness() {
+        let cfg = BracketConfig {
+            line_comments: vec!["//".into()],
+            string_delims: vec![b'"'],
+            char_delim: None,
+        };
+        let seed: u64 = 0xC0FF_EE00_2026_1234;
+        let mut s = seed;
+        let mut rng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut buf = Buffer::new("fn f() { // (a)\n    let s = \"([{\";\n    g([1]);\n}\n")
+            .expect("fixture loads");
+        let mut b = Brackets::match_text_with(&buf.text(), &cfg);
+        // Biased toward bracket chars, comment/string delimiters, escapes, newlines.
+        const POOL: &[u8] = b"(){}[]//\"\"\\\n ab";
+        for i in 0..600 {
+            let len = buf.len();
+            let kind = rng() % 12;
+            let ops = if kind < 5 {
+                let at = (rng() % (u64::from(len) + 1)) as u32;
+                let n = 1 + (rng() % 4) as usize;
+                let text: String =
+                    (0..n).map(|_| POOL[(rng() % POOL.len() as u64) as usize] as char).collect();
+                vec![EditOp::insert(at, text)]
+            } else if kind < 7 {
+                let a = (rng() % (u64::from(len) + 1)) as u32;
+                let e = (a + 1 + (rng() % 10) as u32).min(len);
+                vec![EditOp::delete(a..e)]
+            } else if kind < 9 {
+                let a = (rng() % (u64::from(len) + 1)) as u32;
+                let e = (a + (rng() % 6) as u32).min(len);
+                let n = 1 + (rng() % 5) as usize;
+                let text: String =
+                    (0..n).map(|_| POOL[(rng() % POOL.len() as u64) as usize] as char).collect();
+                vec![EditOp::new(a..e, text)]
+            } else {
+                // Scattered/same-line multi-caret inserts — exercises the
+                // line-aligned region merge across a multi-edit patch.
+                let n = 2 + (rng() % 3) as usize;
+                let mut offs: Vec<u32> =
+                    (0..n).map(|_| (rng() % (u64::from(len) + 1)) as u32).collect();
+                offs.sort_unstable();
+                offs.dedup();
+                offs.into_iter()
+                    .map(|o| {
+                        let byte = POOL[(rng() % POOL.len() as u64) as usize];
+                        EditOp::insert(o, (byte as char).to_string())
+                    })
+                    .collect()
+            };
+            let committed = apply(&mut buf, ops.clone()).expect("generated ops are disjoint");
+            b.apply_edit(committed.patch(), &buf, &cfg);
+            let oracle = Brackets::match_text_with(&buf.text(), &cfg);
+            assert_eq!(
+                b.all(),
+                oracle.all(),
+                "aware brackets diverged from a scratch rebuild at edit {i} (seed {seed:#x}): {ops:?}",
+            );
         }
     }
 
@@ -575,7 +850,7 @@ mod tests {
         let mut buf = Buffer::new("").expect("empty loads");
         let mut b = Brackets::match_text(&buf.text());
         // An empty patch is a no-op with an empty reconcile window.
-        assert_eq!(b.apply_edit(&Patch::new(), &buf), 0..0);
+        assert_eq!(b.apply_edit(&Patch::new(), &buf, &BracketConfig::default()), 0..0);
         edit(&mut b, &mut buf, vec![EditOp::insert(0, "({\n[")]);
         assert_oracle(&b, &buf, "first insert into an empty document");
         let len = buf.len();

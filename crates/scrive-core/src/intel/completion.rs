@@ -125,6 +125,17 @@ impl CompletionController {
         }
     }
 
+    /// Ingest an externally-produced item list — an off-thread or
+    /// language-server completion result — as if a provider had returned it:
+    /// open and filter against the live `word` (with `anchor` the word start),
+    /// or close if nothing matches. The controller stays document-agnostic; the
+    /// caller is responsible for staleness (only call with results computed at
+    /// the current revision, refiltered here against the *current* word so a
+    /// result that arrives after the user typed more still filters correctly).
+    pub fn set_items(&mut self, items: Vec<CompletionItem>, word: &str, anchor: u32) {
+        self.set_from_items(items, word, anchor);
+    }
+
     /// Open from a fresh item list, or close if empty (either the provider
     /// returned nothing or nothing prefix-matches the live word).
     fn set_from_items(&mut self, items: Vec<CompletionItem>, word: &str, anchor: u32) {
