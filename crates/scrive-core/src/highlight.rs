@@ -1094,9 +1094,7 @@ impl HighlightCache {
     /// next `tokenize_until`.
     pub fn set_theme(&mut self, theme: TokenTheme) {
         self.theme = Arc::new(theme);
-        for s in &mut self.ret.win_states {
-            *s = None;
-        }
+        self.ret.win_states.fill(None);
         self.ret.checkpoints.clear();
         self.ret.invalid = DirtyRanges::all(self.ret.n_lines);
     }
