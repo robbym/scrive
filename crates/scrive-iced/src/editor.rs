@@ -3378,7 +3378,6 @@ fn expand_tabs(line: &str) -> String {
     out
 }
 
-/// Map a key event to an [`Action`], or `None` if it isn't an editor input.
 /// The glyph a numpad *character* key carries in `text`, or `None` for a
 /// non-numpad key, a numpad key with no text (NumLock off), or control text
 /// (NumpadEnter → `\r`, left for the `Named::Enter` path). Works around the
@@ -3414,9 +3413,23 @@ fn numpad_text(physical: &iced::keyboard::key::Physical, text: Option<&str>) -> 
     (!ch.is_control()).then_some(ch)
 }
 
+/// Whether an Alt (⌥ Option) chord is text input on this platform. On macOS
+/// Option composes real characters (`ƒ`, `é`), so it must type. Elsewhere Alt+key
+/// is a shortcut, yet Windows still hands over its character as `text`
+/// (WM_SYSCHAR) — typing it would insert "F" under a host's Shift+Alt+F. Chromium
+/// agrees: off macOS it flags every Alt-held key a "system key" whose character
+/// never reaches the page. AltGr is unaffected, since winit reports it with
+/// neither Ctrl nor Alt set on Windows, and as xkb level3 (Mod5), not Alt
+/// (Mod1), on Linux.
+const ALT_TYPES: bool = cfg!(target_os = "macos");
+
+/// Map a key event to an [`Action`], or `None` if it isn't an editor input.
 fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Action> {
     let extend = mods.shift();
     let mv = |motion| Some(Action::Move { motion, extend });
+    // Off macOS an Alt chord with no arm of its own is a shortcut for the host,
+    // never text (see `ALT_TYPES`).
+    let alt_chord = mods.alt() && !ALT_TYPES;
     // Column (box) selection needs all three of Ctrl+Shift+Alt — checked before
     // the Ctrl+Arrow word-motions below, which Ctrl+Shift+Alt+Left would else
     // match on `control()` alone.
@@ -3484,7 +3497,7 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
         Key::Named(Named::Enter) => None,
         Key::Named(Named::Tab) if mods.shift() => Some(Action::Outdent),
         Key::Named(Named::Tab) => Some(Action::Tab),
-        Key::Named(Named::Space) => Some(Action::Type(' ')),
+        Key::Named(Named::Space) if !alt_chord => Some(Action::Type(' ')),
         Key::Named(Named::Escape) => Some(Action::Collapse),
         // F8 / Shift+F8 jump to the next/previous diagnostic.
         Key::Named(Named::F8) => Some(Action::NextDiagnostic { forward: !mods.shift() }),
@@ -3527,7 +3540,7 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
             Some(Action::Redo)
         }
         _ => {
-            if (mods.control() && !mods.alt()) || mods.command() {
+            if (mods.control() && !mods.alt()) || mods.command() || alt_chord {
                 return None;
             }
             let ch = text?.chars().next()?;
@@ -4008,6 +4021,48 @@ mod tests {
         assert_eq!(
             interpret_key(&Key::Named(Named::ArrowLeft), None, Modifiers::CTRL),
             Some(Action::Move { motion: Motion::WordLeft, extend: false })
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn unbound_alt_chord_types_nothing_off_macos() {
+        // Off macOS an Alt chord is a shortcut: Windows still hands its letter
+        // over as `text` (WM_SYSCHAR), so Shift+Alt+F — a host's Format Document —
+        // must not also type "F". Alt+Space likewise types no space.
+        let alt = Modifiers::ALT;
+        assert_eq!(interpret_key(&Key::Character("F".into()), Some("F"), alt | Modifiers::SHIFT), None);
+        assert_eq!(interpret_key(&Key::Character("f".into()), Some("f"), alt), None);
+        assert_eq!(interpret_key(&Key::Character("1".into()), Some("1"), alt), None);
+        assert_eq!(interpret_key(&Key::Named(Named::Space), Some(" "), alt), None);
+        // The bound Alt arms are untouched.
+        assert_eq!(
+            interpret_key(&Key::Named(Named::ArrowRight), None, alt | Modifiers::SHIFT),
+            Some(Action::ExpandSelection)
+        );
+        assert_eq!(interpret_key(&Key::Named(Named::Enter), None, alt), None);
+    }
+
+    #[test]
+    fn altgr_still_types() {
+        // winit reports a real AltGr press with *neither* Ctrl nor Alt set — on
+        // Windows it filters both out for an AltGr layout, and xkb carries
+        // AltGr as level3 (Mod5), not Alt (Mod1) — so it is plain typing on
+        // every platform. (German AltGr+Q → "@", AltGr+7 → "{".)
+        let none = Modifiers::empty();
+        assert_eq!(interpret_key(&Key::Character("@".into()), Some("@"), none), Some(Action::Type('@')));
+        assert_eq!(interpret_key(&Key::Character("{".into()), Some("{"), none), Some(Action::Type('{')));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn option_chord_types_its_character_on_macos() {
+        // Option composes real characters on macOS — it is input, not a chord.
+        let opt = Modifiers::ALT;
+        assert_eq!(interpret_key(&Key::Character("ƒ".into()), Some("ƒ"), opt), Some(Action::Type('ƒ')));
+        assert_eq!(
+            interpret_key(&Key::Character("Ï".into()), Some("Ï"), opt | Modifiers::SHIFT),
+            Some(Action::Type('Ï'))
         );
     }
 
