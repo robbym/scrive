@@ -10,7 +10,10 @@
 //! bytes at `s`; a position inside the overwritten prefix keeps its absolute
 //! offset, only the deleted tail *beyond* the insert clamps, and a pure
 //! deletion collapses its interior to `s`. Bias matters at exactly one place —
-//! a position sitting on the insertion point.
+//! a position sitting on the insertion point. Touching edits can stack several
+//! insertions on one point (a formatter's `TextEdit` list, a snippet
+//! expansion); bias then treats the stack as one insertion — `Right` lands
+//! after all of it, `Left` before it.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -81,6 +84,12 @@ impl Patch {
     ///
     /// `bias` only matters when `offset` sits exactly on an insertion point:
     /// `Left` keeps it before the inserted text, `Right` moves it after.
+    ///
+    /// Several edits may share that point (touching is allowed): one replace
+    /// ending at it, any number of pure inserts at it, one replace starting at
+    /// it. `Right` moves past **all** of their text; `Left` stays before
+    /// everything inserted *at* the point — though after a replace that *ends*
+    /// there, since the point is that replace's trailing boundary.
     #[must_use]
     pub fn map_offset(&self, offset: u32, bias: Bias) -> u32 {
         // Complexity gate: this single-offset map scans the edit list, so calling
@@ -91,20 +100,26 @@ impl Patch {
         crate::perf::charge(self.0.len() as u64);
         let p = offset as i64;
         let mut shift: i64 = 0;
-        for e in &self.0 {
+        for (i, e) in self.0.iter().enumerate() {
             let s = e.old.start as i64;
             let end = e.old.end as i64;
-            let l = (e.new.end - e.new.start) as i64;
             if p < s {
                 // In the gap before this edit — only prior deltas apply.
                 return (p + shift) as u32;
             }
             if p <= end {
+                // `e` is the FIRST edit at `p` — the one `Left` maps through.
+                // `Right` maps through the LAST (see `last_at_point`); the edits
+                // between them sit at `p` too, so their deltas join the shift.
+                let k = if bias == Bias::Right { last_at_point(&self.0, i, p) } else { i };
+                shift += self.0[i..k].iter().map(net_delta).sum::<i64>();
+                let e = &self.0[k];
+                let s = i64::from(e.old.start);
                 let sn = s + shift; // == e.new.start
-                return map_within(p, s, end, sn, l, bias) as u32;
+                return map_within(p, s, i64::from(e.old.end), sn, inserted_len(e), bias) as u32;
             }
             // This edit is fully before `p`; accumulate its delta and continue.
-            shift += l - (end - s);
+            shift += net_delta(e);
         }
         (p + shift) as u32
     }
@@ -157,6 +172,9 @@ impl Patch {
         // are ascending, so a `partition_point` on old.end locates the first
         // edit with `old.end >= p` (map_offset's "first `p <= end`") and
         // `pref[k]` is the shift from all strictly-earlier edits (all `end < p`).
+        // `Right` then moves `k` on to the last edit at `p` exactly as the scan
+        // does (the same `last_at_point`), and `pref` at the moved index already
+        // holds the skipped edits' deltas.
         // The prefix table is a thread-local reused across every `map_many` call —
         // and every mover (selections, decorations, folds, offset sets) flows
         // through here per edit — so the batch mapper allocates nothing.
@@ -168,31 +186,53 @@ impl Patch {
             pref.clear();
             pref.push(0);
             for e in edits {
-                let delta =
-                    i64::from(e.new.end - e.new.start) - i64::from(e.old.end - e.old.start);
-                pref.push(pref[pref.len() - 1] + delta);
+                pref.push(pref[pref.len() - 1] + net_delta(e));
             }
             for &(offset, bias) in queries {
                 let p = i64::from(offset);
-                let k = edits.partition_point(|e| i64::from(e.old.end) < p);
-                let mapped = if k == edits.len() {
-                    p + pref[k]
+                let first = edits.partition_point(|e| i64::from(e.old.end) < p);
+                let mapped = if first == edits.len() || p < i64::from(edits[first].old.start) {
+                    // Past every edit, or in the gap before edit `first` — only
+                    // prior deltas apply.
+                    p + pref[first]
                 } else {
+                    let k = if bias == Bias::Right { last_at_point(edits, first, p) } else { first };
                     let e = &edits[k];
                     let s = i64::from(e.old.start);
-                    let shift = pref[k];
-                    if p < s {
-                        p + shift // in the gap before edit k — only prior deltas apply
-                    } else {
-                        let end = i64::from(e.old.end);
-                        let l = i64::from(e.new.end - e.new.start);
-                        map_within(p, s, end, s + shift, l, bias)
-                    }
+                    map_within(p, s, i64::from(e.old.end), s + pref[k], inserted_len(e), bias)
                 };
                 out.push(mapped as u32);
             }
         });
     }
+}
+
+/// An edit's net length change (inserted minus deleted bytes).
+fn net_delta(e: &Edit) -> i64 {
+    inserted_len(e) - i64::from(e.old.end - e.old.start)
+}
+
+/// An edit's inserted length (its post-edit span).
+fn inserted_len(e: &Edit) -> i64 {
+    i64::from(e.new.end - e.new.start)
+}
+
+/// The LAST edit sitting at point `p`, given `first` — the first edit with
+/// `old.end >= p`, which must also have `old.start <= p` (`p` is in or on it).
+///
+/// Ascending-disjoint-with-touching admits exactly one shape of edits sharing a
+/// point, contiguous and in this order: at most one replace *ending* at `p`, any
+/// number of pure inserts *at* `p`, at most one replace *starting* at `p`. They
+/// are `edits[first..=last]`, where `last` is the final edit with
+/// `old.start <= p` — old starts are non-decreasing, so a partition point finds
+/// it in O(log edits). When `p` is strictly inside `first`, nothing later can
+/// start at or before `p`, so `last == first` and interior mapping is unchanged.
+///
+/// `Bias::Right` maps through `last` (after ALL text at `p`); `Left` through
+/// `first`. Both mappers share this one choice, so they cannot drift apart.
+fn last_at_point(edits: &[Edit], first: usize, p: i64) -> usize {
+    debug_assert!(i64::from(edits[first].old.start) <= p && p <= i64::from(edits[first].old.end));
+    first + edits[first..].partition_point(|e| i64::from(e.old.start) <= p) - 1
 }
 
 /// The per-edit transit table for a position `p` known to lie in `[s, end]`.
@@ -291,6 +331,46 @@ mod tests {
         assert_eq!(p.map_offset(7, Left), 8); // after both: +2 -1 = +1
     }
 
+    /// Both mappers, asserted to agree, for one query — so every pinned
+    /// boundary case below checks `map_many` as well as `map_offset`.
+    fn mapped(p: &Patch, offset: u32, bias: Bias) -> u32 {
+        let single = p.map_offset(offset, bias);
+        let mut batch = Vec::new();
+        p.map_many(&[(offset, bias)], &mut batch);
+        assert_eq!(batch, vec![single], "map_many diverged from map_offset at {offset} {bias:?}");
+        single
+    }
+
+    #[test]
+    fn right_bias_passes_a_touching_replace_and_the_insert_after_it() {
+        // Regression (fails-first): "abcd" with [replace(1..2, "X"), insert(2,
+        // "Y")] → "aXYcd". A Right-biased caret at 2 (between `b` and `c`) must
+        // land after ALL text at 2 — offset 3, between `Y` and `c` — not stop
+        // after the touching replace's `X` (offset 2, splitting X|Y).
+        let mut p = Patch::new();
+        p.push(edit(1, 2, 1, 2)); // "b" → "X"
+        p.push(edit(2, 2, 2, 3)); // insert "Y" at 2, touching the replace's end
+        assert_eq!(mapped(&p, 2, Right), 3, "Right passes X and Y");
+        // Left keeps before the text inserted AT 2; the replace's end is its
+        // trailing boundary (continuous with its post-edit shift), so after X.
+        assert_eq!(mapped(&p, 2, Left), 2, "Left stays before Y");
+    }
+
+    #[test]
+    fn right_bias_passes_every_same_offset_insert() {
+        // Regression (fails-first): two pure inserts at 2 ("Y" then "Z", the
+        // stable-sorted transaction order). Right must pass both (4), not stop
+        // between them (3); Left stays before both (2).
+        let mut p = Patch::new();
+        p.push(edit(2, 2, 2, 3));
+        p.push(edit(2, 2, 3, 4));
+        assert_eq!(mapped(&p, 2, Right), 4, "Right passes both inserts");
+        assert_eq!(mapped(&p, 2, Left), 2, "Left stays before both inserts");
+        // The neighbours are untouched by the fix: plain shift on either side.
+        assert_eq!(mapped(&p, 1, Right), 1);
+        assert_eq!(mapped(&p, 3, Left), 5);
+    }
+
     #[test]
     fn map_range_never_inverts() {
         // Delete a range that fully contains a tracked range → it collapses,
@@ -318,19 +398,139 @@ mod tests {
         p
     }
 
-    #[test]
-    fn map_many_matches_map_offset_oracle() {
-        // Deterministic LCG — no rand dep, reproducible.
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = |n: u32| {
+    /// Deterministic LCG — no rand dep, reproducible. `next(n)` draws from `0..n`.
+    fn lcg(seed: u64) -> impl FnMut(u32) -> u32 {
+        let mut state = seed;
+        move |n| {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((state >> 33) as u32) % n
+        }
+    }
+
+    /// A script dense in the points several edits SHARE — the shapes a uniform
+    /// draw rarely stacks: a zero gap half the time (the next edit touches the
+    /// previous one's end) and a pure insert half the time (so a run of zero-gap
+    /// inserts is several edits at ONE offset, optionally capped by a replace
+    /// starting there). 0..=5 edits; the extent stays under 40 bytes.
+    fn shared_point_script(next: &mut impl FnMut(u32) -> u32) -> Vec<(u32, u32, u32)> {
+        (0..next(6))
+            .map(|_| {
+                let gap = if next(2) == 0 { 0 } else { 1 + next(4) };
+                let old_len = if next(2) == 0 { 0 } else { 1 + next(3) };
+                (gap, old_len, next(4))
+            })
+            .collect()
+    }
+
+    /// Whether old offset `p` is a point two edits share, as `(touching,
+    /// same_offset)`: `touching` — a replace ENDS at `p` and another edit starts
+    /// there; `same_offset` — two or more edits START at `p`.
+    fn shared_point_kind(patch: &Patch, p: u32) -> (bool, bool) {
+        let starts = patch.edits().iter().filter(|e| e.old.start == p).count();
+        let ends_here = patch.edits().iter().any(|e| e.old.start < p && e.old.end == p);
+        (ends_here && starts > 0, starts > 1)
+    }
+
+    /// Where a zero-width marker at old offset `p` REALLY lands — an oracle
+    /// independent of the shift arithmetic. It rebuilds the post-edit text as a
+    /// token stream (each surviving old byte is `Some(i)`, each inserted byte
+    /// `None`), then places the marker by what it is attached to:
+    ///
+    /// - `Left` binds to the byte before it: just after old byte `p - 1` if that
+    ///   survived (so before everything inserted at `p`); if an edit ENDING at
+    ///   `p` replaced it, just after that replacement (`p` is its trailing
+    ///   boundary). At `p == 0`, the very start.
+    /// - `Right` binds to the byte after it: just before old byte `p` if that
+    ///   survived (so after everything inserted at `p`); if an edit STARTING at
+    ///   `p` replaced it, just after that replacement (a replace is an insert at
+    ///   its start). At `p == old_len`, the very end.
+    ///
+    /// `None` for a strictly interior position (byte on the needed side replaced
+    /// by an edit that reaches past `p`) — that is the prefix-preserving clamp,
+    /// pinned by the single-edit tests, not a bias question.
+    fn marker_oracle(old_len: u32, patch: &Patch, p: u32, bias: Bias) -> Option<u32> {
+        let edits = patch.edits();
+        let mut toks: Vec<Option<u32>> = Vec::new();
+        let mut owner: Vec<Option<usize>> = vec![None; old_len as usize];
+        let mut replacement_end: Vec<usize> = Vec::new(); // token index after edit k's text
+        let mut cursor = 0;
+        for (k, e) in edits.iter().enumerate() {
+            toks.extend((cursor..e.old.start).map(Some));
+            for i in e.old.clone() {
+                owner[i as usize] = Some(k);
+            }
+            toks.extend((e.new.start..e.new.end).map(|_| None));
+            replacement_end.push(toks.len());
+            cursor = e.old.end;
+        }
+        toks.extend((cursor..old_len).map(Some));
+        let survivor = |i: u32| toks.iter().position(|&t| t == Some(i)).expect("surviving byte");
+        let at = match bias {
+            Left if p == 0 => 0,
+            Left => match owner[p as usize - 1] {
+                None => survivor(p - 1) + 1,
+                Some(k) if edits[k].old.end == p => replacement_end[k],
+                Some(_) => return None,
+            },
+            Right if p == old_len => toks.len(),
+            Right => match owner[p as usize] {
+                None => survivor(p),
+                Some(k) if edits[k].old.start == p => replacement_end[k],
+                Some(_) => return None,
+            },
         };
-        for _ in 0..400 {
-            let n_edits = next(6); // 0..=5 edits, incl. the empty-patch path
-            let script: Vec<(u32, u32, u32)> = (0..n_edits)
-                .map(|_| (next(5), next(4), next(4))) // gaps + del/ins incl. 0 (pure insert/delete)
-                .collect();
+        Some(at as u32)
+    }
+
+    #[test]
+    fn bias_tracks_a_real_marker_through_touching_and_same_offset_edits() {
+        // Property: at every non-interior offset, both biases, `map_offset` (and
+        // `map_many`, via `mapped`) puts a marker exactly where the token-stream
+        // rebuild says it really is — over random patches dense in touching and
+        // same-offset edits, the shapes formatter `TextEdit` lists and snippet
+        // expansion produce.
+        let mut next = lcg(0xD1B5_4A32_D192_ED03);
+        let (mut touching, mut same_offset) = (0u32, 0u32);
+        for _ in 0..2000 {
+            let script = shared_point_script(&mut next);
+            let patch = patch_from_script(&script);
+            let old_len = patch.edits().last().map_or(0, |e| e.old.end) + next(3);
+            for p in 0..=old_len {
+                let (t, s) = shared_point_kind(&patch, p);
+                for bias in [Left, Right] {
+                    let Some(want) = marker_oracle(old_len, &patch, p, bias) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        mapped(&patch, p, bias),
+                        want,
+                        "marker at {p} {bias:?} misplaced, script {script:?}"
+                    );
+                    touching += u32::from(t);
+                    same_offset += u32::from(s);
+                }
+            }
+        }
+        // The generator must actually reach the shapes this test exists for.
+        assert!(touching > 500, "only {touching} touching-point checks");
+        assert!(same_offset > 500, "only {same_offset} same-offset checks");
+    }
+
+    #[test]
+    fn map_many_matches_map_offset_oracle() {
+        let mut next = lcg(0x9E37_79B9_7F4A_7C15);
+        let (mut touching, mut same_offset) = (0u32, 0u32);
+        for round in 0..800 {
+            // Even rounds: uniform scripts (0..=5 edits; gaps + del/ins incl. 0,
+            // so pure inserts/deletes). Odd rounds: scripts dense in the points
+            // several edits share, where Right must pass every edit at the point
+            // — the batch's partition-point search must land on the same edit
+            // as the scan.
+            let script: Vec<(u32, u32, u32)> = if round % 2 == 0 {
+                (0..next(6)).map(|_| (next(5), next(4), next(4))).collect()
+            } else {
+                shared_point_script(&mut next)
+            };
             let patch = patch_from_script(&script);
             // Query every offset in a window spanning before/through/after all
             // edits, both biases — unsorted order to exercise order-independence.
@@ -351,8 +551,14 @@ mod tests {
                     patch.map_offset(o, b),
                     "map_many diverged at offset {o} bias {b:?}, script {script:?}"
                 );
+                let (t, s) = shared_point_kind(&patch, o);
+                touching += u32::from(t);
+                same_offset += u32::from(s);
             }
         }
+        // Coverage, not luck: the shared-point shapes were actually queried.
+        assert!(touching > 200, "only {touching} touching-point queries");
+        assert!(same_offset > 200, "only {same_offset} same-offset queries");
     }
 
     #[test]

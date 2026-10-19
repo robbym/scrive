@@ -1,10 +1,13 @@
 //! Find — the search core.
 //!
-//! Search is a **literal substring** with an ASCII case-fold toggle, or — behind
-//! the whole-word / regex options — a **line-scoped** pattern. (The private
+//! Search is a **literal substring** with a case-fold toggle, or — behind the
+//! whole-word / regex options — a **line-scoped** pattern. (The private
 //! `Matcher` type carries the full rationale for why a line, and not a byte
-//! window, is the unit there.) The search *bar* is app-side chrome; this module
-//! owns only the match model, the scan, and what a replacement means.
+//! window, is the unit there.) Case folding is Unicode **simple** folding in
+//! every mode (`é`/`É`, `σ`/`Σ`/`ς`; never the multi-char `ß`/`ss`), so
+//! toggling an option never changes what folds. The search *bar* is app-side
+//! chrome; this module owns only the match model, the scan, and what a
+//! replacement means.
 //!
 //! The one design choice: the match set **lives only in the decoration store**
 //! — the sorted `FindMatch` decorations ARE the match set, in document order
@@ -51,11 +54,20 @@ pub struct FindQuery {
     /// [`regex`](Self::regex) is set. Empty means "no matches" (never
     /// match-all).
     pub text: String,
-    /// When `false`, `a`/`A` fold together. Case folding is ASCII-only in the
-    /// literal matcher, and Unicode-aware in the regex one.
+    /// When `false`, case variants fold together — Unicode **simple** case
+    /// folding (one char to one char: `a`/`A`, `é`/`É`, `σ`/`Σ`/`ς`, `k`/`K`
+    /// KELVIN SIGN; never full folding's `ß`/`ss`), the SAME in the literal,
+    /// whole-word and regex modes, so toggling them never changes what folds.
     pub case_sensitive: bool,
-    /// Match only whole words — the `ab|` option. A match must be bounded by
-    /// non-word characters (or the edges of its line) on both sides.
+    /// Match only whole words — the `ab|` option. Each side of a match is judged
+    /// by the match's own edge character there (VS Code's rule): a side whose
+    /// edge is a **word** character must meet a non-word neighbour or the edge
+    /// of its line; a side whose edge is a **separator** holds whatever its
+    /// neighbour is. So `foo` never matches inside `foobar`, while `(foo`
+    /// matches in ` (foo) ` and `==` in `a == b`. "Word character" is the
+    /// crate's one word rule — alphanumeric or `_`, the same one word motion
+    /// uses. In regex mode the edges are the characters each match actually
+    /// covered, not the pattern's spelling (`\(foo` behaves like `(foo`).
     pub whole_word: bool,
     /// Treat [`text`](Self::text) as a regular expression — the `.*` option.
     ///
@@ -77,18 +89,28 @@ impl FindQuery {
     }
 }
 
+// Op-count canary: `Matcher::compile` calls on this thread. A query compiles
+// ONCE, at `FindState::set_query`; a test asserts the replace paths read that
+// cached matcher rather than compiling the pattern again per press.
+// Thread-local so parallel tests don't race the count. Debug/test only;
+// zero-cost in release.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    pub(crate) static MATCHER_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// The compiled form of a [`FindQuery`] — the one place that decides *how* a
 /// query matches, so every scan path shares the decision.
 ///
 /// # Why two matchers, and why the second is line-scoped
 ///
 /// [`FindState::on_commit`]'s windowed repair — the thing that keeps find at
-/// O(edit window) instead of O(document) per keystroke — is built on `k`, the
-/// needle's fixed byte length: a match can start at most `k−1` bytes left of a
-/// changed byte, so that is how far the influence window has to reach. A
-/// **variable-length** pattern destroys that argument outright (`.*` lets an
-/// edit anywhere create a match starting at column 0), and there is no `k` to
-/// widen by.
+/// O(edit window) instead of O(document) per keystroke — is built on `k`, a
+/// bound on the needle's match length: a match can start at most `k−1` bytes
+/// left of a changed byte, so that is how far the influence window has to
+/// reach. An **unbounded** pattern destroys that argument outright (`.*` lets
+/// an edit anywhere create a match starting at column 0), and there is no `k`
+/// to widen by.
 ///
 /// The fix is to bound matches by something the repair *can* window on: a line.
 /// [`Lines`](Self::Lines) feeds the engine **one line at a time**, so `\n` is
@@ -98,21 +120,24 @@ impl FindQuery {
 /// the lines it touches, so the influence window is those lines. Windowed again,
 /// and simpler than the `k−1` dance.
 ///
-/// Whole-word rides the same path for a different reason: judging `\bfoo\b`
-/// needs the character *outside* the match, which a byte window's slice does not
-/// contain — but a line always holds its own matches' context, because a word
-/// can never span a newline. So `whole_word` compiles to `\b…\b` and is
-/// line-scoped too, rather than growing a second boundary mechanism.
+/// Whole-word rides the same path for a different reason: judging a word
+/// boundary needs the character *outside* the match, which a byte window's
+/// slice does not contain — but a line always holds its own matches' context,
+/// because a word can never span a newline. So `whole_word` is line-scoped too,
+/// and its edge rule lives in exactly one place, [`LineMatcher`], which every
+/// line-scoped scan path iterates through.
 ///
-/// Plain literal text keeps the fast byte-scan path: it is the common case, it
-/// is what the memchr scan and the `k−1` repair were built for, and nothing
-/// about it needs a line.
+/// Plain literal text keeps the byte-window path: it is the common case, it is
+/// what the windowed scan and the `k−1` repair were built for, and nothing
+/// about it needs a line. (Case folding can make a literal match's byte length
+/// differ from the needle's, but only within a bound the needle fixes — see
+/// [`LiteralMatcher`] — and the `k−1` argument only ever needed a bound.)
 #[derive(Debug)]
 enum Matcher {
-    /// Plain literal text — the memchr byte scan, fixed `k`, `k−1` repair.
-    Literal,
+    /// Plain literal text — the byte-window scan, bounded `k`, `k−1` repair.
+    Literal(LiteralMatcher),
     /// Whole-word or regex — the line-scoped engine (see the type docs).
-    Lines(regex::Regex),
+    Lines(LineMatcher),
 }
 
 impl Matcher {
@@ -122,30 +147,286 @@ impl Matcher {
     /// pattern being typed (`(`, `[a-`) is invalid, so callers surface the
     /// message and match nothing rather than treating it as broken.
     fn compile(query: &FindQuery) -> Result<Self, String> {
+        #[cfg(any(test, debug_assertions))]
+        MATCHER_COMPILES.with(|c| c.set(c.get() + 1));
         if !query.whole_word && !query.regex {
-            return Ok(Self::Literal);
+            return LiteralMatcher::new(query).map(Self::Literal);
         }
-        // A whole-word literal is `\b` + the escaped text + `\b`; a whole-word
-        // REGEX wraps the user's pattern in a non-capturing group first, so
-        // `foo|bar` means `\b(?:foo|bar)\b` and not `\bfoo|bar\b`.
-        let body =
-            if query.regex { format!("(?:{})", query.text) } else { regex::escape(&query.text) };
-        let pattern = if query.whole_word { format!(r"\b{body}\b") } else { body };
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(!query.case_sensitive)
-            // The haystack is one line, so `.` never sees a `\n` anyway; this
-            // just makes `$`/`^` mean the line's edges, which is what a
-            // line-scoped find should mean.
-            .multi_line(true)
-            .build()
-            .map(Self::Lines)
-            .map_err(|e| e.to_string())
+        query_regex(query).map(|re| {
+            Self::Lines(LineMatcher { re, whole_word: query.whole_word, expands_groups: query.regex })
+        })
     }
 
     /// Whether this matcher is bounded to single lines — the flag every scan and
     /// repair path branches on.
     fn is_line_scoped(&self) -> bool {
         matches!(self, Self::Lines(_))
+    }
+}
+
+/// THE regex compile of a query's text — the one owner of how a pattern
+/// becomes an engine, shared by the line-scoped matcher and the folding
+/// literal (which matches through its own escape, see [`LiteralMatcher`]).
+///
+/// The pattern is NEVER wrapped for whole-word (see [`LineMatcher`] for why
+/// `\b…\b` is wrong): a literal is just its escaped text, a regex the user's
+/// pattern verbatim. A whole-word literal is therefore the whole-word regex of
+/// its own escape — `(foo` and `\(foo` compile to the same engine and the same
+/// edge check, so they cannot disagree. Case folding is the query's flag, in
+/// every mode, so toggling an option never changes what folds.
+fn query_regex(query: &FindQuery) -> Result<regex::Regex, String> {
+    let pattern = if query.regex {
+        std::borrow::Cow::Borrowed(query.text.as_str())
+    } else {
+        std::borrow::Cow::Owned(regex::escape(&query.text))
+    };
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!query.case_sensitive)
+        // The line engine's haystack is one line, so `.` never sees a `\n`
+        // anyway; this just makes `$`/`^` mean the line's edges, which is what a
+        // line-scoped find should mean. (An escaped literal has no anchors, so
+        // it changes nothing there.)
+        .multi_line(true)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// The plain-literal engine: the needle, how it folds case, and the byte-length
+/// bounds of its matches — the ONE owner of "where does this literal match", so
+/// the display scan, the windowed buffer scan, the per-edit repair and
+/// replace-all cannot fork on it.
+///
+/// # Why case folding goes through the regex crate
+///
+/// Case-insensitive literal search must fold EXACTLY as regex mode does, or
+/// toggling `.*` on an escaped-equivalent query changes what matches (`é`
+/// finding `É` only with the regex option on). The regex crate's `(?i)` —
+/// Unicode **simple** case folding — is the owner of that rule, so a folding
+/// literal is matched by the regex of its own escape, compiled `(?i)`: the two
+/// modes then agree by construction, not by a second hand-kept fold table.
+/// Simple folding maps one char to one char — never `ß` → `ss` (that is full
+/// folding, out of scope in both modes).
+///
+/// # Why a match length is a *range*
+///
+/// Simple folding is one char ↔ one char, but not one byte length ↔ the same
+/// length: `k` (1 byte) folds with `K` KELVIN SIGN (3), `s` (1) with `ſ` LONG
+/// S (2), `ß` (2) with `ẞ` (3). So a folding literal's matches are exactly as
+/// many CHARS as the needle, but not as many bytes. The windowed paths never
+/// needed the exact length, only bounds:
+/// [`max_len`](Self::max_len) for how far left of a changed byte a match can
+/// start (the `k−1` overlap/repair margin), [`min_len`](Self::min_len) for
+/// whether a match can still fit in what is left of a scan.
+#[derive(Debug)]
+struct LiteralMatcher {
+    /// The needle as typed — the case-sensitive path's `memmem` needle.
+    needle: String,
+    /// Case-insensitive only: the needle's escape compiled `(?i)` (see the
+    /// type docs). `None` ⇒ exact byte matching.
+    fold: Option<regex::Regex>,
+    /// No match is shorter than this many bytes. Case-sensitive: the needle's
+    /// length. Folding: its CHAR count (a match is that many chars, each at
+    /// least one byte).
+    min_len: u32,
+    /// No match is longer than this many bytes — the `k` of the windowed
+    /// scan's seam overlap and the repair's `k−1` margins. Case-sensitive: the
+    /// needle's length. Folding: the sum of each needle char's
+    /// [`fold_width`](Self::fold_width).
+    max_len: u32,
+}
+
+impl LiteralMatcher {
+    /// Compile `query`'s literal. Exact matching cannot fail; a folding needle
+    /// so large that its `(?i)` escape exceeds the regex crate's size limit
+    /// reports that limit, exactly as the whole-word path (which compiles the
+    /// same escape) always has.
+    fn new(query: &FindQuery) -> Result<Self, String> {
+        let needle = query.text.clone();
+        let len = needle.len() as u32;
+        if query.case_sensitive {
+            return Ok(Self { needle, fold: None, min_len: len, max_len: len });
+        }
+        // The literal's escape, compiled `(?i)` by the one owner.
+        let fold = query_regex(query)?;
+        let min_len = needle.chars().count() as u32;
+        let max_len = needle.chars().map(Self::fold_width).fold(0u32, u32::saturating_add);
+        Ok(Self { needle, fold: Some(fold), min_len, max_len })
+    }
+
+    /// The widest UTF-8 encoding (bytes) of any char that simple-folds with
+    /// `c` — one needle char's share of [`max_len`](Self::max_len).
+    ///
+    /// Exact for ASCII, the common needle and the one where a loose bound costs
+    /// most: the repair window is `±(max_len−1)`, so a 4-bytes-per-char bound
+    /// made a dense ASCII needle's keystroke repair tear out and re-insert
+    /// several times the matches it needed to (measured: +50% per keystroke on
+    /// the find bench's corpus). Only two non-ASCII chars simple-fold into
+    /// ASCII — `K` KELVIN SIGN (3 bytes, with `k`) and `ſ` LONG S (2, with
+    /// `s`) — a fact taken exhaustively from the regex crate itself, which owns
+    /// folding, by `fold_width_covers_every_fold_partner_of_ascii`. Beyond
+    /// ASCII the bound is simply 4, the widest any char can be: that needs no
+    /// Unicode table to be right, and it widens a window by a constant factor
+    /// of the NEEDLE, never by anything the document scales.
+    fn fold_width(c: char) -> u32 {
+        match c {
+            'k' | 'K' => 3,
+            's' | 'S' => 2,
+            c if c.is_ascii() => 1,
+            _ => 4,
+        }
+    }
+
+    /// Every non-overlapping match in `text`, leftmost-first, as byte spans
+    /// relative to it; the `bool` is whether `cap` was hit. An empty needle
+    /// matches nothing (never match-all).
+    ///
+    /// A literal has no context: whether it matches at a start depends only on
+    /// the bytes it covers, so scanning a char-boundary SLICE finds exactly the
+    /// whole text's matches that fit in it — what lets the windowed paths feed
+    /// it windows.
+    fn scan(&self, text: &str, cap: usize) -> (Vec<Range<u32>>, bool) {
+        if self.needle.is_empty() {
+            return (Vec::new(), false); // empty needle = zero matches
+        }
+        let (mut exact, mut folded);
+        let hits: &mut dyn Iterator<Item = Range<usize>> = match &self.fold {
+            // memmem yields non-overlapping occurrences leftmost-first — the
+            // next probe starts at the previous match's end.
+            None => {
+                let k = self.needle.len();
+                exact = memchr::memmem::find_iter(text.as_bytes(), self.needle.as_bytes())
+                    .map(move |i| i..i + k);
+                &mut exact
+            }
+            // The regex crate's own leftmost-first, non-overlapping iteration.
+            // The pattern is a run of single-char classes, so at most one match
+            // can begin at any start — this IS try-every-start greedy.
+            Some(re) => {
+                folded = re.find_iter(text).map(|m| m.range());
+                &mut folded
+            }
+        };
+        let mut spans = Vec::new();
+        for r in hits {
+            if spans.len() == cap {
+                return (spans, true); // cap reached
+            }
+            // The bounds every windowed path's correctness rests on.
+            debug_assert!(
+                (self.min_len..=self.max_len).contains(&(r.len() as u32)),
+                "a literal match of {} bytes escaped its bounds {}..={}",
+                r.len(),
+                self.min_len,
+                self.max_len
+            );
+            spans.push(r.start as u32..r.end as u32);
+        }
+        (spans, false)
+    }
+}
+
+/// The line-scoped engine: a compiled pattern plus the whole-word edge rule —
+/// the ONE owner of "which spans of a line match", so the display scan, the
+/// per-edit repair, and replace-all cannot fork on it.
+///
+/// # Why whole-word is a per-match edge check, not `\b…\b`
+///
+/// `\b` asserts that the characters on its two sides differ in wordness, so
+/// wrapping a needle whose edge is punctuation inverts the rule on that side:
+/// `\b(foo` demands a WORD character before the `(` — it can never match in
+/// ` (foo) ` — and `foo.\b` matches only when a word character follows the `.`.
+/// The rule users mean (VS Code's) is about the match's *own* edge: a side
+/// whose edge character is a word character needs a non-word neighbour (or the
+/// line edge); a side whose edge is a separator is free. That depends on what
+/// a match actually covered, which for a regex (`\(?foo`, `foo|==`) differs
+/// match by match and is unknowable at compile time — so the check runs on
+/// each match against its line, after the engine finds it.
+///
+/// The word rule is [`crate::movement::is_word_char`], the crate's single
+/// owner, so whole-word find agrees with word motion and Ctrl+D about where a
+/// word ends.
+#[derive(Debug)]
+struct LineMatcher {
+    /// The pattern: the user's regex verbatim, or a literal's escape. Never
+    /// wrapped — the whole-word rule is [`whole_word`](Self::whole_word)'s job.
+    re: regex::Regex,
+    /// Apply the edge check to each match (see the type docs).
+    whole_word: bool,
+    /// Whether a replacement expands `$1`-style group references: `re` is the
+    /// user's regex, so its capture groups are the user's, rather than a
+    /// whole-word literal's escape, whose replacement is plain text (see
+    /// [`replacements`]).
+    expands_groups: bool,
+}
+
+impl LineMatcher {
+    /// Every match in `line` — ONE line, without its `\n` — leftmost-first and
+    /// non-overlapping, as byte spans relative to `line`. Zero-width hits are
+    /// dropped (nothing to navigate to, highlight, or replace).
+    fn find_iter<'a>(&'a self, line: &'a str) -> LineMatches<'a> {
+        LineMatches { m: self, line, at: 0 }
+    }
+
+    /// Whether the span `s..e` (non-empty, on char boundaries) of `line` passes
+    /// the whole-word edge rule on both sides.
+    fn is_whole_word(line: &str, s: usize, e: usize) -> bool {
+        use crate::movement::is_word_char;
+        // A side fails only when its edge char AND its neighbour are both word
+        // characters; a line edge (`None`) is never a word character.
+        let holds = |edge: Option<char>, neighbour: Option<char>| {
+            !(edge.is_some_and(is_word_char) && neighbour.is_some_and(is_word_char))
+        };
+        holds(line[s..].chars().next(), line[..s].chars().next_back())
+            && holds(line[..e].chars().next_back(), line[e..].chars().next())
+    }
+}
+
+/// [`LineMatcher::find_iter`]'s iterator.
+///
+/// The cursor rule is what makes the set "the leftmost non-overlapping VALID
+/// placements": an accepted match resumes at its end (non-overlapping), while a
+/// REJECTED one — zero-width, or failing the edge check — resumes one char past
+/// its *start*, never its end, so it cannot hide a valid match that starts
+/// inside it (`a-a` in `xa-a-a`: `1..4` fails against `x`, `3..6` is bounded by
+/// `-`). For a literal needle that is exactly try-every-start, so on needles
+/// with word-character edges it keeps the old `\b…\b` results (up to the word
+/// rule itself: `\b`'s Unicode `\w` also admitted marks and connector
+/// punctuation; this is now the crate's own rule, as above). Without the
+/// edge check (plain regex) it is byte-identical to `Regex::find_iter` with
+/// empties dropped (pinned by `line_matches_without_whole_word_equal_find_iter`).
+///
+/// One limit, inherent to judging a match after the engine picks it: the engine
+/// offers ONE match per start (leftmost-first), so a rejected match's start is
+/// not retried with a different length (`foo|foobar` rejects `foo` in `foobar`
+/// rather than taking `foobar`). Cost residual: each rejection re-searches from
+/// one char further on, so a pathological whole-word regex whose long matches
+/// are all rejected (`.*a` on a line of `xa`s) is quadratic in that LINE's
+/// length — never in the document's, since the scan is line-scoped.
+struct LineMatches<'a> {
+    m: &'a LineMatcher,
+    line: &'a str,
+    /// The next search start (a char boundary of `line`).
+    at: usize,
+}
+
+impl Iterator for LineMatches<'_> {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        while self.at <= self.line.len() {
+            // `find_at`, not a slice: the engine sees the text before `at`, so
+            // the user's own `^` / `\b` keep their line context on a retry.
+            let hit = self.m.re.find_at(self.line, self.at)?;
+            let (s, e) = (hit.start(), hit.end());
+            if s < e && (!self.m.whole_word || LineMatcher::is_whole_word(self.line, s, e)) {
+                self.at = e;
+                return Some(s..e);
+            }
+            // Rejected: retry one char past the START (see the type docs). At the
+            // line's end there is no next char, which ends the loop.
+            self.at = s + self.line[s..].chars().next().map_or(1, char::len_utf8);
+        }
+        None
     }
 }
 
@@ -166,20 +447,23 @@ pub const FIND_MATCH_CAP: usize = 10_000;
 /// Every non-overlapping match of `query` in `text`, leftmost-first, as byte
 /// spans; the `bool` is whether the scan hit [`FIND_MATCH_CAP`].
 ///
-/// The query's options pick the matcher. Plain text takes a **literal byte-wise
+/// The query's options pick the matcher. Plain text takes a **literal
 /// substring** scan — the next probe starts at the previous match's end
-/// (non-overlapping), case fold is **ASCII only**, byte-wise is exact for the
-/// ASCII DSL, and a multi-byte needle is out of scope. `whole_word` / `regex`
-/// take the **line-scoped** engine, fed one line at a time so a match never
-/// crosses a newline. An empty literal query yields no matches (never
-/// match-all); an unfinished regex yields none until it parses.
+/// (non-overlapping), and a folded match may differ in byte length from the
+/// needle (`k` finds the 3-byte KELVIN SIGN). `whole_word` / `regex` take the
+/// **line-scoped** engine, fed one line at a time so a match never crosses a
+/// newline. Every mode folds case alike (Unicode simple folding). An empty
+/// literal query yields no matches (never match-all); an unfinished regex
+/// yields none until it parses.
 ///
 /// The pure whole-text scan the tests use as the oracle. The live paths (the
 /// query-change full scan, the capped refill, the per-edit window repairs) share
 /// its matcher rather than calling it directly, so the match rules cannot fork.
-/// Case-sensitive literal search rides `memchr::memmem`; the fold path probes
-/// the needle's first byte's two case forms via `memchr2` — both bit-identical
-/// to the naive reference scan (pinned by `scan_equals_the_naive_oracle`).
+/// Case-sensitive literal search rides `memchr::memmem`; the fold path is the
+/// regex crate's `(?i)` over the needle's escape (see `LiteralMatcher`) — both
+/// pinned against the naive reference scan where its byte-wise ASCII fold is
+/// exact (`scan_equals_the_naive_oracle`), and the fold path against regex
+/// mode everywhere (`literal_and_regex_fold_case_identically`).
 #[must_use]
 pub fn scan(text: &str, query: &FindQuery) -> (Vec<Range<u32>>, bool) {
     scan_capped(text, query, FIND_MATCH_CAP)
@@ -190,7 +474,7 @@ pub fn scan(text: &str, query: &FindQuery) -> (Vec<Range<u32>>, bool) {
 /// text you replace cannot diverge from the text you were shown.
 fn scan_capped(text: &str, query: &FindQuery, cap: usize) -> (Vec<Range<u32>>, bool) {
     match Matcher::compile(query) {
-        Ok(m) => scan_with(text, query, &m, cap),
+        Ok(m) => scan_with(text, &m, cap),
         // An unfinished pattern (`(`, `[a-`) matches nothing. Not an error: it
         // is what every prefix of a pattern being typed looks like.
         Err(_) => (Vec::new(), false),
@@ -199,17 +483,17 @@ fn scan_capped(text: &str, query: &FindQuery, cap: usize) -> (Vec<Range<u32>>, b
 
 /// [`scan_capped`] against an ALREADY-compiled matcher, so a windowed scan
 /// compiles the pattern once rather than once per window.
-fn scan_with(text: &str, query: &FindQuery, m: &Matcher, cap: usize) -> (Vec<Range<u32>>, bool) {
+fn scan_with(text: &str, m: &Matcher, cap: usize) -> (Vec<Range<u32>>, bool) {
     match m {
-        Matcher::Literal => scan_literal(text, query, cap),
-        Matcher::Lines(re) => scan_lines(text, re, cap),
+        Matcher::Literal(lit) => lit.scan(text, cap),
+        Matcher::Lines(lm) => scan_lines(text, lm, cap),
     }
 }
 
 /// The line-scoped scan: the engine is fed one line at a time — **without its
 /// newline** — so a pattern can never match across one. Offsets are relative to
 /// `text`.
-fn scan_lines(text: &str, re: &regex::Regex, cap: usize) -> (Vec<Range<u32>>, bool) {
+fn scan_lines(text: &str, lm: &LineMatcher, cap: usize) -> (Vec<Range<u32>>, bool) {
     let mut spans: Vec<Range<u32>> = Vec::new();
     let mut base = 0usize;
     for line in text.split_inclusive('\n') {
@@ -217,87 +501,45 @@ fn scan_lines(text: &str, re: &regex::Regex, cap: usize) -> (Vec<Range<u32>>, bo
         // what would let `\s` or `[^x]` slip across a line and break the
         // line-windowed repair this design rests on.
         let body = line.strip_suffix('\n').unwrap_or(line);
-        for m in re.find_iter(body) {
-            // Zero-width hits (`a*` against "bbb") are dropped: there is nothing
-            // to navigate to, highlight, or replace, and the store's
-            // `EmptyPolicy::Drop` would discard them anyway — so the count stays
-            // honest about what the user can act on.
-            if m.start() >= m.end() {
-                continue;
-            }
+        // Zero-width hits (`a*` against "bbb") never come out of `find_iter`:
+        // there is nothing to navigate to, highlight, or replace, and the
+        // store's `EmptyPolicy::Drop` would discard them anyway — so the count
+        // stays honest about what the user can act on.
+        for m in lm.find_iter(body) {
             if spans.len() == cap {
                 return (spans, true); // cap reached
             }
-            spans.push((base + m.start()) as u32..(base + m.end()) as u32);
+            spans.push((base + m.start) as u32..(base + m.end) as u32);
         }
         base += line.len();
     }
     (spans, false)
 }
 
-/// The literal byte scan — the fast common path (memchr, fixed `k`).
-fn scan_literal(text: &str, query: &FindQuery, cap: usize) -> (Vec<Range<u32>>, bool) {
-    let needle = query.text.as_bytes();
-    if needle.is_empty() {
-        return (Vec::new(), false); // empty needle = zero matches
-    }
-    let hay = text.as_bytes();
-    let mut spans = Vec::new();
-    if query.case_sensitive {
-        // memmem yields non-overlapping occurrences leftmost-first — the next
-        // probe starts at the previous match's end.
-        for i in memchr::memmem::find_iter(hay, needle) {
-            if spans.len() == cap {
-                return (spans, true); // cap reached
-            }
-            spans.push(i as u32..(i + needle.len()) as u32);
-        }
-    } else {
-        let (lo, up) = (needle[0].to_ascii_lowercase(), needle[0].to_ascii_uppercase());
-        let mut i = 0usize;
-        while i + needle.len() <= hay.len() {
-            // Jump to the next candidate first byte (either case form)…
-            let Some(j) = memchr::memchr2(lo, up, &hay[i..]) else {
-                break;
-            };
-            let c = i + j;
-            if c + needle.len() > hay.len() {
-                break;
-            }
-            // …and verify the window byte-wise (ASCII-only fold).
-            if hay[c..c + needle.len()].eq_ignore_ascii_case(needle) {
-                if spans.len() == cap {
-                    return (spans, true); // cap reached
-                }
-                spans.push(c as u32..(c + needle.len()) as u32);
-                i = c + needle.len(); // non-overlapping: resume past this match
-            } else {
-                i = c + 1;
-            }
-        }
-    }
-    (spans, false)
-}
-
 /// [`scan`] driven through the buffer's backing-agnostic ranged reads:
-/// fixed-size windows with a needle-length−1 overlap, so a match straddling a
+/// fixed-size windows with a longest-match−1 overlap, so a match straddling a
 /// window boundary is found by the next window and the result is
 /// **byte-identical to `scan(&buffer.text(), query)`** (pinned by
 /// `windowed_scan_equals_the_whole_text_scan`). Never materializes the
 /// document — peak transient is one window — and a capped dense query stops
 /// after O(bytes-until-cap), which `buffer.text()` would defeat by copying
 /// the whole rope up front.
+///
+/// Takes the ALREADY-compiled matcher: [`FindState`] scans through the one it
+/// cached at [`set_query`](FindState::set_query), so a query change compiles
+/// its pattern once, not once per scan.
 fn scan_buffer(
     buffer: &Buffer,
-    query: &FindQuery,
+    m: &Matcher,
     window: u32,
     within: Range<u32>,
 ) -> (Vec<Range<u32>>, bool) {
-    scan_buffer_capped(buffer, query, window, FIND_MATCH_CAP, within)
+    scan_buffer_capped(buffer, m, window, FIND_MATCH_CAP, within)
 }
 
-/// Every match of `query` inside `within` — the whole document when find is
-/// unscoped, or the find-in-selection scope — **uncapped**. The replace-all scan.
+/// Every match of the compiled matcher `m` inside `within` — the whole document
+/// when find is unscoped, or the find-in-selection scope — **uncapped**. The
+/// replace-all scan.
 ///
 /// Replace-all cannot read the live match set: that set is capped at
 /// [`FIND_MATCH_CAP`] and is only a *prefix of its range*, so "all" built from
@@ -306,8 +548,8 @@ fn scan_buffer(
 /// no fork — with the cap lifted. Whole-`within` in the worst case (you cannot
 /// replace what you have not found), which is why it is reachable only from a
 /// discrete user action, never a keystroke.
-pub(crate) fn scan_all(buffer: &Buffer, query: &FindQuery, within: Range<u32>) -> Vec<Range<u32>> {
-    scan_buffer_capped(buffer, query, crate::buffer::SCAN_WINDOW, usize::MAX, within).0
+fn scan_all(buffer: &Buffer, m: &Matcher, within: Range<u32>) -> Vec<Range<u32>> {
+    scan_buffer_capped(buffer, m, crate::buffer::SCAN_WINDOW, usize::MAX, within).0
 }
 
 /// [`scan_buffer`] with the cap injected — see [`scan_capped`].
@@ -318,22 +560,23 @@ pub(crate) fn scan_all(buffer: &Buffer, query: &FindQuery, within: Range<u32>) -
 /// str contract.
 fn scan_buffer_capped(
     buffer: &Buffer,
-    query: &FindQuery,
+    m: &Matcher,
     window: u32,
     cap: usize,
     within: Range<u32>,
 ) -> (Vec<Range<u32>>, bool) {
-    let Ok(m) = Matcher::compile(query) else {
-        return (Vec::new(), false); // an unfinished pattern matches nothing
-    };
     // Snap INWARD: `hi` left, `lo` right, so the scanned span never grows past
     // the requested bound and never splits a char.
     let hi = buffer.clip_offset(within.end.min(buffer.len()), Bias::Left);
     let lo = buffer.clip_offset(within.start.min(hi), Bias::Right);
-    if let Matcher::Lines(re) = &m {
-        return scan_buffer_lines(buffer, re, cap, lo..hi);
-    }
-    let k = query.text.len() as u64;
+    let lit = match m {
+        Matcher::Lines(lm) => return scan_buffer_lines(buffer, lm, cap, lo..hi),
+        Matcher::Literal(lit) => lit,
+    };
+    // A folding match's byte length is a range, not the needle's length (see
+    // `LiteralMatcher`): the seam overlap must cover the LONGEST possible
+    // match, while "can a match still fit" asks about the SHORTEST.
+    let (k, k_min) = (u64::from(lit.max_len), u64::from(lit.min_len));
     if k == 0 {
         return (Vec::new(), false); // empty needle = zero matches
     }
@@ -341,13 +584,13 @@ fn scan_buffer_capped(
     let window = u64::from(window).max(k * 2);
     let mut spans: Vec<Range<u32>> = Vec::new();
     let mut pos: u32 = lo; // the non-overlapping scan cursor (next probe start)
-    while u64::from(pos) + k <= u64::from(hi) {
+    while u64::from(pos) + k_min <= u64::from(hi) {
         // The window end snaps RIGHT to a char boundary: `slice` stays on the
         // str-slicing contract, the window is never empty, and growing a
         // window never loses a candidate.
         let win_end = buffer
             .clip_offset((u64::from(pos) + window).min(u64::from(hi)) as u32, Bias::Right);
-        let (local, local_capped) = scan_with(&buffer.slice(pos..win_end), query, &m, cap);
+        let (local, local_capped) = lit.scan(&buffer.slice(pos..win_end), cap);
         let found = !local.is_empty();
         for r in local {
             if spans.len() == cap {
@@ -382,7 +625,7 @@ fn scan_buffer_capped(
 /// are filtered to `within` afterwards rather than by truncating the haystack.
 fn scan_buffer_lines(
     buffer: &Buffer,
-    re: &regex::Regex,
+    lm: &LineMatcher,
     cap: usize,
     within: Range<u32>,
 ) -> (Vec<Range<u32>>, bool) {
@@ -395,11 +638,8 @@ fn scan_buffer_lines(
     for row in first..=last {
         let base = buffer.point_to_offset(Point::new(row, 0));
         let line = buffer.line(row); // excludes the trailing `\n`
-        for m in re.find_iter(&line) {
-            if m.start() >= m.end() {
-                continue; // zero-width: nothing to act on
-            }
-            let (s, e) = (base + m.start() as u32, base + m.end() as u32);
+        for m in lm.find_iter(&line) {
+            let (s, e) = (base + m.start as u32, base + m.end as u32);
             if s < within.start || e > within.end {
                 continue; // outside the scope, which may open/close mid-line
             }
@@ -442,38 +682,44 @@ fn whole_lines(buffer: &Buffer, r: &Range<u32>) -> Range<u32> {
 /// replaces with a literal `$1`, because nothing captured anything.
 ///
 /// When `preserve_case` is set (the replace bar's `AB` toggle), each
-/// replacement is re-cased to the pattern of the text it replaces — an
-/// ALL-CAPS match takes an upper-cased replacement, a Capitalized match a
-/// capitalized one — so a mechanical rename does not flatten the casing of the
-/// identifiers it touches. See [`preserve_case_of`].
-pub(crate) fn replacements(
+/// replacement is re-cased to the pattern of the text it replaces, by VS Code's
+/// rule — an ALL-CAPS match takes an upper-cased replacement, a Capitalized one
+/// a capitalized one, a camelCase one a lower first letter, and `-`/`_`
+/// segments are re-cased one by one — so a mechanical rename does not flatten
+/// the casing of the identifiers it touches. See [`preserve_case_of`].
+///
+/// Takes the ALREADY-compiled matcher — the one [`FindState`] cached at
+/// [`set_query`](FindState::set_query) (reached through
+/// [`FindState::replacements`]) — so a replace press compiles nothing.
+fn replacements(
     buffer: &Buffer,
-    query: &FindQuery,
+    m: &Matcher,
     within: Range<u32>,
     replacement: &str,
     preserve_case: bool,
 ) -> Vec<(Range<u32>, String)> {
-    if !query.regex {
+    let lm = match m {
+        Matcher::Lines(lm) if lm.expands_groups => lm,
         // Literal and whole-word: one fixed string, every match — re-cased to
         // the match when `preserve_case` is on.
-        return scan_all(buffer, query, within)
-            .into_iter()
-            .map(|r| {
-                let text = if preserve_case {
-                    preserve_case_of(&buffer.slice(r.clone()), replacement)
-                } else {
-                    replacement.to_string()
-                };
-                (r, text)
-            })
-            .collect();
-    }
-    let Ok(Matcher::Lines(re)) = Matcher::compile(query) else {
-        return Vec::new(); // an unfinished pattern replaces nothing
+        _ => {
+            return scan_all(buffer, m, within)
+                .into_iter()
+                .map(|r| {
+                    let text = if preserve_case {
+                        preserve_case_of(&buffer.slice(r.clone()), replacement)
+                    } else {
+                        replacement.to_string()
+                    };
+                    (r, text)
+                })
+                .collect();
+        }
     };
-    // Mirrors `scan_buffer_lines` exactly — same lines, same filters — but walks
-    // captures instead of matches, because expansion needs the groups the plain
-    // scan throws away.
+    // Mirrors `scan_buffer_lines` exactly — same lines, same `LineMatcher`
+    // iteration (so whole-word's edge check and cursor rule apply), same scope
+    // filter — then fetches each kept match's capture groups, which expansion
+    // needs and the plain scan throws away.
     let mut out = Vec::new();
     if within.start >= within.end {
         return out;
@@ -483,20 +729,24 @@ pub(crate) fn replacements(
     for row in first..=last {
         let base = buffer.point_to_offset(Point::new(row, 0));
         let line = buffer.line(row); // excludes the trailing `\n`
-        for c in re.captures_iter(&line) {
-            let m = c.get(0).expect("capture group 0 is the whole match");
-            if m.start() >= m.end() {
-                continue; // zero-width: nothing to replace
-            }
-            let (s, e) = (base + m.start() as u32, base + m.end() as u32);
+        for m in lm.find_iter(&line) {
+            let (s, e) = (base + m.start as u32, base + m.end as u32);
             if s < within.start || e > within.end {
                 continue; // outside the scope, which may open/close mid-line
             }
+            // The SAME match, with its groups: no match starts in
+            // `m.start..` before `m.start`, and leftmost-first picks one match
+            // per start, so `captures_at` from the match's own start re-finds
+            // exactly it (with the same line context for `^` / `\b`).
+            let c = lm.re.captures_at(&line, m.start).expect("the match re-finds at its start");
+            debug_assert_eq!(c.get(0).map(|g| g.range()), Some(m.clone()));
             let mut dst = String::new();
             c.expand(replacement, &mut dst);
             // Preserve-case keys off the WHOLE match (group 0), applied AFTER
-            // template expansion — so `$1`-driven text is re-cased too.
-            let text = if preserve_case { preserve_case_of(m.as_str(), &dst) } else { dst };
+            // template expansion — so `$1`-driven text is re-cased too. That is
+            // scrive's extension: VS Code's rule is defined over a plain
+            // replacement string, and this feeds it the expanded one.
+            let text = if preserve_case { preserve_case_of(&line[m], &dst) } else { dst };
             out.push((s..e, text));
         }
     }
@@ -506,38 +756,75 @@ pub(crate) fn replacements(
 /// Re-case `replacement` to the case *pattern* of `matched` — the engine behind
 /// the replace bar's preserve-case (`AB`) toggle.
 ///
-/// Three patterns carry over, matching VS Code: an all-upper match ⇒ the
-/// replacement upper-cased; an all-lower match ⇒ lower-cased; a match whose
-/// first cased letter is upper (a Capitalized / Title word) ⇒ the replacement's
-/// first letter upper-cased, the rest left as typed. Anything else (mixed case
-/// like `camelCase`, or no cased letters at all) leaves the replacement exactly
-/// as written — guessing at mixed case does more harm than good.
+/// This is VS Code's rule (`buildReplaceStringWithCasePreserved`), ported
+/// branch for branch and pinned by its own test table
+/// (`preserve_case_follows_vs_codes_table`), first rule that applies wins:
+///
+/// 1. **Segments.** When both strings contain `-` and split into the same
+///    number of `-`-segments, each segment is re-cased to its counterpart by
+///    this same rule (`foo-BAR` + `new-name` ⇒ `new-NAME`); likewise `_`. If
+///    BOTH separators qualify, neither does — the rest of the rules see the
+///    whole strings.
+/// 2. **All upper** — `matched` equals its own upper-casing ⇒ the replacement
+///    upper-cased. (So a match with no cased letters at all, like `42`, counts
+///    as upper: VS Code's quirk, kept for parity.)
+/// 3. **All lower** ⇒ the replacement lower-cased.
+/// 4. **First char upper** (lower-casing changes it) — `FooBar`, `Abc` ⇒ the
+///    replacement's first char upper-cased, the rest as typed.
+/// 5. **First char lower** (upper-casing changes it) — camelCase `fooBar` ⇒
+///    the replacement's first char lower-cased, the rest as typed.
+/// 6. Otherwise (a caseless first char in a mixed match) ⇒ as typed.
+///
+/// "First char" is the first Unicode scalar value where VS Code reads the
+/// first UTF-16 unit — the same thing except for a match opening with an
+/// astral cased letter (e.g. Deseret), which VS Code cannot case and this can.
+/// Case mappings are Rust's full Unicode ones (`ß` upper-cases to `SS`), as
+/// JavaScript's are.
 fn preserve_case_of(matched: &str, replacement: &str) -> String {
-    let mut has_upper = false;
-    let mut has_lower = false;
-    let mut first_is_upper = None; // set by the first CASED char only
-    for ch in matched.chars() {
-        if ch.is_uppercase() {
-            has_upper = true;
-            first_is_upper.get_or_insert(true);
-        } else if ch.is_lowercase() {
-            has_lower = true;
-            first_is_upper.get_or_insert(false);
-        }
-    }
-    match (has_upper, has_lower) {
-        (true, false) => replacement.to_uppercase(),
-        (false, true) => replacement.to_lowercase(),
-        // Capitalized/Title: upper the first letter, leave the rest as typed.
-        (true, true) if first_is_upper == Some(true) => {
-            let mut chars = replacement.chars();
-            match chars.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
+    let Some(first) = matched.chars().next() else {
+        return replacement.to_string(); // nothing to take a pattern from
+    };
+    // Rule 1: both sides split into the same number of `sep`-segments.
+    let segmented = |sep: char| {
+        matched.contains(sep)
+            && replacement.contains(sep)
+            && matched.split(sep).count() == replacement.split(sep).count()
+    };
+    let sep = match (segmented('-'), segmented('_')) {
+        (true, false) => Some('-'),
+        (false, true) => Some('_'),
+        _ => None, // neither, or both: judge the whole strings
+    };
+    if let Some(sep) = sep {
+        let mut out = String::with_capacity(replacement.len());
+        for (i, (m, r)) in matched.split(sep).zip(replacement.split(sep)).enumerate() {
+            if i > 0 {
+                out.push(sep);
             }
+            out.push_str(&preserve_case_of(m, r));
         }
-        _ => replacement.to_string(),
+        return out;
     }
+    if matched.to_uppercase() == matched {
+        return replacement.to_uppercase(); // rule 2
+    }
+    if matched.to_lowercase() == matched {
+        return replacement.to_lowercase(); // rule 3
+    }
+    // Rules 4–6 re-case only the replacement's first char.
+    let changes = |mapped: &mut dyn Iterator<Item = char>| !mapped.eq([first]);
+    let mut rest = replacement.chars();
+    let Some(r0) = rest.next() else {
+        return String::new(); // an empty replacement has nothing to re-case
+    };
+    let head: String = if changes(&mut first.to_lowercase()) {
+        r0.to_uppercase().collect() // rule 4: first char is upper
+    } else if changes(&mut first.to_uppercase()) {
+        r0.to_lowercase().collect() // rule 5: first char is lower
+    } else {
+        return replacement.to_string(); // rule 6
+    };
+    head + rest.as_str()
 }
 
 /// Whether a tracked range is a find match — the one predicate the store
@@ -744,6 +1031,22 @@ impl FindState {
         self.pattern_error.as_deref()
     }
 
+    /// The replace plan for the current query inside `within`: every match with
+    /// the text that should replace it (see [`replacements`] for what a
+    /// replacement means per mode). Through the CACHED matcher, as every scan
+    /// and repair is; empty when find is idle or the pattern does not parse.
+    pub(crate) fn replacements(
+        &self,
+        buffer: &Buffer,
+        within: Range<u32>,
+        replacement: &str,
+        preserve_case: bool,
+    ) -> Vec<(Range<u32>, String)> {
+        self.matcher.as_ref().map_or_else(Vec::new, |m| {
+            replacements(buffer, m, within, replacement, preserve_case)
+        })
+    }
+
     /// Refill a **capped** match set: re-scan iff a query is active, the set is
     /// capped with room below the cap, and the debounce window has elapsed.
     /// `now_ms` is an injected monotonic clock — the widget passes real time,
@@ -767,7 +1070,8 @@ impl FindState {
     /// post-patch positions). No-op when find is idle.
     ///
     /// The influence window depends on the matcher. A **literal** query (post-edit
-    /// coordinates, `k` = needle byte length): every affected placement must
+    /// coordinates, `k` = the longest a match can be — the needle's byte length
+    /// when exact, a per-char bound when folding): every affected placement must
     /// overlap `new.start−(k−1) .. new.end+(k−1)` (a created/destroyed match
     /// contains a changed byte or the join point). A **line-scoped** query
     /// (whole-word / regex) instead repairs the whole lines the edit touched —
@@ -798,12 +1102,21 @@ impl FindState {
     /// If a repair pushes the live count past [`FIND_MATCH_CAP`], the tail is
     /// trimmed so the set stays a prefix of the document.
     pub fn on_commit(&mut self, patch: &Patch, buffer: &Buffer, store: &mut DecorationStore) {
-        let Some(query) = &self.query else { return };
+        if self.query.is_none() {
+            return;
+        }
         // No matcher ⇒ the pattern does not parse ⇒ there are no matches to
         // repair (the set is already empty, and stays so until it parses).
         let Some(matcher) = &self.matcher else { return };
         let line_scoped = matcher.is_line_scoped();
-        let k = query.text.len() as u32;
+        // A literal's `k` is the LONGEST a match can be — the needle's length
+        // when exact, a bound when folding (a folded match need not be as many
+        // bytes as the needle; see `LiteralMatcher`). Every margin below only
+        // needs "no match is longer than k", so the bound is all it takes.
+        let k = match matcher {
+            Matcher::Literal(lit) => lit.max_len,
+            Matcher::Lines(_) => 0, // line-scoped repair never reads `k`
+        };
         if patch.is_empty() || (!line_scoped && k == 0) {
             return; // an empty literal needle has no matches to repair
         }
@@ -842,7 +1155,7 @@ impl FindState {
         for e in patch.edits() {
             // The influence window, clamped to the covered prefix (and the
             // scope). Literal: ±(k−1) bytes, snapped OUTWARD to char boundaries
-            // — a fixed-length match can start at most k−1 bytes left of a
+            // — a match no longer than k can start at most k−1 bytes left of a
             // changed byte. Line-scoped: the WHOLE lines the edit touches, which
             // is the same argument in the only currency a variable-length
             // pattern has — a match cannot cross `\n`, so nothing off those
@@ -871,7 +1184,7 @@ impl FindState {
             // repair and no match can straddle the window's edge (it would have
             // to cross a `\n`). The re-scan zone IS the window, and the anchor
             // and guard below have nothing to do — the whole `k−1` widening
-            // dance exists only to serve a fixed-length needle's greedy cursor.
+            // dance exists only to serve a bounded-length needle's greedy cursor.
             let (scan_lo, scan_hi, guard) = if line_scoped {
                 (w_start, w_end, None)
             } else {
@@ -886,7 +1199,7 @@ impl FindState {
             // removal zone — one whose old greedy blocker died (self-overlap
             // phase) — can start up to k−1 bytes left of `ext_lo` and end as
             // far right of `ext_hi`. Removed-match boundaries are char
-            // boundaries (byte-wise hits of a valid-UTF-8 needle); the ±(k−1)
+            // boundaries (whole-char hits of a valid-UTF-8 needle); the ±(k−1)
             // arithmetic can unsnap, so clip again.
             let scan_lo =
                 buffer.clip_offset(ext_lo.saturating_sub(k - 1), Bias::Left).max(lo_bound);
@@ -917,18 +1230,15 @@ impl FindState {
             // Re-scan the zone through the SAME cached matcher the display scan
             // runs, so a repaired match cannot differ from a freshly found one.
             let mut spans: Vec<Range<u32>> = match matcher {
-                Matcher::Lines(re) => {
-                    scan_buffer_lines(buffer, re, FIND_MATCH_CAP, scan_lo..scan_hi).0
+                Matcher::Lines(lm) => {
+                    scan_buffer_lines(buffer, lm, FIND_MATCH_CAP, scan_lo..scan_hi).0
                 }
-                Matcher::Literal => scan_literal(
-                    &buffer.slice(scan_lo..scan_hi),
-                    query,
-                    FIND_MATCH_CAP,
-                )
-                .0
-                .into_iter()
-                .map(|r| scan_lo + r.start..scan_lo + r.end)
-                .collect(),
+                Matcher::Literal(lit) => lit
+                    .scan(&buffer.slice(scan_lo..scan_hi), FIND_MATCH_CAP)
+                    .0
+                    .into_iter()
+                    .map(|r| scan_lo + r.start..scan_lo + r.end)
+                    .collect(),
             };
             if let Some(guard) = guard {
                 spans.retain(|s| s.end <= guard);
@@ -1022,10 +1332,15 @@ impl FindState {
         store.take_matching_in(0..u32::MAX, is_find);
         self.active = None;
         self.active_start = None;
-        if let Some(q) = &self.query {
+        if self.query.is_some() {
             // Scoped find scans only its range; unscoped, the whole document.
             let within = self.scope.clone().unwrap_or(0..buffer.len());
-            let (spans, capped) = scan_buffer(buffer, q, crate::buffer::SCAN_WINDOW, within);
+            // Through the CACHED matcher — the same one every repair uses. None
+            // ⇒ the pattern does not parse ⇒ it matches nothing (until it does).
+            let (spans, capped) = match &self.matcher {
+                Some(m) => scan_buffer(buffer, m, crate::buffer::SCAN_WINDOW, within),
+                None => (Vec::new(), false),
+            };
             self.capped = capped;
             self.coverage_end =
                 if capped { spans.last().map_or(0, |s| s.end) } else { buffer.len() };
@@ -1049,10 +1364,7 @@ impl FindState {
     }
 
     /// Pick the next/previous match relative to the caret and set the active
-    /// id. The live set is the store's `FindMatch` decorations in `(start, id)`
-    /// = document order; collapsed (empty) ones are skipped (normally vacuous,
-    /// since the mover drops them). Sitting exactly on a match steps by position
-    /// (repeated-press cycling); otherwise it scans from `head` and wraps.
+    /// id: [`pick`](Self::pick) then [`activate`](Self::activate).
     fn navigate(
         &mut self,
         head: u32,
@@ -1060,14 +1372,43 @@ impl FindState {
         store: &DecorationStore,
         forward: bool,
     ) -> Option<Range<u32>> {
+        self.activate(Self::pick(head, selection, store, forward))
+    }
+
+    /// Make `target` (a [`pick`](Self::pick)) the active match and return its
+    /// range — or, with no match to go to, clear the active one. Navigation's
+    /// state half, split from the pure pick so a verb that has to choose the
+    /// match inside its commit (`Document::replace_next`, whose redo must
+    /// restore the selection it advanced to) picks there and activates after.
+    pub(crate) fn activate(&mut self, target: Option<(DecorationId, Range<u32>)>) -> Option<Range<u32>> {
+        let Some((id, range)) = target else {
+            self.active = None;
+            self.active_start = None;
+            return None;
+        };
+        self.active = Some(id);
+        self.active_start = Some(range.start);
+        Some(range)
+    }
+
+    /// The match navigation goes to from the caret, as `(id, range)` — a pure
+    /// read of the store. The live set is the store's `FindMatch` decorations in
+    /// `(start, id)` = document order; collapsed (empty) ones are skipped
+    /// (normally vacuous, since the mover drops them). Sitting exactly on a match
+    /// steps by position (repeated-press cycling); otherwise it scans from `head`
+    /// and wraps. `None` only when there are no matches.
+    pub(crate) fn pick(
+        head: u32,
+        selection: Range<u32>,
+        store: &DecorationStore,
+        forward: bool,
+    ) -> Option<(DecorationId, Range<u32>)> {
         // The live set is the store's `FindMatch` decorations in `(start, id)`
         // order — but we never materialize it. Count, rank, and the r-th match
         // are three O(log) store queries that reproduce the full-list branch
         // table exactly (pinned by `navigate_equals…`).
         let count = store.find_count();
         if count == 0 {
-            self.active = None;
-            self.active_start = None;
             return None;
         }
         // "On a match" ⇔ the find starting at `selection.start` IS `selection`.
@@ -1086,10 +1427,7 @@ impl FindState {
             // Last find with start < head, wrapping before the first to count−1.
             (None, false) => (store.find_rank_before(head) + count - 1) % count,
         };
-        let (id, range) = store.nth_find(pick)?;
-        self.active = Some(id);
-        self.active_start = Some(range.start);
-        Some(range)
+        store.nth_find(pick)
     }
 }
 
@@ -1121,10 +1459,76 @@ mod tests {
     }
 
     #[test]
-    fn case_fold_is_ascii_and_toggled() {
+    fn case_fold_is_toggled() {
         assert_eq!(scan("AbAb", &q("ab", false)), (vec![0..2, 2..4], false));
         assert_eq!(scan("AbAb", &q("ab", true)).0, Vec::<Range<u32>>::new());
         assert_eq!(scan("AbAb", &q("Ab", true)), (vec![0..2, 2..4], false));
+    }
+
+    /// Literal and regex modes fold case IDENTICALLY — Unicode simple case
+    /// folding in both — so toggling `.*` never changes whether `é` finds `É`.
+    /// Expected spans come from Unicode's `CaseFolding.txt` (status C/S), not
+    /// from either engine. The fold partners include ones of a DIFFERENT UTF-8
+    /// length (`K` KELVIN SIGN is 3 bytes, `k` 1; `ſ` LONG S 2, `s` 1; `ẞ` 3,
+    /// `ß` 2), so a literal match's byte length is not the needle's.
+    #[test]
+    fn literal_and_regex_fold_case_identically() {
+        let cases: [(&str, &str, Vec<Range<u32>>); 9] = [
+            ("é", "É é", vec![0..2, 3..5]),
+            ("É", "é É", vec![0..2, 3..5]),
+            // Final sigma folds to σ too (`03C2; C; 03C3`).
+            ("σ", "Σ σ ς", vec![0..2, 3..5, 6..8]),
+            ("Σ", "ς σ", vec![0..2, 3..5]),
+            ("k", "\u{212A} k K", vec![0..3, 4..5, 6..7]),
+            ("s", "\u{17F} S s", vec![0..2, 3..4, 5..6]),
+            ("ß", "\u{1E9E} ß", vec![0..3, 4..6]),
+            ("ſé", "SÉ sé", vec![0..3, 4..7]),
+            // Simple folding only: no multi-char expansions (`ß` ↛ `ss`).
+            ("ss", "ß", vec![]),
+        ];
+        for (needle, text, want) in cases {
+            for regex in [false, true] {
+                let query =
+                    FindQuery { text: needle.into(), case_sensitive: false, regex, ..Default::default() };
+                assert_eq!(scan(text, &query).0, want, "{needle:?} in {text:?} (regex={regex})");
+            }
+        }
+        // Case-sensitive, both modes still tell the forms apart.
+        for regex in [false, true] {
+            let query = FindQuery { text: "é".into(), case_sensitive: true, regex, ..Default::default() };
+            assert_eq!(scan("É é", &query).0, vec![3..5], "case-sensitive (regex={regex})");
+        }
+    }
+
+    /// The claim `LiteralMatcher::fold_width` rests on, taken EXHAUSTIVELY
+    /// from the regex crate (the owner of folding), not from memory: the only
+    /// non-ASCII chars that `(?i)` folds into ASCII are `ſ` LONG S and `K`
+    /// KELVIN SIGN, and the width bound of every ASCII char covers each of its
+    /// fold partners. A Unicode bump that adds a partner fails here, not in a
+    /// silently-too-narrow repair window.
+    #[test]
+    fn fold_width_covers_every_fold_partner_of_ascii() {
+        let all_non_ascii: String = (0x80..=char::MAX as u32).filter_map(char::from_u32).collect();
+        let into_ascii = regex::RegexBuilder::new(r"[\x00-\x7F]")
+            .case_insensitive(true)
+            .build()
+            .expect("compiles");
+        let partners: Vec<char> =
+            into_ascii.find_iter(&all_non_ascii).flat_map(|m| m.as_str().chars()).collect();
+        assert_eq!(partners, ['\u{17F}', '\u{212A}'], "the non-ASCII chars that fold into ASCII");
+        for x in partners {
+            for a in (0u8..0x80).map(char::from) {
+                let pattern = format!("^{}$", regex::escape(a.encode_utf8(&mut [0; 4])));
+                let re = regex::RegexBuilder::new(&pattern).case_insensitive(true).build().unwrap();
+                if re.is_match(x.encode_utf8(&mut [0; 4])) {
+                    assert!(
+                        LiteralMatcher::fold_width(a) >= x.len_utf8() as u32,
+                        "{a:?} folds with {x:?} ({} bytes)",
+                        x.len_utf8()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1140,8 +1544,10 @@ mod tests {
 
     #[test]
     fn scan_equals_the_naive_oracle() {
-        // The memchr fast paths must be bit-identical to the straightforward
-        // naive scan, kept here verbatim as the oracle.
+        // Both literal paths must be bit-identical to the straightforward naive
+        // scan, kept here verbatim as the oracle. Its byte-wise ASCII fold IS
+        // Unicode simple folding on this alphabet (no `k`/`s`, whose fold
+        // partners are non-ASCII, and nothing beyond ASCII).
         fn naive(text: &str, query: &FindQuery) -> (Vec<Range<u32>>, bool) {
             let needle = query.text.as_bytes();
             if needle.is_empty() {
@@ -1212,7 +1618,10 @@ mod tests {
     /// materialized text — spans AND capped flag — for every window size,
     /// including windows tiny enough that matches straddle every seam, the
     /// needle exceeds the window, multibyte chars sit on window ends (the
-    /// boundary-snap paths), and self-overlapping needles cross seams.
+    /// boundary-snap paths), and self-overlapping needles cross seams. The
+    /// KELVIN SIGN / LONG S corpus makes folded matches far longer than their
+    /// needle (`kkkkks` ↔ the 17-byte `KKKKKſ`), so a seam overlap sized from
+    /// the needle rather than the longest match drops the straddlers.
     #[test]
     fn windowed_scan_equals_the_whole_text_scan() {
         let corpora = [
@@ -1225,8 +1634,11 @@ mod tests {
             // small window sizes; matches sit between and across them.
             "ä🦀ab🦀äab日本語ab".repeat(30),
             "🦀🦀🦀ab🦀🦀🦀".repeat(50),
+            "\u{212A}\u{212A}\u{212A}\u{212A}\u{212A}ſ kkkkks KK\u{212A}kKS \u{212A}ſ ks ".repeat(20),
         ];
-        let needles = ["a", "ab", "aa", "aaa", "fox", "FOX", "🦀ä", "ab🦀", "abababababab", "語ab"];
+        let needles = [
+            "a", "ab", "aa", "aaa", "fox", "FOX", "🦀ä", "ab🦀", "abababababab", "語ab", "ks", "kkkkks",
+        ];
         for text in &corpora {
             let b = Buffer::new(text).unwrap();
             let full_text = b.text();
@@ -1234,9 +1646,10 @@ mod tests {
                 for cs in [true, false] {
                     let query = q(needle, cs);
                     let expect = scan(&full_text, &query);
+                    let m = Matcher::compile(&query).expect("a literal compiles");
                     for window in [2, 3, 5, 7, 16, 64, 4096] {
                         assert_eq!(
-                            scan_buffer(&b, &query, window, 0..b.len()),
+                            scan_buffer(&b, &m, window, 0..b.len()),
                             expect,
                             "window {window}, needle {needle:?} (cs={cs}) in {:?}…",
                             &text[..text.len().min(24)]
@@ -1304,20 +1717,223 @@ mod tests {
         assert_eq!(scan("bab", &qr("a*", false)).0, vec![1..2], "only the non-empty hit");
     }
 
-    /// Whole-word compiles to `\b…\b` around the ESCAPED literal, so regex
-    /// metacharacters in a plain whole-word query stay literal.
+    /// A needle whose edge character is punctuation is still findable as a
+    /// whole word — the four repros of the `\b…\b` bug, where `\b` before `(`
+    /// demanded a word character *outside* the match and so could never hold.
+    /// The rule (VS Code's): a side whose edge character is a word character
+    /// needs a non-word neighbour (or the line edge); a side whose edge
+    /// character is a separator matches whatever its neighbour is.
+    #[test]
+    fn whole_word_matches_a_needle_with_punctuation_edges() {
+        assert_eq!(scan(" (foo) ", &qw("(foo", false)).0, vec![1..5], "`(foo` inside parens");
+        assert_eq!(scan("a == b", &qw("==", false)).0, vec![2..4], "an all-punctuation needle");
+        //               0123456789.123456789
+        assert_eq!(
+            scan("foo.bar afoo. foo.", &qw("foo.", false)).0,
+            vec![0..4, 14..18],
+            "the `.` side is free (even against `b`); the `f` side still needs a boundary"
+        );
+        //               0123456789.1234
+        assert_eq!(
+            scan("x = -1; y-1 -12", &qw("-1", false)).0,
+            vec![4..6, 9..11],
+            "the `-` side is free (even against `y`); the `1` side rejects `-12`"
+        );
+    }
+
+    /// A whole-word word needle is still rejected inside a longer word on either
+    /// side — the half of the rule the punctuation fix must not loosen. `_` is a
+    /// word character (the `movement::is_word_char` rule), so `foo_x` is one word.
+    #[test]
+    fn whole_word_still_rejects_a_word_inside_a_longer_word() {
+        //          0123456789.123456789.123456
+        let text = "foobar barfoo foo_x xfoo foo";
+        assert_eq!(scan(text, &qw("foo", false)).0, vec![25..28]);
+        assert_eq!(scan(text, &qw("foo", true)).0, vec![25..28]);
+    }
+
+    /// Whole-word REGEX judges each match by its own real edge characters —
+    /// what the pattern actually matched, not the pattern's spelling — so
+    /// `\(foo` behaves exactly like the literal `(foo`, and an optional
+    /// `\(?` prefix makes the `(` side free only on the matches that took it.
+    #[test]
+    fn whole_word_regex_judges_each_matchs_real_edges() {
+        let qrw = |p: &str| FindQuery {
+            text: p.into(),
+            whole_word: true,
+            regex: true,
+            ..Default::default()
+        };
+        assert_eq!(scan(" (foo) ", &qrw(r"\(foo")).0, vec![1..5], r"`\(foo` ≡ the literal `(foo`");
+        //          0123456789.12
+        let text = "(foo afoo foo";
+        assert_eq!(
+            scan(text, &qrw(r"\(?foo")).0,
+            vec![0..4, 10..13],
+            "the match that took the `(` is free on its left; the bare one inside `afoo` is not"
+        );
+        // The match's own edges, per match: `.foo` hits `(foo` (separator edge,
+        // free) and ` afoo`'s `afoo` (word edge, bounded by the space) but not
+        // `xafoo`'s `afoo` (word edge against `x`).
+        //               0123456789.1234
+        assert_eq!(scan("(foo afoo xafoo", &qrw(".foo")).0, vec![0..4, 5..9]);
+    }
+
+    /// Whole-word compiles the ESCAPED literal, so regex metacharacters in a
+    /// plain whole-word query stay literal.
     #[test]
     fn whole_word_escapes_its_literal() {
         assert_eq!(scan("a.c abc", &qw("a.c", false)).0, vec![0..3], "`.` is literal here");
-        // …and a whole-word REGEX groups the pattern before wrapping it, so
-        // alternation binds inside the boundaries.
+        // …and a whole-word REGEX edge-checks every alternative's match, so
+        // alternation is bounded on both sides of each branch (the old wrapping
+        // needed a `(?:…)` group for this; an edge check never splits a pattern).
         let q = FindQuery {
             text: "foo|bar".into(),
             whole_word: true,
             regex: true,
             ..Default::default()
         };
-        assert_eq!(scan("foo bar foobar", &q).0, vec![0..3, 4..7], "not `\\bfoo|bar\\b`");
+        assert_eq!(scan("foo bar foobar", &q).0, vec![0..3, 4..7], "neither inside `foobar`");
+    }
+
+    /// Replace-all walks the SAME whole-word iteration as the display scan and
+    /// expands each kept match's own groups: the `(fo` inside `(foo` is
+    /// rejected (its `o` edge meets `o`), the other two — `(` edges, free of
+    /// their `x` / space neighbours — are replaced with `$1` expanded.
+    #[test]
+    fn whole_word_regex_replace_expands_only_the_kept_matches() {
+        let q = FindQuery {
+            text: r"\((fo)".into(),
+            whole_word: true,
+            regex: true,
+            ..Default::default()
+        };
+        //          0123456789.1234
+        let text = "(foo) (fo) x(fo";
+        let b = Buffer::new(text).unwrap();
+        let m = Matcher::compile(&q).expect("the pattern compiles");
+        assert_eq!(
+            replacements(&b, &m, 0..b.len(), "<$1>", false),
+            vec![(6..9, "<fo>".to_string()), (12..15, "<fo>".to_string())]
+        );
+        assert_eq!(scan(text, &q).0, vec![6..9, 12..15], "the display scan agrees");
+    }
+
+    /// A rejected whole-word candidate resumes one char past its START, so it
+    /// can never hide a valid match that begins inside it: in `xa-a-a`, `1..4`
+    /// fails against the `x`, and `3..6` — bounded by the `-` — is still found.
+    #[test]
+    fn a_rejected_whole_word_candidate_does_not_hide_a_later_one() {
+        assert_eq!(scan("xa-a-a", &qw("a-a", true)).0, vec![3..6]);
+    }
+
+    /// Without whole-word, the line iterator must be byte-identical to the
+    /// regex crate's own `find_iter` with zero-width hits dropped — the plain
+    /// regex mode routes through the new cursor too, and must not change. The
+    /// empty-match-heavy patterns (`a*|b`, `\b`, `$|a`) are the ones whose
+    /// resume rule differs most visibly if the two ever drift.
+    #[test]
+    fn line_matches_without_whole_word_equal_find_iter() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabet = ['a', 'b', 'A', ' ', '_', '(', 'é', '🦀', '1'];
+        let patterns = [
+            "a", "a*", "a*|b", r"\b", "x?", "[ab]+", "(?:)", "é*", "^", "$|a", ".", r"\w+",
+            "b|", "a??", r"\(a", "🦀|a",
+        ];
+        for pattern in patterns {
+            for cs in [true, false] {
+                let Ok(Matcher::Lines(lm)) = Matcher::compile(&qr(pattern, cs)) else {
+                    panic!("{pattern:?} compiles to the line engine");
+                };
+                for round in 0..60 {
+                    let line: String =
+                        (0..(next() % 24)).map(|_| alphabet[(next() % 9) as usize]).collect();
+                    let want: Vec<Range<usize>> = lm
+                        .re
+                        .find_iter(&line)
+                        .filter(|m| m.start() < m.end())
+                        .map(|m| m.range())
+                        .collect();
+                    let got: Vec<Range<usize>> = lm.find_iter(&line).collect();
+                    assert_eq!(got, want, "round {round}: {pattern:?} (cs={cs}) in {line:?}");
+                }
+            }
+        }
+    }
+
+    /// Whole-word against an INDEPENDENT oracle: the greedy, leftmost,
+    /// non-overlapping set of valid placements, judged byte by byte straight
+    /// from the rule (a side fails only when its edge byte and its neighbour
+    /// are both word bytes; `\n` and the text's ends are never word bytes).
+    /// Random ASCII corpora rich in punctuation, `_`, and newlines, every
+    /// needle both as a whole-word literal AND as the whole-word regex of its
+    /// escape — which must agree (`\(foo` ≡ `(foo`).
+    #[test]
+    fn whole_word_equals_the_naive_placement_oracle() {
+        fn naive(text: &str, needle: &str, cs: bool) -> Vec<Range<u32>> {
+            let (hay, nd) = (text.as_bytes(), needle.as_bytes());
+            let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let mut out = Vec::new();
+            let mut i = 0;
+            while !nd.is_empty() && i + nd.len() <= hay.len() {
+                let (w, j) = (&hay[i..i + nd.len()], i + nd.len());
+                let hit = if cs { w == nd } else { w.eq_ignore_ascii_case(nd) };
+                let left = !(word(w[0]) && i > 0 && word(hay[i - 1]));
+                let right = !(word(w[nd.len() - 1]) && j < hay.len() && word(hay[j]));
+                if hit && left && right {
+                    out.push(i as u32..j as u32);
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let mut rng = 0x0DDB_A11C_AFE5_EED5u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabet = ['a', 'A', 'b', '_', '1', '(', '.', '-', '=', ' ', '\n'];
+        let mut nonempty = 0;
+        for round in 0..400 {
+            let text: String =
+                (0..(next() % 80)).map(|_| alphabet[(next() % 11) as usize]).collect();
+            // Needles never hold `\n`: the line-scoped engine cannot match one.
+            let needle: String =
+                (0..1 + (next() % 4)).map(|_| alphabet[(next() % 10) as usize]).collect();
+            for cs in [true, false] {
+                let want = naive(&text, &needle, cs);
+                nonempty += usize::from(!want.is_empty());
+                assert_eq!(
+                    scan(&text, &qw(&needle, cs)).0,
+                    want,
+                    "round {round}: literal {needle:?} (cs={cs}) in {text:?}"
+                );
+                let as_regex = FindQuery {
+                    text: regex::escape(&needle),
+                    case_sensitive: cs,
+                    whole_word: true,
+                    regex: true,
+                };
+                assert_eq!(
+                    scan(&text, &as_regex).0,
+                    want,
+                    "round {round}: regex {:?} (cs={cs}) in {text:?}",
+                    as_regex.text
+                );
+            }
+        }
+        assert!(nonempty > 100, "the oracle must not pass vacuously ({nonempty} non-empty)");
     }
 
     /// A **scoped** scan must equal the whole-document scan restricted to the
@@ -1341,6 +1957,7 @@ mod tests {
                 for cs in [true, false] {
                     let query = q(needle, cs);
                     let all = scan(&full, &query).0;
+                    let m = Matcher::compile(&query).expect("a literal compiles");
                     for lo in 0..=b.len() {
                         for hi in lo..=b.len() {
                             // Snap the bound the way the scan does, then take
@@ -1355,7 +1972,7 @@ mod tests {
                                 .filter(|m| m.start >= slo && m.end <= shi)
                                 .cloned()
                                 .collect();
-                            let got = scan_buffer(&b, &query, 4096, lo..hi).0;
+                            let got = scan_buffer(&b, &m, 4096, lo..hi).0;
                             // Only compare where the scope opens ON a match
                             // boundary; elsewhere a scope can legitimately expose
                             // a match the greedy full scan skipped.
@@ -1384,8 +2001,9 @@ mod tests {
             let text = "ab".repeat(FIND_MATCH_CAP + extra);
             let b = Buffer::new(&text).unwrap();
             let query = q("ab", true);
+            let m = Matcher::compile(&query).expect("a literal compiles");
             assert_eq!(
-                scan_buffer(&b, &query, 4096, 0..b.len()),
+                scan_buffer(&b, &m, 4096, 0..b.len()),
                 scan(&b.text(), &query),
                 "extra {extra}"
             );

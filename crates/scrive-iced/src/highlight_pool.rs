@@ -53,24 +53,31 @@ thread_local! {
 }
 
 /// One bulk chain segment to tokenize off-thread. `against` is the wrong-guessed
-/// old result on a corrected re-run (enables the early-stop splice); `rev` lets a
-/// worker drop a job an edit has superseded.
+/// old result on a corrected re-run (enables the early-stop splice); `sweep` lets
+/// a worker drop a job a restart has superseded. The job carries its sweep's
+/// `engine` (a cheap `Arc` clone) rather than the worker holding one from spawn
+/// time, so a restart after a theme swap (`CodeEditor`'s
+/// `repaint_after_theme_swap` → [`HighlightPool::restart`]) tokenizes with the
+/// new engine on the SAME long-lived threads. A grammar swap (`.language`,
+/// `load`) does not restart this pool: `CodeEditor::seed_highlight` builds a
+/// fresh one, threads and all.
 struct Job {
+    engine: HighlightEngine,
     idx: usize,
     snapshot: std::sync::Arc<Snapshot>,
     rows: Range<u32>,
     start: SegmentStart,
     spans_for: Range<u32>,
     against: Option<SegmentTokens>,
-    rev: Revision,
+    sweep: u64,
 }
 
-/// A finished segment, echoing the revision so the coordinator can drop stale
-/// work.
+/// A finished segment, echoing its sweep so the coordinator can drop work a
+/// restart has superseded.
 struct Done {
     idx: usize,
     seg: SegmentTokens,
-    rev: Revision,
+    sweep: u64,
 }
 
 /// The worker pool + verification coordinator. Threads are spawned once and live
@@ -78,8 +85,9 @@ struct Done {
 /// workers tokenize only the BULK chain; the viewport is painted synchronously
 /// (see [`HighlightPool::speculate`]).
 pub(crate) struct HighlightPool {
-    /// Grammar/theme handle for the UI-thread speculation + re-runs (the workers
-    /// hold their own clones).
+    /// The current sweep's grammar/theme handle — the document's engine as of
+    /// the last [`HighlightPool::start`]. Used for the UI-thread speculation and
+    /// re-runs, and cloned into every job.
     engine: HighlightEngine,
     /// The document-top fresh state — the coordinator compares each segment's
     /// guessed start against a prior segment's verified end with it.
@@ -87,9 +95,9 @@ pub(crate) struct HighlightPool {
     /// The job queue (a deque; a re-run — critical-path — jumps not-yet-started
     /// bulk segments). The `Condvar` parks idle workers so idle costs no CPU.
     queue: std::sync::Arc<(std::sync::Mutex<std::collections::VecDeque<Job>>, std::sync::Condvar)>,
-    /// The live revision, shared with the workers: a worker drops a job whose
-    /// revision no longer matches BEFORE tokenizing it.
-    cur_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The live sweep, shared with the workers: a worker drops a job whose
+    /// sweep no longer matches BEFORE tokenizing it.
+    cur_sweep: std::sync::Arc<std::sync::atomic::AtomicU64>,
     done_rx: std::sync::mpsc::Receiver<Done>,
     _workers: Vec<std::thread::JoinHandle<()>>,
     /// The snapshot the current sweep tokenizes; each job carries a clone.
@@ -97,6 +105,11 @@ pub(crate) struct HighlightPool {
     /// The revision the current sweep is for — `CodeEditor` compares it against
     /// the live document revision to decide whether to restart.
     pub(crate) rev: Revision,
+    /// The current sweep's number, bumped by every [`HighlightPool::start`] —
+    /// what jobs and results are tagged with. NOT the revision: a theme swap
+    /// restarts the sweep at the SAME revision, and the outgoing sweep's
+    /// still-arriving results must not be mistaken for the new one's.
+    sweep: u64,
     /// The segment ranges of the current sweep (for re-dispatching a re-run).
     seg_rows: Vec<Range<u32>>,
     results: Vec<Option<SegmentTokens>>,
@@ -120,12 +133,11 @@ impl HighlightPool {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
         let queue: std::sync::Arc<(std::sync::Mutex<std::collections::VecDeque<Job>>, std::sync::Condvar)> =
             std::sync::Arc::new((std::sync::Mutex::new(std::collections::VecDeque::new()), std::sync::Condvar::new()));
-        let cur_rev = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(doc.revision().0));
+        let cur_sweep = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let workers = (0..count)
             .map(|_| {
-                let engine = engine.clone();
                 let queue = queue.clone();
-                let cur_rev = cur_rev.clone();
+                let cur_sweep = cur_sweep.clone();
                 let done_tx = done_tx.clone();
                 std::thread::spawn(move || loop {
                     let job = {
@@ -136,16 +148,16 @@ impl HighlightPool {
                         }
                         q.pop_front().unwrap()
                     };
-                    // Drop a stale job (an edit restarted the sweep) BEFORE
-                    // spending a full tokenization on it.
-                    if job.rev.0 != cur_rev.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Drop a stale job (an edit or a theme swap restarted the
+                    // sweep) BEFORE spending a full tokenization on it.
+                    if job.sweep != cur_sweep.load(std::sync::atomic::Ordering::Relaxed) {
                         continue;
                     }
                     let seg = scrive_core::tokenize_segment(
-                        &engine, &job.snapshot, job.rows, job.start, Some(job.spans_for),
+                        &job.engine, &job.snapshot, job.rows, job.start, Some(job.spans_for),
                         job.against.as_ref(),
                     );
-                    let _ = done_tx.send(Done { idx: job.idx, seg, rev: job.rev });
+                    let _ = done_tx.send(Done { idx: job.idx, seg, sweep: job.sweep });
                 })
             })
             .collect();
@@ -154,11 +166,12 @@ impl HighlightPool {
             engine,
             fresh,
             queue,
-            cur_rev,
+            cur_sweep,
             done_rx,
             _workers: workers,
             snapshot: std::sync::Arc::new(doc.snapshot()),
             rev: doc.revision(),
+            sweep: 0,
             seg_rows: Vec::new(),
             results: Vec::new(),
             next_verify: 0,
@@ -170,15 +183,25 @@ impl HighlightPool {
         Some(pool)
     }
 
-    /// (Re)dispatch a full sweep at the document's current revision — the initial
-    /// run and the post-edit restart both come here. The verified prefix already
-    /// absorbed survives (it rides `on_commit`); this re-sweeps from row 0 with a
-    /// fresh snapshot.
+    /// (Re)dispatch a full sweep at the document's current revision AND engine —
+    /// the initial run, the post-edit restart, and the post-theme-swap restart
+    /// all come here. The verified prefix already absorbed survives an edit (it
+    /// rides `on_commit`); this re-sweeps from row 0 with a fresh snapshot.
     fn start(&mut self, doc: &Document, viewport: Range<u32>) {
         self.rev = doc.revision();
-        // Publish the new revision to the workers and DRAIN the stale queue, so a
-        // restart does not pile prior-revision jobs ahead of the current chain.
-        self.cur_rev.store(self.rev.0, std::sync::atomic::Ordering::Relaxed);
+        // Re-read the engine every sweep: the document refuses segments from any
+        // engine but its current one, and a theme swap replaces it without
+        // moving the revision. (`None` — no highlighter — cannot follow a
+        // pool's creation; keeping the old handle is harmless, nothing absorbs.)
+        if let Some(engine) = doc.highlight_engine() {
+            self.fresh = engine.fresh_boundary();
+            self.engine = engine;
+        }
+        // A new sweep number, published to the workers, and DRAIN the stale
+        // queue, so a restart does not pile prior-sweep jobs ahead of the
+        // current chain (and their in-flight results are dropped on arrival).
+        self.sweep = self.sweep.wrapping_add(1);
+        self.cur_sweep.store(self.sweep, std::sync::atomic::Ordering::Relaxed);
         self.queue.0.lock().unwrap().clear();
         self.snapshot = std::sync::Arc::new(doc.snapshot());
         let n = self.snapshot.line_count();
@@ -198,13 +221,14 @@ impl HighlightPool {
         let mut q = lock.lock().unwrap();
         for (idx, rows) in self.seg_rows.iter().enumerate() {
             q.push_back(Job {
+                engine: self.engine.clone(),
                 idx,
                 snapshot: self.snapshot.clone(),
                 rows: rows.clone(),
                 start: SegmentStart::Fresh,
                 spans_for: self.window.clone(),
                 against: None,
-                rev: self.rev,
+                sweep: self.sweep,
             });
         }
         cvar.notify_all();
@@ -218,9 +242,11 @@ impl HighlightPool {
         self.window = scrive_core::padded_highlight_window(viewport, n);
     }
 
-    /// Restart the sweep after an edit (fresh snapshot) AND repaint the viewport
-    /// now — the pair must go together: a bare `start` leaves the visible rows
-    /// showing pre-edit colours until the chain verifies down to them.
+    /// Restart the sweep after an edit (fresh snapshot) or a theme swap (fresh
+    /// engine; a grammar swap builds a fresh pool instead) AND repaint the
+    /// viewport now — the pair must go together:
+    /// a bare `start` leaves the visible rows showing stale colours until the
+    /// chain verifies down to them.
     pub(crate) fn restart(&mut self, doc: &mut Document, viewport: Range<u32>) {
         self.start(doc, viewport.clone());
         self.speculate(doc, viewport);
@@ -265,9 +291,7 @@ impl HighlightPool {
     /// subscription resumes it next frame.
     pub(crate) fn poll(&mut self, doc: &mut Document) {
         while let Ok(done) = self.done_rx.try_recv() {
-            if done.rev == self.rev {
-                self.results[done.idx] = Some(done.seg);
-            } // else stale — drop it
+            self.intake(done);
         }
         let mut verified = 0usize;
         let mut reruns = 0usize;
@@ -313,6 +337,14 @@ impl HighlightPool {
             self.active = false;
         }
     }
+
+    /// File one finished job into the current sweep's results, or drop it if
+    /// it belongs to a superseded sweep — the ONE staleness rule for arrivals.
+    fn intake(&mut self, done: Done) {
+        if done.sweep == self.sweep {
+            self.results[done.idx] = Some(done.seg);
+        } // else stale — drop it
+    }
 }
 
 #[cfg(test)]
@@ -355,9 +387,11 @@ mod tests {
         let mut pool = HighlightPool::new(&doc, 0..N as u32).expect("grammar → engine");
 
         // Neutralize the worker sweep `new` dispatched so `results` is entirely
-        // under test control (retag to an unused revision, stop workers, drain).
+        // under test control (retag to an unused revision and sweep, stop
+        // workers, drain).
         pool.rev = scrive_core::Revision(u64::MAX);
-        pool.cur_rev.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        pool.sweep = u64::MAX;
+        pool.cur_sweep.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         pool.queue.0.lock().unwrap().clear();
         while pool.done_rx.try_recv().is_ok() {}
 
@@ -416,5 +450,50 @@ mod tests {
         assert_eq!(pool.next_verify, N, "every segment verified");
         assert!(!pool.active, "active clears only once the document is fully verified");
         assert!(frames > 1, "verification was paced across frames, not drained in one");
+    }
+
+    /// A theme swap leaves the revision where it was, so the revision alone
+    /// cannot tell the pool its sweep went stale. `restart` must therefore (a)
+    /// drop the previous sweep's results still arriving — they match the
+    /// revision but were tokenized by the outgoing engine — and (b) sweep with
+    /// the document's NEW engine, or the document refuses every segment and a
+    /// large buffer silently falls back to the synchronous walk. Fails-first
+    /// against a pool that tagged work by revision and kept its spawn-time engine.
+    #[test]
+    fn restart_after_a_theme_swap_adopts_the_new_engine_and_drops_the_old_sweep() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // 200 rows: the pool's padded window spans the whole document, so its
+        // segments carry spans for every row and accepted absorbs alone clean
+        // the frontier — no synchronous walk is ever run here.
+        let mut doc = grammar_doc(&"x\n".repeat(199));
+        let mut pool = HighlightPool::new(&doc, 0..40).expect("grammar → engine");
+        // Hold the first sweep's finished results: in-flight work at the swap.
+        let mut in_flight = Vec::new();
+        while in_flight.len() < pool.seg_rows.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            in_flight.push(pool.done_rx.recv_timeout(left).expect("the first sweep finishes"));
+        }
+
+        // An identical theme still mints a new engine: identity, not content.
+        doc.set_theme(crate::scrive_dark_theme());
+        pool.restart(&mut doc, 0..40);
+        for done in in_flight {
+            pool.intake(done); // the old sweep's results arrive after the restart
+        }
+        assert!(
+            pool.results.iter().all(Option::is_none),
+            "results from the sweep before the restart must be dropped",
+        );
+
+        while pool.active {
+            pool.poll(&mut doc);
+            assert!(std::time::Instant::now() < deadline, "the restarted sweep never finished");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            doc.highlight_frontier(),
+            None,
+            "the document accepted every verified segment — the pool swept with its current engine",
+        );
     }
 }

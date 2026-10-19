@@ -20,7 +20,7 @@
 //! - store text / convert coordinates → [`buffer`], [`coords`]
 //! - apply an edit / undo / redo → [`transaction`], [`history`]
 //! - move or extend the caret → [`selection`], [`movement`]
-//! - type / paste / indent → [`verbs`]
+//! - type / paste / indent / move or copy a line → [`verbs`]
 //! - expand tabs to columns → [`display_map`]
 //! - syntax-highlight a line → [`highlight`]
 //! - attach diagnostics / snippet stops → [`decorations`]
@@ -33,6 +33,7 @@ mod autoclose; // auto-close pair rules (crate-internal)
 pub mod bracket;
 mod bracket_tree; // bracket matching on the SumTree (shape monoid)
 pub mod buffer;
+mod change_log; // the opt-in incremental change log behind `Document::drain_changes` (crate-internal)
 pub mod coords;
 pub mod decorations;
 pub mod display_map;

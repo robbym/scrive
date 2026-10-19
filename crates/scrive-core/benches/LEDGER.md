@@ -318,3 +318,111 @@ Document-scale multi-caret typing WITH a config set is therefore O(carets·log²
 per commit rather than bulk O(brackets): bounded by caret count (the edit
 dimension), not document size — no doc-scaling regression — but a real constant
 on that one scenario. Not benched here; a `keystroke_aware` cell would pin it.
+
+## Find — Unicode case folding in literal mode
+
+A case-insensitive literal now folds exactly as regex mode does (Unicode simple
+folding: `é`/`É`, `σ`/`Σ`/`ς`, `k`/`K` KELVIN SIGN), by matching through the
+regex crate's `(?i)` over the needle's escape instead of the old ASCII-only
+`memchr2` + `eq_ignore_ascii_case` scan. Folded matches can be a different byte
+length than the needle (`K` is 3 bytes), so the literal path's fixed `k`
+became a bound: the per-char `fold_width` (exact for ASCII, 4 beyond it).
+
+`find` group, medians, pre → post (`FindQuery::new("return")`, case-insensitive):
+
+| | 100 KB | 1 MB | 10 MB |
+|---|---|---|---|
+| `find/set_query`                | 209 µs → 410 µs  | 1.46 ms → 2.15 ms | 31.3 ms → 22.4 ms |
+| `find/keystroke_while_active`   | 162 µs → 158 µs  | 1.12 ms → 1.07 ms | 21.9 ms → 21.1 ms |
+| `find/navigate_big_set` (1 MB)  | —                | 1.07 µs → 0.97 µs | —                 |
+
+No class change anywhere: the scan is still O(bytes-until-cap), the repair
+still O(edit window). The keystroke row is flat **because** the bound is
+tight for ASCII: a first cut at a flat 4-bytes-per-char bound measured +50% per
+keystroke on this corpus (dense `return` hits — a 6× wider repair window tears
+out and re-inserts matches it did not need to). The 10 MB `set_query` drop has
+no mechanism in this change; read it as run-to-run noise (other builds were
+running on the machine throughout both runs).
+
+**Residual, honestly:** `set_query` pays two new constants. (1) Compiling
+`(?i)<needle>` — about 40–200 µs per query change in isolation (more for a
+needle with `s`/`k`, whose classes gain the 2–3-byte partners), so a find-bar
+keystroke on a small document is now compile-bound rather than scan-bound. (2)
+About 50–100 ns more per dense hit than the byte compare it replaces (1 MB,
+10k hits: ~0.86 → ~1.3 ms isolated). Both are per query change, never per
+document keystroke. An exact ASCII fast path (an ASCII needle without `k`/`s`
+has only ASCII fold partners — the fact `fold_width` already rests on, pinned
+exhaustively) would win them back at the price of a second matcher; not taken,
+so folding has one owner.
+
+## Core-bug fixes — host clipping, whole-word find, undo/redo (2026-10-19)
+
+The hot paths this run changed that had no numbers yet: `Buffer::point_to_offset`
+(host clipping added a char-boundary snap), the whole-word find engine (the
+`\b…\b` wrap became a per-match edge check), and undo/redo (now restoring the
+unit's whole selection set; the review fix then made the restore's caret
+ejection read the memoized fold map instead of building a throwaway one). New
+cells and one new group cover them: `find/{set_query,keystroke}_whole_word`,
+`keystroke/{undo,redo}_multicaret_folded_1m`, and `position/point_to_offset`.
+
+Master (`d56da01`, exported with this bench file) and this branch, back-to-back
+on the same box, medians. Other worktrees were building during the runs; an
+identical-code rerun of the folded undo/redo cells moved 3–7%, so read anything
+under ~7% as noise (the stage-3 section's ±5–9% floor).
+
+| bench | 100 KB | 1 MB | 10 MB |
+|---|---|---|---|
+| `position/point_to_offset` (NEW, 1,024 calls) | 154 → 113 µs | 170 → 130 µs | 205 → 163 µs |
+| `find/set_query_whole_word` (NEW) | 1.70 → 1.43 ms | 9.70 → 8.83 ms | 30.4 → 29.5 ms |
+| `find/keystroke_whole_word` (NEW) | 182 → 180 µs | 1.25 → 1.10 ms | 21.8 → 20.9 ms |
+| `keystroke/undo_step` | 106 → 107 µs | 954 → 927 µs | 20.7 → 21.8 ms |
+| `keystroke/insert_mid` | 154 → 148 µs | 994 → 982 µs | 22.5 → 23.1 ms |
+| `find/set_query` (literal, folding) | 153 → 310 µs | 1.34 → 2.02 ms | 21.6 → 22.6 ms |
+
+- **`point_to_offset`: faster, not slower.** The snap costs one chunk descent,
+  and `Rope::point_to_offset` dropped a redundant line seek in the same change
+  (rope.rs: "no net descent"), so the door with the clip in it now runs
+  −20…27% (≈150 → 110 ns a call at 100 KB). No class change: O(log chunks).
+- **Whole-word find: no class change.** The query-change scan is still
+  O(document) and line-scoped, the keystroke repair still O(the touched lines);
+  the 10 MB keystroke row sits on the same ~21 ms floor as every other 10 MB
+  keystroke cell, plain typing included, so that floor is not the repair's.
+  `set_query` came out faster at 100 KB / 1 MB (−16% / −9%) and level at 10 MB
+  — plausibly the engine no longer evaluating `\b` assertions, not measured
+  separately.
+- **Single-caret undo: flat.** The selection restore's per-unit snapshot is a
+  one-selection clone.
+- The literal `set_query` rise is the case folding's `(?i)` compile and fold,
+  recorded in its own section above — reproduced here, not new.
+
+Undo/redo of a multi-caret unit over a document-scale fold set (1 MB: 4,352
+collapsed `fn` bodies and a caret on each block's comment line, one char typed;
+the measured step ends with the frame's `fold_map` read). Three trees, one
+back-to-back run: master; the integration tip with the selection restore but
+before the review fix (`0629b75`); this branch:
+
+| bench | master | selection restore, pre-fix | branch |
+|---|---|---|---|
+| `keystroke/undo_multicaret_folded_1m` (NEW) | 12.0 ms | 14.0 ms | 12.6 ms |
+| `keystroke/redo_multicaret_folded_1m` (NEW) | 11.5 ms | 14.0 ms | 12.1 ms |
+
+The selection restore alone cost ~2 ms here: restoring 4,352 carets instead of
+one, plus ejecting them through a throwaway `FoldMap::new` that the next frame's
+`fold_map` then rebuilt — two O(folds) builds per undo/redo. Routing the
+ejection through the memo (the review fix) makes that build the frame's,
+recovering ~1.4–1.9 ms; what remains over master (~0.5 ms, inside the noise) is
+the restore itself. The
+complexity class is pinned by op count, not here: `perf_gate`'s
+`undo_redo_over_folds_and_carets_is_linear` (N carets over N folds, 2.00×) and
+`undo_redo_is_size_independent` (1.00×), and `undo_and_redo_build_the_fold_map_once`
+counts the builds.
+
+**Residual, honestly:** undo and redo stay O(folds) per press — the whole-set
+`reconcile_folds` bumps the fold generation unconditionally, so one rebuild is
+the floor; shifting the memo through the replayed patches (as the forward edit
+path does) would need reconcile to bump only when it drops a fold. And history
+now holds two selection sets per undo unit: memory proportional to carets ×
+units, cloned only when an edit opens a unit (a merged typing run clones
+nothing). The replace path is a discrete action and is not benched; the review
+fix removed a pattern compile from every `replace_next` / `replace_all` press
+(40–200 µs per compile, per the Unicode case-folding section).

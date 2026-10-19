@@ -1,7 +1,18 @@
-//! The editing verbs: type, backspace, delete, enter, paste, and (out)dent.
+//! The editing verbs: type, backspace, delete, enter, paste, (out)dent, and
+//! move / copy line.
 //! Each turns the current selections into one atomic multi-range transaction,
 //! then places a caret after each edit — so every verb is multi-cursor-correct
-//! for free (one op per selection).
+//! for free (one op per selection). The placement is handed to the commit
+//! itself (`Document::edit_placing`), never assigned once the edit returns, so
+//! history records it as the unit's after-selections and redo restores exactly
+//! the carets the verb left.
+//!
+//! The one catch is deletion: a selection's delete can reach past its
+//! neighbour (a tab-stop backspace, a word, a line block), so delete verbs
+//! merge their ranges first (`merge_delete_ranges`) — the engine rejects
+//! overlapping ops — and every verb commits through `verb_commit`, which turns
+//! an overlap that slipped through into a debug panic instead of a keystroke
+//! that silently does nothing.
 //!
 //! Two load-bearing semantics live here: **typing over a selection replaces
 //! it** (one transaction, caret after), and **Enter's autoindent is the leading
@@ -20,16 +31,21 @@ use crate::buffer::Buffer;
 use crate::coords::Point;
 use crate::document::Document;
 use crate::history::{GroupingHint, OpClass};
+use crate::patch::Patch;
 use crate::row_layout::tail_start_col;
 use crate::selection::{Selection, SelectionSet};
-use crate::transaction::EditOp;
+use crate::transaction::{Committed, EditOp, TransactionError};
 
-/// Spaces per indent level, the width Tab and the indent verbs insert.
+/// Spaces per indent level: the stop spacing Tab, Shift+Tab, the block
+/// (out)dent and backspace's tab-stop delete use on a space-indented line (a
+/// tab-indented line moves by one hard tab instead).
 ///
 /// Deliberately a SEPARATE knob from [`crate::display_map::default_tab_size`]
 /// (an *editing* width vs a *display* width — mainstream editors keep both).
 /// They happen to share the value 4; if either ever changes, the widget's
 /// indent guides key on the display knob and Tab/indent verbs on this one.
+/// Space stops after a hard tab count from the tab, so they line up with the
+/// drawn ones while the display width is a multiple of this one.
 #[must_use]
 pub fn default_indent_size() -> u32 {
     4
@@ -149,24 +165,26 @@ impl Document {
             })
             .collect();
         let hint = GroupingHint { op: OpClass::Type, seal_before: true, seal_after: false };
-        let Ok(committed) = self.edit_grouped(ops, hint) else {
-            return true; // ops are disjoint by construction
-        };
         // A caret just after each opener; provenance for the paired ones.
         let close_len = close.len_utf8() as u32;
-        let edits = committed.patch().edits();
-        let mut carets = Vec::with_capacity(edits.len());
         let mut pairs = Vec::new();
-        for (e, &pair) in edits.iter().zip(&plan) {
-            if pair {
-                let close_off = e.new.end - close_len; // start of the close char
-                carets.push(close_off); // caret between open and close
-                pairs.push((e.new.start, close_off)); // [open, close)
-            } else {
-                carets.push(e.new.end); // after the bare opener
+        let placed = self.edit_placing(ops, hint, |patch, _| {
+            let edits = patch.edits();
+            let mut carets = Vec::with_capacity(edits.len());
+            for (e, &pair) in edits.iter().zip(&plan) {
+                if pair {
+                    let close_off = e.new.end - close_len; // start of the close char
+                    carets.push(close_off); // caret between open and close
+                    pairs.push((e.new.start, close_off)); // [open, close)
+                } else {
+                    carets.push(e.new.end); // after the bare opener
+                }
             }
+            Some(SelectionSet::from_offsets(&carets))
+        });
+        if !verb_commit(placed) {
+            return true; // refused: no pair landed, so no provenance to record
         }
-        self.selections = SelectionSet::from_offsets(&carets);
         if !pairs.is_empty() {
             // Supersede any prior provenance — e.g. an outer pair whose tracked
             // range grew to enclose this insertion (nested `(` inside `()`) — so
@@ -208,18 +226,12 @@ impl Document {
                 EditOp::new(s.start()..s.end(), &wrapped)
             })
             .collect();
-        let Ok(committed) = self.edit_grouped(ops, GroupingHint::discrete()) else {
-            return true;
-        };
         // Each selection stays on its interior, read straight from the edits.
-        let ranges: Vec<(u32, u32)> = committed
-            .patch()
-            .edits()
-            .iter()
-            .map(|e| (e.new.start + open_len, e.new.end - close_len))
-            .collect();
-        let newest = ranges.len() - 1;
-        self.selections = SelectionSet::from_ranges(&ranges, newest);
+        verb_commit(self.edit_placing(ops, GroupingHint::discrete(), |patch, _| {
+            let ranges: Vec<(u32, u32)> =
+                patch.edits().iter().map(|e| (e.new.start + open_len, e.new.end - close_len)).collect();
+            Some(SelectionSet::from_ranges(&ranges, ranges.len() - 1))
+        }));
         true
     }
 
@@ -308,14 +320,15 @@ impl Document {
             let ops = starts.into_iter().map(|at| EditOp::new(at..at, text)).collect();
             // `edit_grouped` rebases the selections through the patch — never
             // `run_edit`, whose caret-after would yank the caret off its line.
-            let _ = self.edit_grouped(ops, GroupingHint::discrete());
+            verb_commit(self.edit_grouped(ops, GroupingHint::discrete()));
             return;
         }
         self.insert_text(text);
     }
 
     /// Backspace: delete the selection, or the character before an empty caret
-    /// (to the previous tab stop when the caret sits in leading whitespace).
+    /// — one indent level when the caret sits in leading whitespace: a hard
+    /// tab, or spaces back to the previous stop (the unit Shift+Tab removes).
     pub fn backspace(&mut self) {
         // Pair-backspace: every empty caret strictly between a live *empty*
         // pair deletes both chars (`open + 1 == close` ⇒ nothing typed between
@@ -334,14 +347,12 @@ impl Document {
                 .map(|s| s.is_empty().then(|| empty_pair_at(s.head())).flatten())
                 .collect();
             if let Some(pairs) = pairs {
-                let ops: Vec<EditOp> = pairs
-                    .iter()
-                    .map(|r| {
-                        let close_len =
-                            self.buffer.char_at(r.end).map_or(1, |c| c.len_utf8() as u32);
-                        EditOp::delete(r.start..r.end + close_len)
-                    })
-                    .collect();
+                // Distinct carets sit in distinct (disjoint) pairs, so these
+                // only ever touch — merged anyway, like every delete verb.
+                let ops = merge_delete_ranges(pairs.iter().map(|r| {
+                    let close_len = self.buffer.char_at(r.end).map_or(1, |c| c.len_utf8() as u32);
+                    r.start..r.end + close_len
+                }));
                 self.clear_autoclose();
                 let hint =
                     GroupingHint { op: OpClass::Delete, seal_before: true, seal_after: true };
@@ -350,18 +361,21 @@ impl Document {
             }
         }
         let buffer = &self.buffer;
-        let ops = self.selections.all().iter().filter_map(|sel| {
+        let ranges = self.selections.all().iter().filter_map(|sel| {
             if !sel.is_empty() {
-                return Some(EditOp::delete(sel.start()..sel.end()));
+                return Some(sel.start()..sel.end());
             }
             let caret = sel.head();
             if caret == 0 {
                 return None;
             }
-            let start = backspace_target(buffer, caret);
-            Some(EditOp::delete(start..caret))
+            Some(backspace_target(buffer, caret)..caret)
         });
-        let ops: Vec<_> = ops.collect();
+        // A tab-stop delete reaches back past its own caret's neighbourhood —
+        // carets at cols 3 and 4 both delete to stop 0 (`0..3`, `0..4`), and a
+        // caret deletes straight through a selection inside its indent run —
+        // so the ranges can OVERLAP and must merge before the transaction.
+        let ops = merge_delete_ranges(ranges);
         self.run_edit(ops, GroupingHint::mergeable(OpClass::Delete));
     }
 
@@ -370,22 +384,21 @@ impl Document {
     pub fn delete_forward(&mut self) {
         let len = self.buffer.len();
         let buffer = &self.buffer;
-        let ops: Vec<_> = self
-            .selections
-            .all()
-            .iter()
-            .filter_map(|sel| {
-                if !sel.is_empty() {
-                    return Some(EditOp::delete(sel.start()..sel.end()));
-                }
-                let caret = sel.head();
-                if caret >= len {
-                    return None;
-                }
-                let next = buffer.char_at(caret).expect("caret < len");
-                Some(EditOp::delete(caret..caret + next.len_utf8() as u32))
-            })
-            .collect();
+        let ranges = self.selections.all().iter().filter_map(|sel| {
+            if !sel.is_empty() {
+                return Some(sel.start()..sel.end());
+            }
+            let caret = sel.head();
+            if caret >= len {
+                return None;
+            }
+            let next = buffer.char_at(caret).expect("caret < len");
+            Some(caret..caret + next.len_utf8() as u32)
+        });
+        // One char forward from a caret can only TOUCH the next selection (a
+        // caret touching a selection merged into it), never overlap — merged
+        // anyway, so every delete verb builds its ops the same disjoint way.
+        let ops = merge_delete_ranges(ranges);
         self.run_edit(ops, GroupingHint::mergeable(OpClass::Delete));
     }
 
@@ -397,7 +410,7 @@ impl Document {
     /// Two carets inside one word yield *overlapping* delete ranges, which the
     /// transaction engine rejects — so the ranges are merged first (the shared
     /// span is deleted once and the carets collapse via the selection merge
-    /// rule), the one verb that can produce overlap.
+    /// rule), as for every delete verb.
     pub fn delete_word_back(&mut self) {
         let buffer = &self.buffer;
         let ranges = self.selections.all().iter().filter_map(|sel| {
@@ -479,49 +492,90 @@ impl Document {
             })
             .collect();
         let hint = GroupingHint { op: OpClass::Type, seal_before: true, seal_after: false };
-        let Ok(committed) = self.edit_grouped(ops, hint) else {
-            return;
-        };
-        if committed.is_empty() {
-            return;
-        }
         // `run_edit`'s caret-after, minus each op's rule-(b) pull-back.
-        let carets: Vec<u32> = committed
-            .patch()
-            .edits()
-            .iter()
-            .zip(&backs)
-            .map(|(e, back)| e.new.end - back)
-            .collect();
-        self.selections = SelectionSet::from_offsets(&carets);
+        verb_commit(self.edit_placing(ops, hint, |patch, _| Some(carets_pulled_back(patch, &backs))));
     }
 
-    /// Tab: at an empty caret insert spaces to the next indent stop; over a
-    /// non-empty selection indent every spanned line one level.
+    /// Tab: at an empty caret insert one indent unit of the caret's line — a
+    /// hard tab on a tab-indented line, else spaces to the next indent stop;
+    /// over a single-line selection type that unit over it; over a multi-line
+    /// selection indent every spanned line one level, each by its own unit
+    /// (the indent-unit rule Enter and Shift+Tab share). The unit goes at the
+    /// caret, or in the selection's place, except from a caret or selection
+    /// ending ahead of a mixed indent's trailing run (the `··` of `··\t`, the
+    /// `\t` of `\t··`): there the selection is deleted and the unit goes where
+    /// block indent puts it, so no Tab interleaves kinds within a line's
+    /// indent. VS Code types the unit in the selection's place even there — a
+    /// `·` selected in `··\t` becomes `\t·\t` — which is exactly the
+    /// interleave; deleting the selection still replaces it with one level,
+    /// just not between chars of the other kind.
     pub fn tab(&mut self) {
-        let indent = default_indent_size();
         if self.selection_spans_multiple_lines() {
             // Multi-line selection → indent the whole block, selection preserved.
-            self.indent_lines(indent as i32);
+            self.indent_lines(true);
         } else {
-            // Carets and single-line selections → insert / replace-with spaces to
-            // the next tab stop. A single-line selection *types over* (as
-            // mainstream editors do): it does NOT indent the whole line.
-            let ops = self.map_selections(|start, end, buffer| {
-                let col = buffer.offset_to_point(start).col;
-                let n = indent - (col % indent);
-                EditOp::new(start..end, " ".repeat(n as usize))
-            });
-            self.run_edit(ops, GroupingHint::discrete());
+            // Carets and single-line selections → insert / replace-with one
+            // unit. A single-line selection *types over* (as mainstream editors
+            // do): it does NOT indent the whole line.
+            let buffer = &self.buffer;
+            let sels = self.selections.all();
+            let mut ops = Vec::with_capacity(sels.len());
+            for sel in sels {
+                let (start, end) = (sel.start(), sel.end());
+                let p = buffer.offset_to_point(start);
+                let line = buffer.line(p.row);
+                let ws = leading_ws(&line);
+                // The LINE's kind (its whole leading whitespace), not the
+                // prefix's: a caret at column 0 of `\tfoo` must add a tab,
+                // where the empty prefix alone would say spaces.
+                let unit = IndentUnit::of(ws);
+                // A caret or selection ENDING ahead of the trailing run of the
+                // unit's char would drop the unit between chars of the OTHER
+                // kind (`\t··\t`). It takes block indent's insertion instead —
+                // the run's start, one level padded as block indent pads it —
+                // and a selection is still typed over: deleted where it lies.
+                // Ending in or at an edge of the run (or past the indent), the
+                // unit's own char joins its own run: in the selection's place,
+                // padded from there (VS Code's caret Tab).
+                let end_col = p.col + (end - start); // single-line: same row
+                if end_col < level_start(ws, unit) {
+                    if start < end {
+                        ops.push(EditOp::delete(start..end));
+                    }
+                    let (at, text) = indent_insert(ws);
+                    let mut at = start - p.col + at;
+                    // A later selection typing over the run's start (it starts
+                    // ahead of the run and ends in it) holds `at` strictly
+                    // inside — an overlap. The run then starts where that
+                    // selection does, so the unit goes there, touching its op.
+                    // Sorted and disjoint ⇒ at most one selection holds `at`.
+                    let over = sels.get(sels.partition_point(|o| o.end() <= at));
+                    if let Some(over) = over.filter(|o| o.start() < at) {
+                        at = over.start();
+                    }
+                    ops.push(EditOp::insert(at, text));
+                } else {
+                    ops.push(EditOp::new(start..end, unit.text(&line[..p.col as usize])));
+                }
+            }
+            // A caret just past each typed unit: every unit is non-empty text,
+            // so the edits that insert are exactly the units — the type-over
+            // deletes (empty post-edit ranges) carry no caret.
+            verb_commit(self.edit_placing(ops, GroupingHint::discrete(), |patch, _| {
+                let carets: Vec<u32> =
+                    patch.edits().iter().filter(|e| !e.new.is_empty()).map(|e| e.new.end).collect();
+                Some(SelectionSet::from_offsets(&carets))
+            }));
         }
     }
 
-    /// Shift+Tab: outdent every spanned line by one indent level. Unlike Tab
+    /// Shift+Tab: outdent every spanned line by one indent level — its last
+    /// hard tab, or its trailing spaces back to the previous stop. Unlike Tab
     /// (which types over a single-line selection), Shift+Tab always outdents —
     /// carets, single-line selections, and multi-line selections alike; the
     /// selection is preserved.
     pub fn outdent(&mut self) {
-        self.indent_lines(-(default_indent_size() as i32));
+        self.indent_lines(false);
     }
 
     /// Delete each selection's whole-line block (Ctrl+Shift+K) — the one
@@ -536,7 +590,7 @@ impl Document {
 
     /// THE whole-line **deletion block** for a selection: every spanned line
     /// (a selection ending exactly at a line start does not span it — the
-    /// [`last_spanned_offset`] rule shared with `spanned_rows`) plus ONE
+    /// [`last_spanned_offset`] rule shared with `line_runs`) plus ONE
     /// bounding newline: the trailing one, or, when the block reaches the
     /// buffer's final line, the PRECEDING one — so no empty tail line is left
     /// behind. Shared by [`Document::delete_line`] and the
@@ -566,7 +620,7 @@ impl Document {
         for sel in self.selections.all() {
             let row = buffer.offset_to_point(sel.head()).row;
             let line = buffer.line(row);
-            let indent = &line[..tail_start_col(&line) as usize];
+            let indent = leading_ws(&line);
             if down {
                 let at = buffer.point_to_offset(Point::new(row, buffer.line_len(row)));
                 if ops.last().is_some_and(|op| op.range.start == at) {
@@ -591,20 +645,89 @@ impl Document {
                 backs.push(1);
             }
         }
-        let Ok(committed) = self.edit_grouped(ops, GroupingHint::discrete()) else {
-            return;
-        };
-        if committed.is_empty() {
-            return;
-        }
-        let carets: Vec<u32> = committed
-            .patch()
-            .edits()
-            .iter()
-            .zip(&backs)
-            .map(|(e, back)| e.new.end - back)
-            .collect();
-        self.selections = SelectionSet::from_offsets(&carets);
+        verb_commit(self.edit_placing(ops, GroupingHint::discrete(), |patch, _| {
+            Some(carets_pulled_back(patch, &backs))
+        }));
+    }
+
+    /// Move every selected line-block up or down one line (Alt+↑/↓). A block is
+    /// a run of whole lines the selections span (`line_runs`: a
+    /// whole-line selection ending at column 0 does not span that row), runs on
+    /// consecutive rows merged — each block swaps with its neighbour line, which
+    /// must therefore belong to no other block. Every selection rides its moved
+    /// text, id and direction kept. A block at the document edge — or, moving
+    /// down, against the trailing empty line — stays put while the others move.
+    /// One undo step; never re-indents.
+    pub fn move_line(&mut self, down: bool) {
+        let line_count = self.buffer.line_count();
+        let ends_nl = self.buffer.char_before(self.buffer.len()) == Some('\n');
+        // The last row a real line occupies (the trailing empty line, if any, is
+        // not movable — moving into it would drop the terminator).
+        let last_movable = if ends_nl { line_count.saturating_sub(2) } else { line_count - 1 };
+        // Each swap rewrites its region (block + neighbour) with text of the same
+        // length, so offsets outside the moved regions never shift: every
+        // destination is the pre-edit one, with nothing to accumulate.
+        self.relocate_line_blocks(true, |buffer, run, _, block| {
+            let (r0, r1) = (run.first, run.last);
+            if (down && r1 >= last_movable) || (!down && r0 == 0) {
+                return None; // at the edge: stays put while the others move
+            }
+            let (a, b) = if down { (r0, r1 + 1) } else { (r0 - 1, r1) };
+            let has_nl = b + 1 < line_count; // row `b` carries a trailing newline
+            let region_start = buffer.point_to_offset(Point::new(a, 0));
+            let region_end =
+                if has_nl { buffer.point_to_offset(Point::new(b + 1, 0)) } else { buffer.len() };
+            let neighbour = buffer.line(if down { b } else { a });
+            let (mut text, dest) = if down {
+                // The line below moves to the front; the block shifts down past
+                // it and its `\n`.
+                (format!("{neighbour}\n{block}"), region_start + neighbour.len() as u32 + 1)
+            } else {
+                // The line above moves to the back; the block takes its place.
+                (format!("{block}\n{neighbour}"), region_start)
+            };
+            if has_nl {
+                text.push('\n');
+            }
+            // A whole-line selection's end sits past the block's `\n`; moved onto
+            // the buffer's final line the block has no `\n`, so that end clamps to
+            // the region (buffer) end.
+            Some(Relocation { op: EditOp::new(region_start..region_end, text), dest, max: Some(region_end) })
+        });
+    }
+
+    /// Duplicate every selected line-block above (`down = false`) or below
+    /// (`down = true`) — Shift+Alt+↑/↓. A block is a run of whole lines the
+    /// selections span (`line_runs`), runs that share a row merged
+    /// so no line is copied twice; runs on consecutive rows stay apart, so
+    /// carets on consecutive lines each copy their own line (VS Code). Every
+    /// selection lands on its block's copy — the lower one copying down, the
+    /// upper one copying up — id and direction kept. One undo step.
+    pub fn copy_line(&mut self, down: bool) {
+        let line_count = self.buffer.line_count();
+        // Bytes the earlier copies insert. The runs — and so the insertion
+        // points — ascend, so everything after an insertion, every later copy
+        // included, lands that much further on post-edit.
+        let mut grown = 0;
+        self.relocate_line_blocks(false, |buffer, run, block_start, block| {
+            // Where the copy is inserted, its text, and where its block starts.
+            let (at, text, copy_start) = if !down {
+                // Above: the copy takes the block's place and pushes it down.
+                (block_start, format!("{block}\n"), block_start)
+            } else if run.last + 1 < line_count {
+                let at = buffer.point_to_offset(Point::new(run.last + 1, 0));
+                (at, format!("{block}\n"), at)
+            } else {
+                // Duplicating the final line (no trailing newline): prepend one.
+                let at = buffer.len();
+                (at, format!("\n{block}"), at + 1)
+            };
+            let dest = copy_start + grown;
+            grown += text.len() as u32;
+            // The copy is the block verbatim, so a whole-line selection's end,
+            // past the block's `\n`, lands past the copy's: nothing clamps.
+            Some(Relocation { op: EditOp::insert(at, text), dest, max: None })
+        });
     }
 
     /// Toggle the line comment on every line the selections span (Ctrl+/).
@@ -665,7 +788,7 @@ impl Document {
         };
         // `edit_grouped` rebases the selections through the patch, so the
         // selection (or caret) survives the toggle in place.
-        let _ = self.edit_grouped(ops, GroupingHint::discrete());
+        verb_commit(self.edit_grouped(ops, GroupingHint::discrete()));
     }
 
     /// Whether any selection spans more than one line — the trigger for block
@@ -676,24 +799,27 @@ impl Document {
         })
     }
 
-    /// Indent (`n > 0`) or outdent (`n < 0`) every line the selections span, by
-    /// `|n|` spaces, as one transaction. The **selection is preserved** — it
+    /// Indent (`deeper`) or outdent every line the selections span by one
+    /// level of ITS OWN unit ([`indent_insert`] / [`outdent_range`] of its
+    /// leading whitespace — a block mixing tab- and space-indented lines moves
+    /// each in kind), as one transaction. The **selection is preserved** — it
     /// rebases through the edit (its endpoints shift with the indent), as
     /// mainstream editors do, rather than collapsing to one caret per line.
-    fn indent_lines(&mut self, n: i32) {
+    fn indent_lines(&mut self, deeper: bool) {
         let rows = self.spanned_rows();
         let buffer = &self.buffer;
         let mut ops = Vec::new();
         for row in rows {
             let line_start = buffer.point_to_offset(Point::new(row, 0));
-            if n > 0 {
-                ops.push(EditOp::insert(line_start, " ".repeat(n as usize)));
+            let line = buffer.line(row);
+            let ws = leading_ws(&line);
+            if deeper {
+                let (at, text) = indent_insert(ws);
+                ops.push(EditOp::insert(line_start + at, text));
             } else {
-                let line = buffer.line(row);
-                let removable =
-                    line.bytes().take((-n) as usize).take_while(|&b| b == b' ').count() as u32;
-                if removable > 0 {
-                    ops.push(EditOp::delete(line_start..line_start + removable));
+                let r = outdent_range(ws);
+                if !r.is_empty() {
+                    ops.push(EditOp::delete(line_start + r.start..line_start + r.end));
                 }
             }
         }
@@ -701,25 +827,92 @@ impl Document {
         // start biases Left and its end biases Right), so the selection survives
         // the (out)dent as a selection — not `run_edit`'s one-caret-per-op, which
         // would collapse it to a caret.
-        let _ = self.edit_grouped(ops, GroupingHint::discrete());
+        verb_commit(self.edit_grouped(ops, GroupingHint::discrete()));
     }
 
-    /// The distinct rows any selection touches (for block (out)dent and
-    /// toggle-comment) — end-exclusivity via [`last_spanned_offset`].
+    /// The distinct rows any selection touches, ascending (for block (out)dent
+    /// and toggle-comment): the [`line_runs`](Self::line_runs) flattened — runs
+    /// sharing a row are already merged, so no row repeats.
     fn spanned_rows(&self) -> Vec<u32> {
+        self.line_runs(false).into_iter().flat_map(|run| run.first..=run.last).collect()
+    }
+
+    /// The whole-line **runs** the selections span — the unit move-line and
+    /// copy-line act on. Each selection spans `first..=last` rows by the
+    /// [`last_spanned_offset`] rule (a whole-line selection ending at column 0
+    /// does not span that row); runs that share a row merge, and with
+    /// `merge_adjacent` so do runs on consecutive rows. Every selection lies in
+    /// exactly one run, and the set's sorted, disjoint order makes each run's
+    /// selections a contiguous index range of [`SelectionSet::all`].
+    fn line_runs(&self, merge_adjacent: bool) -> Vec<LineRun> {
         let buffer = &self.buffer;
-        let mut rows = Vec::new();
-        for sel in self.selections.all() {
+        let reach = u32::from(merge_adjacent);
+        let mut runs: Vec<LineRun> = Vec::new();
+        for (i, sel) in self.selections.all().iter().enumerate() {
             let first = buffer.offset_to_point(sel.start()).row;
             let last = buffer.offset_to_point(last_spanned_offset(sel)).row;
-            for r in first..=last {
-                if rows.last() != Some(&r) {
-                    rows.push(r);
+            match runs.last_mut() {
+                // Sorted and disjoint ⇒ `first` and `last` never decrease, so
+                // only the newest run can absorb this selection.
+                Some(run) if first <= run.last + reach => {
+                    run.last = run.last.max(last);
+                    run.sels.end = i + 1;
                 }
+                _ => runs.push(LineRun { first, last, sels: i..i + 1 }),
             }
         }
-        rows.dedup();
-        rows
+        runs
+    }
+
+    /// The shared shape of [`move_line`](Self::move_line) and
+    /// [`copy_line`](Self::copy_line). Per line run
+    /// ([`line_runs`](Self::line_runs)`(merge_adjacent)`), `plan` sees the run,
+    /// its block's start offset and its text (rows `first..=last`, without the
+    /// last row's `\n`) and returns the run's [`Relocation`] — or `None` to leave
+    /// the run where it is. Destinations are pre-edit arithmetic, so `plan`
+    /// accounts for any shift earlier runs' edits cause.
+    ///
+    /// Every selection of a relocated run rides its block: the block moves or is
+    /// copied verbatim, so each offset keeps its distance from the block start
+    /// (clamped to the relocation's `max`, if any); a run left in place keeps
+    /// its spans. Ids and directions survive (`moved_to`). One discrete undo
+    /// step, the placement inside the commit so redo restores it; no run
+    /// relocated ⇒ no edit at all.
+    fn relocate_line_blocks(
+        &mut self,
+        merge_adjacent: bool,
+        mut plan: impl FnMut(&Buffer, &LineRun, u32, &str) -> Option<Relocation>,
+    ) {
+        let mut spans: Vec<(u32, u32)> =
+            self.selections.all().iter().map(|s| (s.tail(), s.head())).collect();
+        let mut ops = Vec::new();
+        for run in self.line_runs(merge_adjacent) {
+            let block_start = self.buffer.point_to_offset(Point::new(run.first, 0));
+            let block_end =
+                self.buffer.point_to_offset(Point::new(run.last, self.buffer.line_len(run.last)));
+            let block = self.buffer.slice(block_start..block_end);
+            let Some(Relocation { op, dest, max }) = plan(&self.buffer, &run, block_start, &block)
+            else {
+                continue;
+            };
+            let to = |o: u32| {
+                let landed = dest + (o - block_start);
+                max.map_or(landed, |max| landed.min(max))
+            };
+            for (tail, head) in &mut spans[run.sels] {
+                (*tail, *head) = (to(*tail), to(*head));
+            }
+            ops.push(op);
+        }
+        if ops.is_empty() {
+            return;
+        }
+        let placed = self.selections.moved_to(&spans);
+        verb_commit(self.edit_placing(ops, GroupingHint::discrete(), |_, _| Some(placed)));
+        // Drop provenance through the one owner so the `AutoClosePair`
+        // decoration is removed with it — the store is the single owner of the
+        // pair, with nothing else to keep in sync.
+        self.clear_autoclose();
     }
 
     /// Build one op per selection via `f(start, end, buffer)`.
@@ -735,24 +928,78 @@ impl Document {
     }
 
     /// Apply verb ops as one transaction and drop a caret after each edit.
+    /// The ops must be disjoint ([`verb_commit`] holds the verb to it).
     fn run_edit(&mut self, ops: Vec<EditOp>, hint: GroupingHint) {
-        let Ok(committed) = self.edit_grouped(ops, hint) else {
-            return; // overlap is a programmer error; verbs never produce it
-        };
-        if committed.is_empty() {
-            return;
-        }
         // A caret after each edit: `new.end` is after inserted text, or the
         // deletion point for a pure delete.
-        let carets: Vec<u32> = committed.patch().edits().iter().map(|e| e.new.end).collect();
-        self.selections = SelectionSet::from_offsets(&carets);
+        verb_commit(self.edit_placing(ops, hint, |patch, _| {
+            let carets: Vec<u32> = patch.edits().iter().map(|e| e.new.end).collect();
+            Some(SelectionSet::from_offsets(&carets))
+        }));
     }
+}
+
+/// The verbs' one verdict on a commit — no verb drops a [`TransactionError`]
+/// with a bare `let _ =`. Every verb builds DISJOINT ops by construction (one
+/// per selection, or overlapping deletes merged by [`merge_delete_ranges`]),
+/// so an [`Overlap`](TransactionError::Overlap) reaching here is a verb bug —
+/// a keystroke that would silently do nothing (two carets in one indent run
+/// backspacing to the same tab stop). Debug and test builds panic on it,
+/// which turns every verb test, and the seeded multi-caret walks, into an
+/// overlap oracle. [`WouldOverflow`](TransactionError::WouldOverflow) is the
+/// one legitimate refusal — a paste past the u32 offset space, rejected
+/// atomically with the document untouched — and the verbs' `()` surface has
+/// no channel to report it, so it alone passes as a no-op. Returns whether the
+/// transaction was applied.
+pub(crate) fn verb_commit(result: Result<Committed, TransactionError>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            debug_assert!(
+                !matches!(e, TransactionError::Overlap { .. }),
+                "a verb built overlapping ops (merge them first): {e}"
+            );
+            false
+        }
+    }
+}
+
+/// A maximal block of whole lines the selections span, with the selections
+/// that span it ([`Document::line_runs`]).
+struct LineRun {
+    /// The run's first row.
+    first: u32,
+    /// The run's last row (inclusive).
+    last: u32,
+    /// The run's selections, as indices into [`SelectionSet::all`].
+    sels: Range<usize>,
+}
+
+/// Where one line run's block goes — [`Document::relocate_line_blocks`]'s
+/// per-run plan.
+struct Relocation {
+    /// The edit that moves or copies the block.
+    op: EditOp,
+    /// Where the block's first byte lands post-edit.
+    dest: u32,
+    /// The furthest a carried offset may land, or `None` when nothing clamps.
+    max: Option<u32>,
+}
+
+/// One caret per edit, `backs[i]` bytes before edit `i`'s inserted end — the
+/// Enter / insert-line placement (0 = just after the text, as `run_edit`; >0
+/// pulls the caret back onto a line the insertion opened). `backs` is
+/// parallel to the ops, which the engine keeps one edit each, in order.
+fn carets_pulled_back(patch: &Patch, backs: &[u32]) -> SelectionSet {
+    let carets: Vec<u32> = patch.edits().iter().zip(backs).map(|(e, back)| e.new.end - back).collect();
+    SelectionSet::from_offsets(&carets)
 }
 
 /// The last offset a selection actually spans: one back from the exclusive
 /// `end`, so a selection ending exactly at a line start does not span that
 /// line. THE end-exclusivity rule, shared by the row enumeration
-/// (`spanned_rows`) and the whole-line deletion block (`line_block`).
+/// (`line_runs`, and through it `spanned_rows`) and the whole-line deletion
+/// block (`line_block`).
 fn last_spanned_offset(sel: &Selection) -> u32 {
     if sel.end() > sel.start() {
         sel.end() - 1
@@ -762,10 +1009,15 @@ fn last_spanned_offset(sel: &Selection) -> u32 {
 }
 
 /// Merge overlapping delete ranges into a minimal non-overlapping set of delete
-/// ops, because the transaction engine rejects overlapping ops. Word-delete at
-/// two carets inside one word produces overlapping ranges — merging deletes the
-/// shared region once, and the carets collapse via the selection merge rule.
-/// Touching ranges (`a.end == b.start`) stay separate; the engine accepts those.
+/// ops, because the transaction engine rejects overlapping ops. EVERY
+/// multi-caret delete verb builds its ops here, since a per-selection delete
+/// can reach past its neighbour: two carets in one word (word-delete), two
+/// carets on one line (line-delete, cut), two carets in one indent run backing
+/// to the same tab stop, or a caret's stop reaching through a selection
+/// (backspace). Merging deletes the shared region once — the union of what each
+/// selection would delete alone — and `run_edit`'s one caret per merged edit
+/// collapses the carets onto its start. Touching ranges (`a.end == b.start`)
+/// stay separate; the engine accepts those, and their carets coincide and merge.
 fn merge_delete_ranges(ranges: impl Iterator<Item = Range<u32>>) -> Vec<EditOp> {
     let mut sorted: Vec<Range<u32>> = ranges.collect();
     sorted.sort_by_key(|r| r.start);
@@ -779,20 +1031,125 @@ fn merge_delete_ranges(ranges: impl Iterator<Item = Range<u32>>) -> Vec<EditOp> 
     merged.into_iter().map(EditOp::delete).collect()
 }
 
-/// The byte offset backspace should delete back to from an empty caret: one tab
-/// stop if the caret is within pure leading whitespace, else one character.
+/// The byte offset backspace should delete back to from an empty caret: one
+/// indent level ([`outdent_range`] of the whitespace before the caret) if the
+/// caret is within the line's leading whitespace, else one character.
 fn backspace_target(buffer: &Buffer, caret: u32) -> u32 {
     let p = buffer.offset_to_point(caret);
     let line = buffer.line(p.row);
-    let in_indent = p.col > 0 && line.as_bytes()[..p.col as usize].iter().all(|&b| b == b' ');
-    if in_indent {
-        let indent = default_indent_size();
-        let target_col = ((p.col - 1) / indent) * indent;
-        buffer.point_to_offset(Point::new(p.row, target_col))
-    } else {
-        let prev = buffer.char_before(caret).expect("caret > 0");
-        caret - prev.len_utf8() as u32
+    if p.col > 0 && p.col <= tail_start_col(&line) {
+        // The whitespace before the caret, read as an indent — the leading
+        // whitespace truncated to the caret, exactly as Enter copies it.
+        // Its level is removed from the END of its trailing run (the run is
+        // one repeated char, so where within it is moot for the text), i.e.
+        // just before the caret.
+        let level = outdent_range(&line[..p.col as usize]).len() as u32;
+        if level > 0 {
+            return caret - level;
+        }
+        // Leading whitespace that is neither a tab nor a space (U+3000…)
+        // has no level: an ordinary one-char delete.
     }
+    let prev = buffer.char_before(caret).expect("caret > 0");
+    caret - prev.len_utf8() as u32
+}
+
+/// The kind of one indent level — THE indent-unit rule. Enter's
+/// block-opening level, Tab, block indent, Shift+Tab, and backspace's
+/// tab-stop delete all classify a line here, so they cannot disagree about
+/// it: a tab-indented line grows and shrinks by hard tabs, anything else by
+/// spaces between stops [`default_indent_size`] apart. (A global
+/// tabs-vs-spaces preference is a host setting this does not know; an
+/// unindented line therefore takes spaces.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndentUnit {
+    /// One hard tab.
+    Tab,
+    /// Spaces to the neighbouring indent stop.
+    Spaces,
+}
+
+impl IndentUnit {
+    /// The unit leading whitespace `ws` calls for: the kind of its LAST char —
+    /// a hard tab ⇒ [`Tab`](Self::Tab), spaces or nothing ⇒
+    /// [`Spaces`](Self::Spaces). The last char because it is the one a level
+    /// abuts: `\t··` is tab-indented then space-ALIGNED, and a level added
+    /// after alignment spaces must be spaces, or the line would interleave
+    /// kinds (`\t··\t`).
+    fn of(ws: &str) -> Self {
+        if ws.ends_with('\t') {
+            Self::Tab
+        } else {
+            Self::Spaces
+        }
+    }
+
+    /// The char a level of this unit is made of.
+    fn char(self) -> char {
+        match self {
+            Self::Tab => '\t',
+            Self::Spaces => ' ',
+        }
+    }
+
+    /// The text of one level inserted right after `prefix` (the line's text
+    /// before the insertion point): a hard tab, or the spaces to the next
+    /// stop.
+    fn text(self, prefix: &str) -> String {
+        match self {
+            Self::Tab => "\t".to_owned(),
+            Self::Spaces => {
+                let n = default_indent_size();
+                " ".repeat((n - stop_col(prefix) % n) as usize)
+            }
+        }
+    }
+}
+
+/// The column `prefix`'s end sits at for indent-stop arithmetic: its bytes
+/// after the last hard tab (or from the line start). A hard tab ends on a tab
+/// stop, so counting from it keeps the stops where they are drawn while the
+/// display tab width ([`crate::display_map::default_tab_size`]) is a multiple
+/// of the indent width — and keeps a level of spaces after a tab inverse to
+/// its outdent. Byte-based like every column here.
+fn stop_col(prefix: &str) -> u32 {
+    (prefix.len() - prefix.rfind('\t').map_or(0, |i| i + 1)) as u32
+}
+
+/// Where one indent level goes in leading whitespace `ws`: the START of its
+/// trailing run of the [`IndentUnit::of`] char. The run is one repeated char,
+/// so the text comes out the same anywhere in it; its start is, for a pure
+/// indent, column 0 — where these verbs always edited, so selections rebase
+/// as they did (one beginning at an indented line's text stays on the text
+/// through the (out)dent) — while a mixed line's earlier whitespace (the `\t`
+/// before alignment spaces) is left in front, untouched.
+fn level_start(ws: &str, unit: IndentUnit) -> u32 {
+    ws.trim_end_matches(unit.char()).len() as u32
+}
+
+/// One indent level deeper for leading whitespace `ws`: insert `.1` at byte
+/// `.0` of the line — a hard tab on a tab-indented line, else spaces padding
+/// the trailing space run to its next stop.
+fn indent_insert(ws: &str) -> (u32, String) {
+    let unit = IndentUnit::of(ws);
+    (level_start(ws, unit), unit.text(ws))
+}
+
+/// One indent level shallower for leading whitespace `ws` (or the part of it
+/// before a caret): the byte range to delete — its last tab, or its trailing
+/// spaces back to the previous stop (at most [`default_indent_size`], never
+/// past a tab) — empty when `ws` has no level to give.
+fn outdent_range(ws: &str) -> Range<u32> {
+    let unit = IndentUnit::of(ws);
+    let start = level_start(ws, unit);
+    let run = ws.len() as u32 - start;
+    let width = match unit {
+        IndentUnit::Tab => 1, // `of` ⇒ the run holds at least this one tab
+        IndentUnit::Spaces if run == 0 => 0,
+        // `run` counts from the last tab or the line start: `stop_col(ws)`.
+        IndentUnit::Spaces => (run - 1) % default_indent_size() + 1,
+    };
+    start..start + width
 }
 
 /// The leading-whitespace indent an Enter at `caret` should carry: the current
@@ -801,21 +1158,27 @@ fn backspace_target(buffer: &Buffer, caret: u32) -> u32 {
 fn enter_indent(buffer: &Buffer, caret: u32) -> String {
     let p = buffer.offset_to_point(caret);
     let line = buffer.line(p.row);
-    let indent_len = tail_start_col(&line) as usize;
-    let take = indent_len.min(p.col as usize);
-    line[..take].to_owned()
+    let ws = leading_ws(&line);
+    ws[..ws.len().min(p.col as usize)].to_owned()
 }
 
-/// One indent unit matching the KIND of the `copied` leading whitespace: a
-/// tab-indented prefix grows by one hard tab, anything else (spaces or an empty
-/// prefix) by [`default_indent_size`] spaces — so an indent-carrying Enter
-/// never mixes tabs and spaces within a line.
+/// A line's leading whitespace — the indent every indent verb reads (Tab,
+/// block (out)dent, Enter, insert-line). The one slice of the one
+/// [`tail_start_col`] rule, so they cannot disagree on where an indent ends.
+fn leading_ws(line: &str) -> &str {
+    &line[..tail_start_col(line) as usize]
+}
+
+/// One indent unit matching the KIND of the `copied` leading whitespace
+/// ([`IndentUnit::of`], the rule Tab and Shift+Tab share): a tab-indented
+/// prefix grows by one hard tab, anything else (spaces or an empty prefix) by
+/// [`default_indent_size`] spaces — so an indent-carrying Enter never mixes
+/// tabs and spaces within a line. A WHOLE level — the unit's
+/// [`text`](IndentUnit::text) from an indent stop (an empty prefix) — not
+/// Tab's pad to the next stop from the caret: the two agree on every on-grid
+/// indent.
 fn indent_unit(copied: &str) -> String {
-    if copied.ends_with('\t') {
-        "\t".to_owned()
-    } else {
-        " ".repeat(default_indent_size() as usize)
-    }
+    IndentUnit::of(copied).text("")
 }
 
 /// Whether the current line opens a block at `caret`: the text left of `caret`,
@@ -1089,6 +1452,223 @@ mod tests {
         d.selections = SelectionSet::new(8); // caret after the spaces
         d.backspace();
         assert_eq!(d.text(), "    x"); // removed 4 (one stop), not 1
+    }
+
+    #[test]
+    fn two_carets_in_one_indent_run_backspace_to_their_shared_tab_stop() {
+        // The repro: carets at cols 3 and 4 both target stop 0, so their
+        // tab-stop deletes are 0..3 and 0..4 — overlapping. Unmerged, the
+        // transaction rejected them and the keystroke silently did nothing.
+        let mut d = doc("        x"); // 8 spaces
+        d.set_selections(SelectionSet::from_offsets(&[3, 4]));
+        d.backspace();
+        assert_eq!(d.text(), "    x", "one 0..4 delete — the union of both carets' stops");
+        let heads: Vec<u32> = d.selections().all().iter().map(Selection::head).collect();
+        assert_eq!(heads, [0], "both carets collapse onto the shared stop");
+        assert!(d.undo());
+        assert_eq!(d.text(), "        x", "one undo step restores the text");
+        assert!(!d.can_undo(), "…and it was the only step");
+    }
+
+    #[test]
+    fn tab_stop_backspace_overlapping_a_selection_merges_into_it() {
+        // The mixed form of the same overlap: a caret at col 3 deletes back to
+        // stop 0 straight through a selection on cols 1..2 (never touching the
+        // caret, so the selection set kept them apart).
+        let mut d = doc("        x");
+        let mut set = SelectionSet::new(3);
+        set.add_selection(1, 2);
+        d.set_selections(set);
+        d.backspace();
+        assert_eq!(d.text(), "     x", "0..3 ∪ 1..2 deleted once");
+        let heads: Vec<u32> = d.selections().all().iter().map(Selection::head).collect();
+        assert_eq!(heads, [0]);
+        assert!(d.undo());
+        assert_eq!(d.text(), "        x");
+        assert!(!d.can_undo());
+    }
+
+    /// The heads of every selection, ascending.
+    fn heads(d: &Document) -> Vec<u32> {
+        d.selections().all().iter().map(Selection::head).collect()
+    }
+
+    /// Undo once and require it restored `text` and emptied the history.
+    fn assert_one_undo_restores(d: &mut Document, text: &str) {
+        assert!(d.undo());
+        assert_eq!(d.text(), text, "one undo restores the text");
+        assert!(!d.can_undo(), "…and the delete was the only step");
+    }
+
+    #[test]
+    fn adjacent_carets_char_delete_each_char_once() {
+        // The char-delete audit: one char per caret can only TOUCH the next
+        // range (distinct carets; a caret touching a selection merges into it),
+        // so both carets' chars go and the carets meet.
+        let mut d = doc("abcd");
+        d.set_selections(SelectionSet::from_offsets(&[1, 2]));
+        d.backspace();
+        assert_eq!((d.text().as_ref(), heads(&d)), ("cd", vec![0]));
+        assert_one_undo_restores(&mut d, "abcd");
+        let mut d = doc("abcd");
+        d.set_selections(SelectionSet::from_offsets(&[1, 2]));
+        d.delete_forward();
+        assert_eq!((d.text().as_ref(), heads(&d)), ("ad", vec![1]));
+        assert_one_undo_restores(&mut d, "abcd");
+    }
+
+    #[test]
+    fn word_delete_reaching_through_a_selection_merges_into_it() {
+        // The word-delete audit, mixed form (two carets in one word is
+        // `multi_caret_word_delete_merges_overlapping_ranges`): the caret's word
+        // span swallows a selection inside the same word.
+        let mut d = doc("foo bar");
+        let mut set = SelectionSet::new(3); // after "foo"
+        set.add_selection(1, 2);
+        d.set_selections(set);
+        d.delete_word_back();
+        assert_eq!((d.text().as_ref(), heads(&d)), (" bar", vec![0]), "0..3 ∪ 1..2");
+        assert_one_undo_restores(&mut d, "foo bar");
+        let mut d = doc("foo bar");
+        let mut set = SelectionSet::new(0); // before "foo"
+        set.add_selection(1, 2);
+        d.set_selections(set);
+        d.delete_word_forward();
+        assert_eq!((d.text().as_ref(), heads(&d)), (" bar", vec![0]), "0..3 ∪ 1..2");
+        assert_one_undo_restores(&mut d, "foo bar");
+    }
+
+    #[test]
+    fn overlapping_line_blocks_delete_once() {
+        // The line-delete audit: a two-row selection's block contains the block
+        // of a caret on its second row.
+        let mut d = doc("a\nbb\nc");
+        let mut set = SelectionSet::new(4); // end of "bb", row 1
+        set.add_selection(0, 3); // rows 0..=1 → block 0..5
+        d.set_selections(set);
+        d.delete_line();
+        assert_eq!((d.text().as_ref(), heads(&d)), ("c", vec![0]), "0..5 ∪ 2..5");
+        assert_one_undo_restores(&mut d, "a\nbb\nc");
+        // Cut's whole-line mode: two carets on one line yield the SAME block.
+        let mut d = doc("aaaa\nbb");
+        d.set_selections(SelectionSet::from_offsets(&[1, 3]));
+        d.cut();
+        assert_eq!((d.text().as_ref(), heads(&d)), ("bb", vec![0]));
+        assert_one_undo_restores(&mut d, "aaaa\nbb");
+    }
+
+    #[test]
+    fn multi_caret_deletes_remove_the_union_of_each_selections_lone_delete() {
+        // The overlap oracle for EVERY multi-caret delete verb. Spec: a
+        // multi-selection delete removes exactly the union of what each
+        // selection would delete alone — a shared span once, never a rejected
+        // transaction — leaves a caret where each of those deletes began, and
+        // one undo restores the text. Each lone delete is observed through the
+        // public API only (a pure delete leaves its caret at the range start,
+        // and the length drop is the width); the union is a per-byte mask, not
+        // `merge_delete_ranges`' sort-and-sweep. Indent-heavy lines with up to
+        // four selections make overlapping tab-stop, word and line ranges common.
+        let mut rng = 0x0010_7AB5_70B5_u64;
+        let mut next = move |m: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        type Verb = fn(&mut Document);
+        let verbs: [(&str, Verb); 6] = [
+            ("backspace", Document::backspace),
+            ("delete_forward", Document::delete_forward),
+            ("delete_word_back", Document::delete_word_back),
+            ("delete_word_forward", Document::delete_word_forward),
+            ("delete_line", Document::delete_line),
+            ("cut", Document::cut),
+        ];
+        const TAILS: &[&str] = &["", "x", "foo bar", "a.b", "(y)", "  z"];
+        // Per verb: cases run, and cases whose lone deletes overlapped.
+        let mut runs = [0usize; 6];
+        let mut overlaps = [0usize; 6];
+        for case in 0..3_000 {
+            let text = (0..1 + next(3))
+                .map(|_| {
+                    // Mostly spaces, some tabs: pure, tab-then-aligned and
+                    // interleaved indents all reach the tab-stop backspace.
+                    let indent: String = (0..next(10))
+                        .map(|_| if next(8) == 0 { '\t' } else { ' ' })
+                        .collect();
+                    format!("{indent}{}", TAILS[next(TAILS.len() as u64) as usize])
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let len = text.len() as u64; // ASCII: every offset is a char boundary
+            let ranges: Vec<(u32, u32)> = (0..1 + next(4))
+                .map(|_| {
+                    let a = next(len + 1) as u32;
+                    (a, if next(4) == 0 { next(len + 1) as u32 } else { a })
+                })
+                .collect();
+            let set = SelectionSet::from_ranges(&ranges, 0);
+            let v = next(verbs.len() as u64) as usize;
+            let (name, verb) = verbs[v];
+            // Cut's own rule: in a mixed set an empty caret copied nothing, so
+            // it deletes nothing (alone it would cut its whole line).
+            let mixed = set.all().iter().any(|s| !s.is_empty());
+            let mut mask = vec![false; text.len()];
+            let (mut starts, mut lone_total) = (Vec::new(), 0);
+            for sel in set.all() {
+                if name == "cut" && mixed && sel.is_empty() {
+                    continue;
+                }
+                let mut lone = doc(&text);
+                lone.set_selections(SelectionSet::from_ranges(&[(sel.tail(), sel.head())], 0));
+                verb(&mut lone);
+                let width = text.len() - lone.text().len();
+                if width > 0 {
+                    let start = lone.selections().newest().head() as usize;
+                    mask[start..start + width].iter_mut().for_each(|m| *m = true);
+                    starts.push(start);
+                    lone_total += width;
+                }
+            }
+            let union = mask.iter().filter(|&&m| m).count();
+            runs[v] += 1;
+            overlaps[v] += usize::from(union < lone_total);
+            let expected: String =
+                text.bytes().zip(&mask).filter(|&(_, &m)| !m).map(|(b, _)| char::from(b)).collect();
+
+            let mut d = doc(&text);
+            d.set_selections(set);
+            verb(&mut d);
+            let what = format!("case {case}: {name} on {text:?} at {ranges:?}");
+            assert_eq!(d.text(), expected, "{what}: the union of the lone deletes");
+            for s in starts {
+                let at = (s - mask[..s].iter().filter(|&&m| m).count()) as u32;
+                assert!(
+                    d.selections().all().iter().any(|c| c.is_empty() && c.head() == at),
+                    "{what}: a caret where the delete from {s} began (post-edit {at})",
+                );
+            }
+            if union > 0 {
+                assert!(d.undo(), "{what}: undoable");
+                assert_eq!(d.text(), text, "{what}: one undo restores the text");
+            }
+            assert!(!d.can_undo(), "{what}: the whole delete was ONE undo step");
+        }
+        // A one-char forward delete can only TOUCH its neighbour (a caret
+        // touching a selection merges into it); every other verb must have
+        // really been driven through overlapping ranges, or the oracle is vacuous.
+        // (This seed, in `verbs` order: ~500 runs each; overlaps 33 / 0 / 111 /
+        // 104 / 290 / 155.)
+        for (v, (name, _)) in verbs.iter().enumerate() {
+            if *name == "delete_forward" {
+                assert_eq!(overlaps[v], 0, "delete_forward cannot overlap");
+            } else {
+                assert!(
+                    overlaps[v] > 20,
+                    "walk too thin for {name}: runs {runs:?}, overlaps {overlaps:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1386,6 +1966,219 @@ mod tests {
         );
     }
 
+    /// Select `anchor..head` as the one selection.
+    fn select(d: &mut Document, anchor: u32, head: u32) {
+        d.set_selections(SelectionSet::from_ranges(&[(anchor, head)], 0));
+    }
+
+    /// Run `verb`, require `after`, and require ONE undo step restoring the
+    /// text `verb` started from.
+    #[track_caller]
+    fn assert_one_step(d: &mut Document, verb: fn(&mut Document), after: &str) {
+        let before = d.text().into_owned();
+        verb(d);
+        assert_eq!(d.text(), after, "{before:?}");
+        assert_one_undo_restores(d, &before);
+    }
+
+    #[test]
+    fn outdent_removes_a_hard_tab() {
+        // The repro: Shift+Tab worked in spaces only, so a tab-indented
+        // line could not be outdented at all.
+        let mut d = doc("\tfoo");
+        assert_one_step(&mut d, Document::outdent, "foo");
+        let mut d = doc("\t\tfoo"); // one level per press, not the whole indent
+        d.set_selections(SelectionSet::new(4)); // caret inside the text
+        assert_one_step(&mut d, Document::outdent, "\tfoo");
+    }
+
+    #[test]
+    fn block_indent_of_a_tab_indented_block_adds_tabs() {
+        // The repro: Tab over a tab-indented block inserted SPACES ahead of
+        // each tab (`"    \tfoo"`), mixing kinds within the line.
+        let mut d = doc("\tfoo\n\tbar");
+        d.select_all();
+        assert_one_step(&mut d, Document::tab, "\t\tfoo\n\t\tbar");
+        // A block selection begun at the text (after Home) stays on the text:
+        // the new level lands ahead of the old one, never inside the selection.
+        select(&mut d, 1, 9);
+        d.tab();
+        let s = d.selections().newest();
+        assert_eq!((s.start(), s.end()), (2, 11), "the block selection survives");
+        let mut d = doc("\t\tfoo\n\t\tbar");
+        d.select_all();
+        assert_one_step(&mut d, Document::outdent, "\tfoo\n\tbar");
+    }
+
+    #[test]
+    fn caret_tab_on_a_tab_indented_line_inserts_a_tab() {
+        // The caret form of the same mix: Tab at the line start (or anywhere on
+        // a tab-indented line) inserts the line's own unit.
+        let mut d = doc("\tfoo");
+        d.set_selections(SelectionSet::new(0));
+        assert_one_step(&mut d, Document::tab, "\t\tfoo");
+        d.set_selections(SelectionSet::new(4)); // end of the line
+        assert_one_step(&mut d, Document::tab, "\tfoo\t");
+        // A space-indented (or unindented) line still pads to the next stop.
+        let mut d = doc("  foo");
+        d.set_selections(SelectionSet::new(1));
+        assert_one_step(&mut d, Document::tab, "     foo");
+    }
+
+    #[test]
+    fn space_indents_snap_to_the_neighbouring_stops() {
+        // Indent pads to the NEXT stop and outdent cuts back to the PREVIOUS
+        // one — an off-grid indent is realigned, not shifted by a fixed 4.
+        let mut d = doc("  foo\n      bar");
+        select(&mut d, 0, 15);
+        assert_one_step(&mut d, Document::tab, "    foo\n        bar");
+        select(&mut d, 0, 15);
+        assert_one_step(&mut d, Document::outdent, "foo\n    bar");
+        let mut d = doc("      foo"); // 6 spaces
+        assert_one_step(&mut d, Document::outdent, "    foo");
+    }
+
+    #[test]
+    fn mixed_leading_whitespace_moves_one_unit_of_its_last_kind() {
+        // The indent unit is the kind of the leading whitespace's LAST char
+        // (Enter's rule): tab-then-alignment-spaces is a SPACES line whose
+        // stops count from the tab; spaces-then-tab is a TAB line.
+        let mut d = doc("\t  foo");
+        assert_one_step(&mut d, Document::outdent, "\tfoo");
+        let mut d = doc("\t      foo"); // tab + 6: back to the stop at tab + 4
+        assert_one_step(&mut d, Document::outdent, "\t    foo");
+        let mut d = doc("\t  foo\nx");
+        select(&mut d, 0, 8);
+        assert_one_step(&mut d, Document::tab, "\t    foo\n    x");
+        let mut d = doc("  \tfoo");
+        assert_one_step(&mut d, Document::outdent, "  foo");
+        let mut d = doc("  \tfoo\nx");
+        select(&mut d, 0, 8);
+        assert_one_step(&mut d, Document::tab, "  \t\tfoo\n    x");
+        // A whitespace-only line is all leading whitespace.
+        let mut d = doc("\t\t");
+        assert_one_step(&mut d, Document::outdent, "\t");
+    }
+
+    #[test]
+    fn caret_tab_before_a_mixed_indents_last_run_indents_like_block_indent() {
+        // Fails-first: a caret Tab dropped the line's unit AT the caret, so at
+        // column 0 of `··\tfoo` (a tab line: its indent ends in a tab) it gave
+        // `\t··\tfoo` — interleaving kinds, the very thing the unit rule exists
+        // to prevent — where block indent gives `··\t\tfoo`. A caret ahead of
+        // the indent's trailing run now inserts where block indent does, and
+        // lands just past the new level.
+        for (line, col, want, caret) in [
+            ("  \tfoo", 0, "  \t\tfoo", 3),
+            ("  \tfoo", 1, "  \t\tfoo", 3),
+            ("\t  foo", 0, "\t    foo", 3), // a spaces line (tab-then-alignment)
+        ] {
+            let mut d = doc(line);
+            d.set_selections(SelectionSet::new(col));
+            d.tab();
+            assert_eq!(d.text(), want, "{line:?} @ {col}");
+            assert_eq!(heads(&d), [caret], "{line:?} @ {col}: the caret lands past the new level");
+            assert_one_undo_restores(&mut d, line);
+            // Block indent of the same line agrees.
+            let mut b = doc(&format!("{line}\nx"));
+            select(&mut b, 0, line.len() as u32 + 2);
+            b.tab();
+            assert_eq!(b.text().split('\n').next(), Some(want), "{line:?}: block indent");
+        }
+        // In (or at an edge of) the trailing run, the level still goes at the
+        // caret — inserting a run's own char into it mixes nothing — and spaces
+        // still pad from the caret to its next stop (VS Code's caret Tab).
+        for (line, col, want) in [
+            ("  \tfoo", 2, "  \t\tfoo"),
+            ("\t  foo", 3, "\t    foo"),
+            ("    foo", 2, "      foo"),
+            ("\t\tfoo", 1, "\t\t\tfoo"),
+        ] {
+            let mut d = doc(line);
+            d.set_selections(SelectionSet::new(col));
+            assert_one_step(&mut d, Document::tab, want);
+        }
+    }
+
+    #[test]
+    fn tab_over_a_selection_ahead_of_a_mixed_indents_last_run_never_interleaves() {
+        // Fails-first: the caret fix above covered only empty carets, so a
+        // selection ahead of the trailing run still had the unit typed in its
+        // place — the `·` selected in `··\tfoo` became a tab, giving `\t·\tfoo`
+        // where block indent gives `··\t\tfoo`. The selection is still typed
+        // over (deleted), and the unit goes where block indent puts it.
+        for (line, (from, to), want, caret) in [
+            ("  \tfoo", (0, 1), " \t\tfoo", 2),
+            ("  \tfoo", (1, 0), " \t\tfoo", 2), // either direction
+            ("\t\t  foo", (0, 1), "\t    foo", 3), // a spaces line: tabs, then the run
+        ] {
+            let mut d = doc(line);
+            select(&mut d, from, to);
+            d.tab();
+            assert_eq!(d.text(), want, "{line:?} {from}..{to}");
+            assert_eq!(heads(&d), [caret], "{line:?} {from}..{to}: the caret lands past the new level");
+            assert_one_undo_restores(&mut d, line);
+        }
+    }
+
+    #[test]
+    fn tab_from_several_selections_in_one_mixed_indent_stays_disjoint() {
+        // Fails-first: each caret ahead of the run inserted at the run's start
+        // even when another selection typed over that very point — two
+        // overlapping ops, a verb bug the debug overlap assert caught (and a
+        // silent no-op in release). Against a selection reaching into the run,
+        // the unit goes at that selection's start (where the run starts once
+        // it is typed over); several selections ahead of the run each delete
+        // and each add a level there.
+        for (line, sels, want, carets) in [
+            // A caret ahead of the run + a selection straddling the run start.
+            ("  \t\tfoo", &[(0, 0), (1, 3)][..], " \t\t\tfoo", &[2, 3][..]),
+            // The same with a selection, not a caret, ahead of the run.
+            ("   \t\tfoo", &[(0, 1), (2, 4)][..], " \t\t\tfoo", &[2, 3][..]),
+            // Two selections ahead of the run: both deleted, two levels added.
+            ("    \tfoo", &[(0, 1), (2, 3)][..], "  \t\t\tfoo", &[3, 4][..]),
+        ] {
+            let mut d = doc(line);
+            d.set_selections(SelectionSet::from_ranges(sels, 0));
+            d.tab();
+            assert_eq!(d.text(), want, "{line:?} {sels:?}");
+            assert_eq!(heads(&d), carets, "{line:?} {sels:?}");
+            assert_one_undo_restores(&mut d, line);
+        }
+    }
+
+    #[test]
+    fn backspace_in_mixed_indentation_deletes_one_unit() {
+        // Backspace-to-stop reads the same unit from the whitespace before the
+        // caret: spaces after a tab go back to the stop counted from the tab…
+        let mut d = doc("\t      foo"); // tab + 6
+        d.set_selections(SelectionSet::new(7));
+        assert_one_step(&mut d, Document::backspace, "\t    foo");
+        d.set_selections(SelectionSet::new(7));
+        d.backspace();
+        assert_eq!(heads(&d), [5], "the caret lands on the stop");
+        // …and a tab before the caret goes one tab at a time.
+        let mut d = doc("  \t\tfoo");
+        d.set_selections(SelectionSet::new(4));
+        assert_one_step(&mut d, Document::backspace, "  \tfoo");
+    }
+
+    #[test]
+    fn block_indent_over_mixed_kind_lines_keeps_each_lines_kind() {
+        // One multi-line selection over tab-indented, space-indented, mixed and
+        // unindented lines: every line moves by ITS OWN unit, in one step.
+        let text = "\ta\n    b\n\t  c\nd\n  \te";
+        let mut d = doc(text);
+        d.select_all();
+        assert_one_step(&mut d, Document::tab, "\t\ta\n        b\n\t    c\n    d\n  \t\te");
+        d.select_all();
+        assert_one_step(&mut d, Document::outdent, "a\nb\n\tc\nd\n  e");
+        // Multi-caret Shift+Tab — one caret per line, mixed kinds — likewise.
+        let mut d = doc(text);
+        d.set_selections(SelectionSet::from_offsets(&[2, 8, 13, 15, 20]));
+        assert_one_step(&mut d, Document::outdent, "a\nb\n\tc\nd\n  e");
+    }
+
     #[test]
     fn multi_cursor_typing_edits_every_caret() {
         let mut d = doc("a b c");
@@ -1429,8 +2222,9 @@ mod tests {
 
     #[test]
     fn undo_returns_the_caret_to_the_edit() {
-        // Undo lands the caret at the START of the reverted region; redo at the END
-        // of the re-applied one — as if the edit had just (un)happened.
+        // Undo restores the caret from before the run (the region's start here);
+        // redo the caret the run left (its end) — as if the edit had just
+        // (un)happened.
         let mut d = doc("");
         for ch in "hello".chars() {
             d.type_char(ch);

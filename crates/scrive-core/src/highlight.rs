@@ -446,13 +446,15 @@ impl DirtyRanges {
 /// such edits are rare: you edit what you see). Memory for a fully swept
 /// document: `O(window + lines / stride)` instead of `O(lines)`.
 pub struct HighlightCache {
-    /// `Arc`-shared so [`HighlightCache::engine`] hands an off-thread worker
-    /// the SAME immutable grammar/theme without a deep `SyntaxSet` clone.
-    syntax: Arc<SyntaxDef>,
-    theme: Arc<TokenTheme>,
-    /// Everything the walks mutate — split from the grammar/theme so the
-    /// borrow of `theme` inside a live `SyntectHighlighter` stays disjoint
-    /// from the retention mutations.
+    /// The grammar + theme, `Arc`-shared so [`HighlightCache::engine`] hands an
+    /// off-thread worker the SAME immutable pair without a deep `SyntaxSet`
+    /// clone. Its [`EngineId`] is what [`HighlightCache::absorb`] checks a
+    /// segment's provenance against; a theme swap replaces the whole engine
+    /// (new id), so everything tokenized with the outgoing one is refused.
+    engine: HighlightEngine,
+    /// Everything the walks mutate — split from the engine so the borrow of
+    /// its theme inside a live `SyntectHighlighter` stays disjoint from the
+    /// retention mutations.
     ret: Retention,
 }
 
@@ -842,11 +844,19 @@ impl HighlightCache {
     /// [`HighlightCache::set_window`].
     #[must_use]
     pub fn new(syntax: SyntaxDef, theme: TokenTheme, n_lines: u32) -> Self {
+        Self::with_engine(HighlightEngine::new(syntax, theme), n_lines)
+    }
+
+    /// [`HighlightCache::new`] over an existing engine, sharing its identity —
+    /// so segments that engine tokenizes are absorbable here. Private: the one
+    /// production engine is the cache's own, handed out by
+    /// [`HighlightCache::engine`]; the tests use this to build a cache around
+    /// an engine they tokenized with first.
+    fn with_engine(engine: HighlightEngine, n_lines: u32) -> Self {
         let win = 0..(2 * HIGHLIGHT_WINDOW_SLACK).min(n_lines);
         let len = win.len();
         Self {
-            syntax: Arc::new(syntax),
-            theme: Arc::new(theme),
+            engine,
             ret: Retention {
                 n_lines,
                 invalid: DirtyRanges::all(n_lines),
@@ -999,8 +1009,8 @@ impl HighlightCache {
         max_lines: u32,
         mut line: impl FnMut(u32) -> S,
     ) -> u32 {
-        let syntect = SyntectHighlighter::new(&self.theme.0);
-        let syntax = &*self.syntax;
+        let syntect = SyntectHighlighter::new(&self.engine.theme.0);
+        let syntax = &*self.engine.syntax;
         let fresh = || LineState {
             parse: ParseState::new(syntax.reference()),
             highlight: HighlightState::new(&syntect, ScopeStack::new()),
@@ -1092,8 +1102,14 @@ impl HighlightCache {
     /// as a stale fallback** so the view keeps showing the outgoing theme's
     /// colors (not a flash to default) until the frontier repaints them on the
     /// next `tokenize_until`.
+    ///
+    /// The swap mints a NEW engine identity, so any segment an off-thread
+    /// worker is still tokenizing with the outgoing theme is refused by
+    /// [`crate::Document::absorb_highlight`] — the buffer revision does not
+    /// move here, so it cannot be what catches them. Re-fetch
+    /// [`HighlightCache::engine`] to sweep with the new theme.
     pub fn set_theme(&mut self, theme: TokenTheme) {
-        self.theme = Arc::new(theme);
+        self.engine = HighlightEngine::from_arcs(self.engine.syntax.clone(), Arc::new(theme));
         self.ret.win_states.fill(None);
         self.ret.checkpoints.clear();
         self.ret.invalid = DirtyRanges::all(self.ret.n_lines);
@@ -1101,16 +1117,22 @@ impl HighlightCache {
 
     /// A cheap-to-clone, `Send + Sync` handle to this cache's grammar + theme,
     /// for off-thread bulk tokenization (the parallel/speculative sweep).
-    /// Shares the `Arc`-held grammar/theme — no `SyntaxSet` deep clone.
+    /// Shares the `Arc`-held grammar/theme — no `SyntaxSet` deep clone — and
+    /// the cache's engine identity, so only segments it tokenizes are
+    /// absorbable here (until the next theme or grammar swap).
     #[must_use]
     pub fn engine(&self) -> HighlightEngine {
-        HighlightEngine { syntax: self.syntax.clone(), theme: self.theme.clone() }
+        self.engine.clone()
     }
 
-    /// Ingest a segment tokenized off-thread (parallel/speculative sweep). The
-    /// caller ([`crate::Document::absorb_highlight`]) guarantees the segment
-    /// was computed at the current revision, so `rows`/checkpoints align with
-    /// this cache.
+    /// Ingest a segment tokenized off-thread (parallel/speculative sweep).
+    /// Returns `false` — absorbing **nothing** — unless the segment was
+    /// tokenized wholly by THIS cache's current engine (see [`EngineId`]): a
+    /// segment from before a theme/grammar swap carries the outgoing colours
+    /// or scopes, and `verified` would otherwise mark its rows clean in them
+    /// for good. The caller ([`crate::Document::absorb_highlight`]) guarantees
+    /// the segment was computed at the current revision, so
+    /// `rows`/checkpoints align with this cache.
     ///
     /// - `verified` — the coordinator chained this segment from row 0, so its
     ///   start state (and thus its whole result) is TRUE. Merge its stride
@@ -1126,7 +1148,11 @@ impl HighlightCache {
     ///   these rows per-line and converges in O(1) if the guess was right; a
     ///   dirty row's state is only ever read as a convergence probe, never as
     ///   a warm-up source (that reads `first_dirty − 1`, which is clean).
-    pub(crate) fn absorb(&mut self, seg: SegmentTokens, verified: bool) {
+    #[must_use]
+    pub(crate) fn absorb(&mut self, seg: SegmentTokens, verified: bool) -> bool {
+        if seg.engine != Some(self.engine.id) {
+            return false;
+        }
         let r = &mut self.ret;
         let SegmentTokens { rows, checkpoints, win, win_spans, win_states, .. } = seg;
         if verified {
@@ -1166,6 +1192,7 @@ impl HighlightCache {
                 }
             }
         }
+        true
     }
 
     // Test-only retention probes — the memory canaries count entries, the
@@ -1204,22 +1231,61 @@ impl HighlightCache {
 // this layer is pure and sync, syntect stays sealed.
 // ======================================================================
 
+/// The identity of one grammar + theme pairing — the provenance stamp a
+/// [`SegmentTokens`] carries and [`HighlightCache::absorb`] checks. Minted
+/// from a process-wide counter whenever an engine is built (a cache's
+/// construction, a theme swap), and shared by every clone of that engine, so
+/// "same id" means "tokenized by this very grammar + theme".
+///
+/// Identity, not content: two engines parsed from identical sources are
+/// distinct, which is the conservative direction — a false "different" costs
+/// a refused segment and a re-sweep, a false "same" would paint stale colours
+/// that never repaint. A counter rather than `Arc` pointer identity, so an
+/// address recycled after the old engine is freed can never alias a new one,
+/// and a segment need not keep the old grammar alive to be checkable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EngineId(u64);
+
+impl EngineId {
+    /// A never-before-issued id. `u64` cannot wrap in practice (one per
+    /// theme/grammar swap), so ids are unique for the process lifetime.
+    fn mint() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// A cheap-to-clone, `Send + Sync` handle to a grammar + theme for off-thread
 /// bulk tokenization. Nothing syntect crosses its surface; [`SegmentBoundary`]
-/// and [`SegmentTokens`] are opaque. Obtain via [`HighlightCache::engine`] (to
-/// share the cache's exact grammar/theme) or [`HighlightEngine::new`], and move
-/// clones to worker threads.
+/// and [`SegmentTokens`] are opaque. Move clones to worker threads.
+///
+/// Every engine has an identity (shared by its clones), and a cache absorbs
+/// only segments its OWN engine tokenized: obtain it via
+/// [`crate::Document::highlight_engine`] / [`HighlightCache::engine`] for a
+/// sweep whose results you will absorb, and re-fetch it after a theme or
+/// grammar swap (the swap mints a new engine; the old one's segments are
+/// refused). [`HighlightEngine::new`] builds a standalone engine — for
+/// tokenizing outside any cache (benchmarks, tests, an export pipeline) — whose
+/// segments no cache will absorb.
 #[derive(Clone)]
 pub struct HighlightEngine {
     syntax: Arc<SyntaxDef>,
     theme: Arc<TokenTheme>,
+    id: EngineId,
 }
 
 impl HighlightEngine {
-    /// An engine over an injected grammar + theme (mirrors [`Highlighter::new`]).
+    /// A standalone engine over an injected grammar + theme (mirrors
+    /// [`Highlighter::new`]), with a fresh identity.
     #[must_use]
     pub fn new(syntax: SyntaxDef, theme: TokenTheme) -> Self {
-        Self { syntax: Arc::new(syntax), theme: Arc::new(theme) }
+        Self::from_arcs(Arc::new(syntax), Arc::new(theme))
+    }
+
+    /// An engine over already-shared parts, with a fresh identity — how a
+    /// theme swap keeps the (expensive) grammar while still minting a new id.
+    fn from_arcs(syntax: Arc<SyntaxDef>, theme: Arc<TokenTheme>) -> Self {
+        Self { syntax, theme, id: EngineId::mint() }
     }
 
     /// The document-top fresh start state, as a boundary. The coordinator
@@ -1228,7 +1294,7 @@ impl HighlightEngine {
     /// as-is; unequal => re-run from the true end.
     #[must_use]
     pub fn fresh_boundary(&self) -> SegmentBoundary {
-        SegmentBoundary(Box::new(self.fresh_state()))
+        SegmentBoundary { state: Box::new(self.fresh_state()), engine: Some(self.id) }
     }
 
     fn fresh_state(&self) -> LineState {
@@ -1242,9 +1308,17 @@ impl HighlightEngine {
 
 /// The per-line carry state at a segment edge - opaque, comparable, sendable.
 /// Two edges compare equal iff everything downstream is provably identical
-/// (the convergence theorem: same state + same text => same tokens).
+/// (the convergence theorem: same state + same text => same tokens) — which
+/// includes coming from the same engine: a state carries its theme's styles
+/// and its grammar's contexts, so edges from different engines never compare
+/// equal.
 #[derive(Clone, PartialEq)]
-pub struct SegmentBoundary(Box<LineState>);
+pub struct SegmentBoundary {
+    state: Box<LineState>,
+    /// The provenance of `state` — the producing segment's stamp (see
+    /// [`SegmentTokens`]); resuming from it carries that provenance forward.
+    engine: Option<EngineId>,
+}
 
 /// Where a segment's tokenization begins.
 pub enum SegmentStart {
@@ -1261,6 +1335,13 @@ pub enum SegmentStart {
 pub struct SegmentTokens {
     rows: Range<u32>,
     started_fresh: bool,
+    /// The provenance stamp [`HighlightCache::absorb`] checks against its own
+    /// engine (the revision stamp alone cannot see a theme/grammar swap):
+    /// `Some(id)` iff the segment was built WHOLLY by engine `id` — tokenized
+    /// by it, from a start state it produced. `None` = mixed provenance (some
+    /// input came from another engine); no cache absorbs that, and the taint
+    /// rides the end boundary into anything chained from it.
+    engine: Option<EngineId>,
     /// Stride-aligned end-state checkpoints within `rows` (rows where
     /// `(row + 1) % HIGHLIGHT_CHECKPOINT_STRIDE == 0`) - the SAME rows the
     /// sync walk would pick, so [`HighlightCache::absorb`] merges them cleanly.
@@ -1326,6 +1407,12 @@ impl SegmentTokens {
 /// `converge_against` is `Some`), so the caller need not track which window
 /// the old segment was tokenized with — the splice stays internally consistent
 /// even if the viewport moved since.
+///
+/// **Provenance.** The result is stamped as `engine`'s only if every input is
+/// too: a `start` boundary or `converge_against` segment produced by another
+/// engine (e.g. before a theme or grammar swap) yields a segment that
+/// [`crate::Document::absorb_highlight`] refuses, as does anything chained from
+/// its end boundary. After a swap, re-fetch the engine and re-sweep from row 0.
 #[must_use]
 pub fn tokenize_segment(
     engine: &HighlightEngine,
@@ -1338,10 +1425,19 @@ pub fn tokenize_segment(
     let syntect = SyntectHighlighter::new(&engine.theme.0);
     let set = &engine.syntax.set;
     let started_fresh = matches!(start, SegmentStart::Fresh);
-    let mut state = match start {
-        SegmentStart::Fresh => engine.fresh_state(),
-        SegmentStart::After(b) => *b.0,
+    // Provenance: the result is `engine`'s only if every input it builds on is
+    // too — the start state it resumes from, and the old segment a converging
+    // re-run may splice its tail from. One foreign input taints the whole
+    // result (`None`), which no cache absorbs; that is the only safe answer,
+    // since another engine's state or spans would otherwise ride in under this
+    // engine's stamp.
+    let (mut state, start_engine) = match start {
+        SegmentStart::Fresh => (engine.fresh_state(), Some(engine.id)),
+        SegmentStart::After(b) => (*b.state, b.engine),
     };
+    let own = |id: Option<EngineId>| id == Some(engine.id);
+    let stamp = (own(start_engine) && converge_against.is_none_or(|old| own(old.engine)))
+        .then_some(engine.id);
 
     let n = snapshot.line_count();
     let lo = rows.start.min(n);
@@ -1395,8 +1491,9 @@ pub fn tokenize_segment(
                     return SegmentTokens {
                         rows,
                         started_fresh,
+                        engine: stamp,
                         checkpoints,
-                        end: old.end.clone(),
+                        end: SegmentBoundary { state: old.end.state.clone(), engine: stamp },
                         win,
                         win_spans,
                         win_states,
@@ -1411,8 +1508,9 @@ pub fn tokenize_segment(
     SegmentTokens {
         rows,
         started_fresh,
+        engine: stamp,
         checkpoints,
-        end: SegmentBoundary(Box::new(state)),
+        end: SegmentBoundary { state: Box::new(state), engine: stamp },
         win,
         win_spans,
         win_states,
@@ -1933,18 +2031,14 @@ mod tests {
         \x20   - match: '.'\n\
         \x20     scope: comment.block.test\n";
 
+    // A test that ABSORBS segments builds its cache around the engine that
+    // tokenized them (`HighlightCache::with_engine(engine.clone(), n)`): a cache
+    // absorbs only its own engine's segments, and a separately-built cache over
+    // the same sources is a different engine.
     fn engine_cmt() -> HighlightEngine {
         HighlightEngine::new(
             SyntaxDef::from_sublime_syntax(GRAMMAR_CMT).unwrap(),
             TokenTheme::from_tm_theme(THEME).unwrap(),
-        )
-    }
-
-    fn cache_cmt(n: u32) -> HighlightCache {
-        HighlightCache::new(
-            SyntaxDef::from_sublime_syntax(GRAMMAR_CMT).unwrap(),
-            TokenTheme::from_tm_theme(THEME).unwrap(),
-            n,
         )
     }
 
@@ -2644,10 +2738,10 @@ mod tests {
             let win = win_start..(win_start + 40).min(ln);
 
             let (verified, _reruns) = parallel_verify(&engine, &s, &cuts, None);
-            let mut c = cache_str(ln);
+            let mut c = HighlightCache::with_engine(engine.clone(), ln);
             c.set_window(win.clone());
             for seg in verified {
-                c.absorb(seg, true);
+                assert!(c.absorb(seg, true), "a segment of the cache's own engine is absorbed");
             }
             assert_eq!(c.first_dirty(), None, "round {round}: verified sweep must clear all dirt");
             // Spans-less segments left window gaps - the sync refill (from the
@@ -2709,10 +2803,10 @@ mod tests {
         // End-to-end oracle around the close, where the guess was wrong.
         let (verified, reruns) = parallel_verify(&engine, &s, &[200], None);
         assert_eq!(reruns, 1, "the in-comment cut must trigger exactly one re-run");
-        let mut c = cache_cmt(8_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 8_000);
         c.set_window(190..600);
         for v in verified {
-            c.absorb(v, true);
+            assert!(c.absorb(v, true), "a segment of the cache's own engine is absorbed");
         }
         drive_all_snap(&mut c, &s);
         let full = highlighter_cmt().highlight(&lines.join("\n"));
@@ -2753,10 +2847,10 @@ mod tests {
         assert_eq!(moved.win_states.len(), moved.win.len());
         // And absorbing it colours the old window's rows correctly.
         let full = highlighter_cmt().highlight(&lines.join("\n"));
-        let mut c = cache_cmt(4_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 4_000);
         c.set_window(210..250);
-        c.absorb(prefix, true);
-        c.absorb(moved, true);
+        assert!(c.absorb(prefix, true), "a segment of the cache's own engine is absorbed");
+        assert!(c.absorb(moved, true), "a segment of the cache's own engine is absorbed");
         drive_all_snap(&mut c, &s);
         for r in 210..250u32 {
             assert_eq!(c.line_spans(r), Some(full[r as usize].as_slice()), "row {r}");
@@ -2774,10 +2868,10 @@ mod tests {
         let s = snap(&lines);
         let (verified, reruns) = parallel_verify(&engine, &s, &[400, 800, 1_200, 1_600], None);
         assert_eq!(reruns, 4, "every mid-string boundary mismatches");
-        let mut c = cache_str(2_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 2_000);
         c.set_window(900..980);
         for v in verified {
-            c.absorb(v, true);
+            assert!(c.absorb(v, true), "a segment of the cache's own engine is absorbed");
         }
         drive_all_snap(&mut c, &s);
         let full = highlighter_str().highlight(&lines.join("\n"));
@@ -2796,9 +2890,9 @@ mod tests {
         let win = 900u32..940;
         // One verified segment covering the viewport, carrying its spans.
         let seg = tokenize_segment(&engine, &s, 0..2_000, SegmentStart::Fresh, Some(win.clone()), None);
-        let mut c = cache_str(2_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 2_000);
         c.set_window(win.clone());
-        c.absorb(seg, true);
+        assert!(c.absorb(seg, true), "a segment of the cache's own engine is absorbed");
         assert_eq!(c.first_dirty(), None, "verified absorb clears the whole frontier");
         // The requested spans render immediately — no sync walk. (The window
         // pads ±SLACK beyond `spans_for`, so pending() may still report a
@@ -2820,9 +2914,9 @@ mod tests {
         let win = 900u32..940;
         // A viewport-first speculative segment: back off 128 rows, Fresh guess.
         let seg = tokenize_segment(&engine, &s, 772..940, SegmentStart::Fresh, Some(win.clone()), None);
-        let mut c = cache_str(2_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 2_000);
         c.set_window(win.clone());
-        c.absorb(seg, false);
+        assert!(c.absorb(seg, false), "a segment of the cache's own engine is absorbed");
         // Spans are visible now (the guess is right here - no multi-line state).
         let full = highlighter_str().highlight(&lines.join("\n"));
         for r in win.clone() {
@@ -2846,9 +2940,9 @@ mod tests {
         let s = snap(&lines);
         let win = 900u32..940;
         let seg = tokenize_segment(&engine, &s, 772..940, SegmentStart::Fresh, Some(win.clone()), None);
-        let mut c = cache_str(2_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 2_000);
         c.set_window(win.clone());
-        c.absorb(seg, false);
+        assert!(c.absorb(seg, false), "a segment of the cache's own engine is absorbed");
         // Now drive the frontier from row 0 (as the idle sweep would). When it
         // reaches the window, each row's freshly-tokenized state matches the
         // stored speculative state, so it converges immediately and the whole
@@ -2874,12 +2968,12 @@ mod tests {
         let s = snap(&lines);
         let win = 1_500u32..1_540; // deep inside the comment
         let full = highlighter_cmt().highlight(&lines.join("\n"));
-        let mut c = cache_cmt(4_000);
+        let mut c = HighlightCache::with_engine(engine.clone(), 4_000);
         c.set_window(win.clone());
         // Speculate from a FRESH (ground) start — WRONG here, the truth is
         // in-comment.
         let spec = tokenize_segment(&engine, &s, 1_400..1_540, SegmentStart::Fresh, Some(win.clone()), None);
-        c.absorb(spec, false);
+        assert!(c.absorb(spec, false), "a segment of the cache's own engine is absorbed");
         assert_ne!(
             c.line_spans(1_520),
             Some(full[1_520].as_slice()),
@@ -2888,7 +2982,7 @@ mod tests {
         // The correct verified sweep (one segment, Fresh at row 0 = true).
         let (verified, _) = parallel_verify(&engine, &s, &[], None);
         for v in verified {
-            c.absorb(v, true);
+            assert!(c.absorb(v, true), "a segment of the cache's own engine is absorbed");
         }
         // The wrong speculative span is GONE — evicted, not left clean.
         assert_eq!(c.line_spans(1_520), None, "wrong speculative spans must be evicted, never trusted");

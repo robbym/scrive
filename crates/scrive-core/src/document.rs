@@ -15,10 +15,11 @@ use std::borrow::Cow;
 
 use crate::bracket::Brackets;
 use crate::buffer::{Buffer, EolFlavor, LoadError, Revision, Snapshot};
+use crate::change_log::ChangeLog;
 use crate::coords::{Bias, Point};
 use crate::decorations::{
-    DecorationKind, DecorationStore, Diagnostic, DiagnosticsOutcome, Severity, Stickiness,
-    TrackedRange,
+    DecorationId, DecorationKind, DecorationStore, Diagnostic, DiagnosticsOutcome, Severity,
+    Stickiness, TrackedRange,
 };
 use crate::display_map::{BufferRow, DisplayRow};
 use crate::find::{FindQuery, FindState};
@@ -28,6 +29,7 @@ use crate::fold_map::{FoldMap, FoldSet};
 use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef, TokenTheme};
 use crate::history::{GroupingHint, History};
 use crate::movement::{self, ColumnDir, Granularity, Motion};
+use crate::patch::Patch;
 use crate::selection::{Selection, SelectionId, SelectionSet};
 use crate::transaction::{apply, Committed, EditOp, TransactionError};
 
@@ -100,11 +102,12 @@ pub struct Document {
     /// The strategy of the last reveal request.
     reveal_mode: RevealMode,
     /// Opt-in incremental-change log. Off by default (zero overhead per edit);
-    /// when [`Document::observe_changes`] enables it, every committed edit's
-    /// applied ops are appended for a host to [`drain`](Document::drain_changes)
-    /// — e.g. to mirror edits to a language server as `textDocument/didChange`.
-    observe_changes: bool,
-    changes: Vec<EditOp>,
+    /// when [`Document::observe_changes`] enables it, every applied step —
+    /// forward edit, undo, redo — is appended for a host to
+    /// [`drain`](Document::drain_changes), e.g. to mirror edits to a language
+    /// server as `textDocument/didChange`. Fed only by `rebase_views` (it rides
+    /// in [`Views`]), the one mover every mutation route shares.
+    changes: ChangeLog,
     /// Memoized [`FoldMap`]. The render path queries it ~20× per frame, so it is
     /// cached rather than rebuilt (a fresh build is O(folds), which at document
     /// scale with everything collapsed would stall scrolling). A fold toggle
@@ -189,8 +192,7 @@ impl Document {
             expand_stack: Vec::new(),
             reveal_seq: 0,
             reveal_mode: RevealMode::Fit,
-            observe_changes: false,
-            changes: Vec::new(),
+            changes: ChangeLog::default(),
             // Seed with a never-matching key so the first `fold_map()` builds it.
             fold_cache: RefCell::new(FoldMapCache { key: (u64::MAX, u64::MAX), map: FoldMap::empty() }),
         })
@@ -292,10 +294,18 @@ impl Document {
         &self.selections
     }
 
-    /// Replace the selection set (e.g. a mouse click placing a caret). Offsets
-    /// are clamped to the buffer.
-    pub fn set_selections(&mut self, selections: SelectionSet) {
+    /// Replace the selection set (e.g. a mouse click placing a caret, or a
+    /// host's go-to-definition). Host offsets are untrusted, so every endpoint
+    /// is clipped to the buffer: past-end offsets clamp to the end, a ranged
+    /// selection snaps outward to whole chars ([`Bias::Left`] start,
+    /// [`Bias::Right`] end), and a caret inside a char snaps `Left` to its
+    /// start; selections the clamp lands on one offset merge.
+    pub fn set_selections(&mut self, mut selections: SelectionSet) {
         self.reset_transient();
+        // The one door a host-built set walks through. Undo/redo's restore
+        // installs history's own sets, captured against this exact text, so it
+        // bypasses this (`restore_selections`) rather than paying a re-clip.
+        selections.clip_to(&self.buffer);
         self.selections = selections;
     }
 
@@ -314,10 +324,12 @@ impl Document {
     }
 
     /// Add a bare caret at `offset` — the Alt+Click add-caret gesture.
-    /// Merges into any selection it touches via the set's merge rule.
+    /// Merges into any selection it touches via the set's merge rule. The
+    /// offset is clipped first: past the end clamps to the end, and inside a
+    /// char snaps [`Bias::Left`] to its start.
     pub fn add_caret(&mut self, offset: u32) {
         self.reset_transient();
-        self.selections.add_caret(offset);
+        self.selections.add_caret(self.buffer.clip_offset(offset, Bias::Left));
     }
 
     /// Ctrl+D. If the newest selection is an empty caret, select the word
@@ -683,8 +695,14 @@ impl Document {
     /// fully selected even when the drag reverses past it (the tail flips to the
     /// far edge of the origin unit). `head == origin` selects just the origin
     /// unit — the double/triple-click initial selection. Replaces the set.
+    /// Both offsets are clipped first, like a caret: past the end clamps to the
+    /// end, and inside a char snaps [`Bias::Left`] to its start.
     pub fn drag_select(&mut self, granularity: Granularity, origin: u32, head: u32) {
         self.reset_transient();
+        // Clip before the unit scans: the word scan reads chars at `origin`
+        // and `head`, and a mid-char read is a panic, not a wrong answer.
+        let origin = self.buffer.clip_offset(origin, Bias::Left);
+        let head = self.buffer.clip_offset(head, Bias::Left);
         let (anchor, head) = match granularity {
             Granularity::Char => (origin, head),
             Granularity::Word => {
@@ -751,15 +769,22 @@ impl Document {
     /// own content, so a drag past short lines still selects the full width of
     /// longer ones. Same selection-only semantics as `column_select`; any other
     /// action exits the mode. Shares `Document.column`, so a keyboard box then
-    /// continues it.
+    /// continues it. A corner row past the document clamps to the last row
+    /// (the cell, being virtual, is kept as given).
     pub fn column_drag(&mut self, anchor: (u32, u32), active: (u32, u32)) {
         // Same boundary + ladder rule as `column_select`.
         self.history.seal();
         self.expand_stack.clear();
         let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
+        // Clamp the rows before they are stored: the box builds one selection
+        // per row it spans, so an unclamped host row would cost (and allocate)
+        // per *requested* row, and survive as the anchor a keyboard box steps
+        // from. Cells need no clamp — every row resolves them through
+        // `hit_row`, which clamps to that row's content.
+        let last = self.buffer.line_count() - 1;
         let col = ColumnSelection {
-            anchor: CellCorner { row: anchor.0, cell: anchor.1 },
-            active: CellCorner { row: active.0, cell: active.1 },
+            anchor: CellCorner { row: anchor.0.min(last), cell: anchor.1 },
+            active: CellCorner { row: active.0.min(last), cell: active.1 },
         };
         self.column = Some(col);
         self.rebuild_column_box(&folds, self.tab_size(), col);
@@ -786,92 +811,6 @@ impl Document {
         }
     }
 
-    /// Move the selected line-block up or down one line (Alt+↑/↓). Swaps the
-    /// block with its neighbour; the selection rides the moved text. A block at
-    /// the document edge — or, moving down, against the trailing empty line — is
-    /// a no-op. Single selection. Own undo step; never re-indents.
-    pub fn move_line(&mut self, down: bool) {
-        let sel = *self.selections.newest();
-        let p0 = self.buffer.offset_to_point(sel.start());
-        let p1 = self.buffer.offset_to_point(sel.end());
-        let (r0, r1) = (p0.row, p1.row);
-        let line_count = self.buffer.line_count();
-        let ends_nl = self.buffer.char_before(self.buffer.len()) == Some('\n');
-        // The last row a real line occupies (the trailing empty line, if any, is
-        // not movable — moving into it would drop the terminator).
-        let last_movable = if ends_nl { line_count.saturating_sub(2) } else { line_count - 1 };
-        if (down && r1 >= last_movable) || (!down && r0 == 0) {
-            return;
-        }
-        let (a, b) = if down { (r0, r1 + 1) } else { (r0 - 1, r1) };
-        let has_nl = b + 1 < line_count; // row `b` carries a trailing newline
-        let region_start = self.buffer.point_to_offset(Point::new(a, 0));
-        let region_end = if has_nl {
-            self.buffer.point_to_offset(Point::new(b + 1, 0))
-        } else {
-            self.buffer.len()
-        };
-        let lines: Vec<Cow<str>> = (a..=b).map(|r| self.buffer.line(r)).collect();
-        let reordered: Vec<Cow<str>> = if down {
-            // The line below moves to the front; the block shifts down.
-            let mut v = vec![lines[lines.len() - 1].clone()];
-            v.extend_from_slice(&lines[..lines.len() - 1]);
-            v
-        } else {
-            // The line above moves to the back; the block shifts up.
-            let mut v = lines[1..].to_vec();
-            v.push(lines[0].clone());
-            v
-        };
-        let mut new_text = reordered.join("\n");
-        if has_nl {
-            new_text.push('\n');
-        }
-        let _ = self.edit(vec![EditOp::new(region_start..region_end, &new_text)]);
-        // Place the selection on the moved block (one line over).
-        let shift = |r: u32| if down { r + 1 } else { r - 1 };
-        let ns = self.buffer.point_to_offset(Point::new(shift(r0), p0.col));
-        let ne = self.buffer.point_to_offset(Point::new(shift(r1), p1.col));
-        let mut set = SelectionSet::new(0);
-        set.set_single(Selection::from_anchor(SelectionId(0), ns, ne));
-        self.selections = set;
-        // Drop provenance through the one owner so the `AutoClosePair`
-        // decoration is removed with it — the store is the single owner of the
-        // pair, with nothing else to keep in sync.
-        self.clear_autoclose();
-    }
-
-    /// Duplicate the selected line-block above (`down = false`) or below
-    /// (`down = true`) — Shift+Alt+↑/↓. The caret lands on the copy. Single
-    /// selection. Own undo step.
-    pub fn copy_line(&mut self, down: bool) {
-        let sel = *self.selections.newest();
-        let p0 = self.buffer.offset_to_point(sel.start());
-        let p1 = self.buffer.offset_to_point(sel.end());
-        let (r0, r1) = (p0.row, p1.row);
-        let height = r1 - r0 + 1;
-        let line_count = self.buffer.line_count();
-        let block: String = (r0..=r1).map(|r| self.buffer.line(r)).collect::<Vec<_>>().join("\n");
-        let (at, text) = if !down {
-            (self.buffer.point_to_offset(Point::new(r0, 0)), format!("{block}\n"))
-        } else if r1 + 1 < line_count {
-            (self.buffer.point_to_offset(Point::new(r1 + 1, 0)), format!("{block}\n"))
-        } else {
-            // Duplicating the final line (no trailing newline): prepend one.
-            (self.buffer.len(), format!("\n{block}"))
-        };
-        let _ = self.edit(vec![EditOp::new(at..at, &text)]);
-        let (nr0, nr1) = if down { (r0 + height, r1 + height) } else { (r0, r1) };
-        let ns = self.buffer.point_to_offset(Point::new(nr0, p0.col));
-        let ne = self.buffer.point_to_offset(Point::new(nr1, p1.col));
-        let mut set = SelectionSet::new(0);
-        set.set_single(Selection::from_anchor(SelectionId(0), ns, ne));
-        self.selections = set;
-        // Same as `move_line`: clear provenance through the owner so the store
-        // entry can't be orphaned.
-        self.clear_autoclose();
-    }
-
     /// Step a box corner one unit in `dir`, in display space: vertical steps
     /// walk display rows — a collapsed fold is hopped in one step — and clamp
     /// to the document; the left cell saturates at 0; the right cell is
@@ -885,7 +824,8 @@ impl Document {
                 CellCorner { row: row_at((d + 1).min(folds.max_display_row().index())), cell: c.cell }
             }
             ColumnDir::Left => CellCorner { row: c.row, cell: c.cell.saturating_sub(1) },
-            ColumnDir::Right => CellCorner { row: c.row, cell: c.cell + 1 },
+            // Saturating: a host corner may already sit at the largest cell.
+            ColumnDir::Right => CellCorner { row: c.row, cell: c.cell.saturating_add(1) },
         }
     }
 
@@ -947,13 +887,53 @@ impl Document {
 
     /// Apply a batch of edits with an explicit [`GroupingHint`]: the
     /// verbs layer uses this so a typing run collapses to one undo step.
+    ///
+    /// The selections rebase through the edit, and that rebased set is what
+    /// [`redo`](Document::redo) restores for this unit; the set ahead of the
+    /// unit is what [`undo`](Document::undo) restores.
     pub fn edit_grouped(
         &mut self,
         ops: Vec<EditOp>,
         hint: GroupingHint,
     ) -> Result<Committed, TransactionError> {
+        self.edit_placing(ops, hint, |_, _| None)
+    }
+
+    /// THE commit path — [`edit_grouped`](Document::edit_grouped) plus a caret
+    /// placement. `place` sees the committed forward patch and the post-edit
+    /// document — buffer, rebased selections, every view already moved (the
+    /// find set repaired) — and returns the selections the edit leaves (`None`
+    /// keeps the rebased set); it runs only for an edit that changed text.
+    ///
+    /// Placement lives INSIDE the commit, not after it returns, because history
+    /// records each unit's after-selections with the transaction: a verb that
+    /// assigned `self.selections` once this returned would show its carets but
+    /// leave redo restoring the rebased ones. The contract, exactly: every core
+    /// verb whose edit leaves the selections anywhere but the rebased set places
+    /// them here (`run_edit`, auto-close, surround, Enter, insert-line, move and
+    /// copy line, [`replace_next`](Document::replace_next)'s advance), so redo
+    /// restores what the verb showed. A selection set once a commit has returned
+    /// is a separate selection gesture, outside the unit. One known exception
+    /// does that on purpose: scrive-iced's `CodeEditor::accept_completion`
+    /// inserts through [`insert_text`](Document::insert_text), then selects the
+    /// snippet's first tab stop (or its final caret) itself — so redoing an
+    /// accepted snippet restores the caret after the inserted text, not the
+    /// stop. Core has no snippet-insert verb to place that through, and the
+    /// tab-stop session it would select into is widget state that history does
+    /// not restore either.
+    pub(crate) fn edit_placing(
+        &mut self,
+        ops: Vec<EditOp>,
+        hint: GroupingHint,
+        place: impl FnOnce(&Patch, &Document) -> Option<SelectionSet>,
+    ) -> Result<Committed, TransactionError> {
         self.column = None; // any text edit exits column-select mode…
         self.expand_stack.clear(); // …and invalidates the expand ladder
+        // The selections ahead of the edit — what undo restores — captured
+        // before the patch rebases them, and only when this edit opens a unit:
+        // a keystroke merging into an open run keeps the run's first before-set,
+        // so it needs (and clones) nothing here.
+        let sel_before = (!self.history.merges(hint)).then(|| self.selections.clone());
         // The (revision, fold generation) the fold cache would need to be at to
         // shift it in place instead of rebuilding — captured before the edit.
         let pre_fold_key = (self.buffer.revision().0, self.folds.generation());
@@ -979,7 +959,8 @@ impl Document {
             // Rebase every derived view through the patch — the single mover,
             // shared verbatim with undo/redo (see `rebase_views`). The auto-close
             // provenance is an `AutoClosePair` decoration, so it rides here too —
-            // no hand-rebasing; the fold reveal rides inside it too.
+            // no hand-rebasing; the fold reveal and the change log ride inside it
+            // too.
             let region = rebase_views(
                 &mut Views {
                     highlight: &mut self.highlight,
@@ -988,6 +969,7 @@ impl Document {
                     autoclose: &mut self.autoclose,
                     folds: &mut self.folds,
                     find: &mut self.find,
+                    changes: &mut self.changes,
                 },
                 &self.buffer,
                 tab,
@@ -1031,24 +1013,20 @@ impl Document {
                     cache.key = (u64::MAX, u64::MAX);
                 }
             }
-            // Log the applied deltas for a host draining incremental changes
-            // (LSP `didChange`) — only when observing, so the common path pays
-            // nothing. Descending start order so sequential application within
-            // this batch is offset-stable; ops move into history next, so read
-            // them here. Their ranges are in the pre-edit coordinates the batch
-            // was applied against — exactly what a content-change wants.
-            if self.observe_changes {
-                let mut ops = committed.forward_ops().to_vec();
-                ops.sort_by_key(|op| core::cmp::Reverse(op.range.start));
-                self.changes.extend(ops);
+            // The verb's caret placement replaces the rebased set — after the
+            // autoclose validation above, which judges the pairs by the REBASED
+            // carets (the order verbs had when they placed carets post-return).
+            if let Some(placed) = place(committed.patch(), self) {
+                self.selections = placed;
             }
             // Record history LAST, moving the forward + inverse op batches out of
             // `committed` with no clone (rebase_views already used its borrow of
             // the inverse; the fold-cache borrow above has been dropped, freeing
-            // `&mut self` for `history`). The returned `Committed` keeps only the
-            // patch — the sole part callers (the verbs layer) read.
+            // `&mut self` for `history`), with the selections on either side of
+            // the unit. The returned `Committed` keeps only the patch — the sole
+            // part callers (the verbs layer) read.
             let (patch, forward, inverse) = committed.into_ops();
-            self.history.record(forward, inverse, hint);
+            self.history.record(forward, inverse, hint, sel_before, &self.selections);
             return Ok(Committed::from_patch(patch));
         }
         Ok(committed)
@@ -1056,28 +1034,31 @@ impl Document {
 
     /// Enable or disable the incremental-change log. Off by default so the common
     /// path pays nothing; a host mirroring edits to a language server
-    /// (`textDocument/didChange`) turns it on and drains
-    /// [`drain_changes`](Document::drain_changes) after each edit. Turning it off
-    /// clears any pending log. For full-document sync, leave this off and re-read
-    /// [`snapshot`](Document::snapshot) instead.
+    /// (`textDocument/didChange`) turns it on — taking the current
+    /// [`text`](Document::text) as its starting copy — and drains
+    /// [`drain_changes`](Document::drain_changes) after each edit, undo, or
+    /// redo. Turning it off clears any pending log. For full-document sync, leave
+    /// this off and re-read [`snapshot`](Document::snapshot) instead.
     pub fn observe_changes(&mut self, on: bool) {
-        self.observe_changes = on;
-        if !on {
-            self.changes.clear();
-        }
+        self.changes.set_observing(on);
     }
 
-    /// Drain the incremental-change log: every applied edit since the last drain,
-    /// in commit order (offset-stable within each commit), as `EditOp` deltas
-    /// whose `range` is in the coordinates of the document just before that edit —
-    /// ready to translate into language-server content changes. Empty unless
+    /// Drain the incremental-change log: every applied change since the last
+    /// drain — forward edits, undo, and redo alike — as `EditOp` deltas in
+    /// **sequential replay order**: each op's `range` is in the coordinates of
+    /// the document as left by the previous op, so applying them one by one, in
+    /// order, to the text the host last saw yields exactly
+    /// [`text`](Document::text) — the shape of a language server's
+    /// content-change array. Empty unless
     /// [`observe_changes`](Document::observe_changes) is on.
     #[must_use]
     pub fn drain_changes(&mut self) -> Vec<EditOp> {
-        core::mem::take(&mut self.changes)
+        self.changes.drain()
     }
 
-    /// Undo the most recent undo unit. Returns `false` if there is nothing to
+    /// Undo the most recent undo unit, restoring the selections from before it
+    /// — every caret of a multi-cursor edit, and for a merged typing run the set
+    /// from before its first keystroke. Returns `false` if there is nothing to
     /// undo.
     ///
     /// Each reverted step threads its patch through `rebase_views` — the exact
@@ -1088,66 +1069,57 @@ impl Document {
     pub fn undo(&mut self) -> bool {
         self.reset_transient();
         let tab = self.tab_size();
-        // Where to land the caret: the START of the reverted region, so undo takes
-        // you TO the change (as mainstream editors do) instead of leaving the
-        // caret wherever it happened to be. Steps revert newest→oldest, so the LAST
-        // callback is the oldest edit — the region's start.
-        let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
+            history, buffer, highlight, brackets, decorations, autoclose, folds, find, changes, ..
         } = self;
-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
-        let undone = history.undo(buffer, selections, |committed, buffer| {
+        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find, changes };
+        let restored = history.undo(buffer, |committed, buffer| {
             // The one mover — highlight, brackets, decorations, folds (position +
             // fold reveal) all ride it, so undo needs no per-feature resync.
             rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
-            if let Some(e) = committed.patch().edits().first() {
-                caret_home = Some(e.new.start);
-            }
         });
+        let Some(selections) = restored else { return false };
         // Reverting text can invalidate a fold's bracket pair too — reconcile once
-        // the buffer/brackets are settled, same as the forward edit path.
-        if undone {
-            self.reconcile_folds();
-            // Move the caret to the reverted edit (the widget's `moves_caret`
-            // autoscroll then follows it into view). Overrides the mid-revert
-            // rebase — the user wants to SEE what undo changed, not stay put.
-            if let Some(off) = caret_home {
-                self.selections = SelectionSet::new(off);
-            }
-        }
-        undone
+        // the buffer/brackets are settled, same as the forward edit path, and
+        // BEFORE the restore below ejects carets against the surviving folds.
+        self.reconcile_folds();
+        self.restore_selections(selections);
+        true
     }
 
     /// Redo the most recently undone unit — the [`undo`](Document::undo) mirror,
-    /// through the same `rebase_views` mover. Returns `false` if nothing to redo.
+    /// through the same `rebase_views` mover — restoring the selections the
+    /// unit left (a verb's caret placement included). Returns `false` if
+    /// nothing to redo.
     pub fn redo(&mut self) -> bool {
         self.reset_transient();
         let tab = self.tab_size();
-        // Symmetric to `undo`: land the caret at the END of the re-applied region,
-        // where it would sit had the edit just been made. Steps replay oldest→newest,
-        // so the LAST callback is the newest edit — the region's end.
-        let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
+            history, buffer, highlight, brackets, decorations, autoclose, folds, find, changes, ..
         } = self;
-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
-        let redone = history.redo(buffer, selections, |committed, buffer| {
+        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find, changes };
+        let restored = history.redo(buffer, |committed, buffer| {
             // The same one mover as `undo` (folds ride it, position + fold reveal).
             rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
-            if let Some(e) = committed.patch().edits().last() {
-                caret_home = Some(e.new.end);
-            }
         });
-        if redone {
-            self.reconcile_folds();
-            if let Some(off) = caret_home {
-                self.selections = SelectionSet::new(off);
-            }
-        }
-        redone
+        let Some(selections) = restored else { return false };
+        self.reconcile_folds();
+        self.restore_selections(selections);
+        true
+    }
+
+    /// Install a selection set history recorded — undo's before-set or redo's
+    /// after-set. The offsets need no rebasing (the buffer is byte-identical to
+    /// the state they were captured in), but the folds may differ: one collapsed
+    /// since the capture can hide a restored caret (the mover expanded the folds
+    /// hiding the reverted edit itself, but a caret elsewhere in the set gets no
+    /// such reveal), so restore ejects through the same pass a fold gesture uses.
+    /// The widget's caret autoscroll then follows the newest restored selection.
+    fn restore_selections(&mut self, selections: SelectionSet) {
+        self.selections = selections;
+        self.eject_hidden_carets();
     }
 
     /// Whether the document differs from the last [`Document::mark_saved`].
@@ -1248,7 +1220,15 @@ impl Document {
     }
 
     /// Mutable [`decorations`](Document::decorations) for a decoration owner.
+    /// Host ranges are untrusted, so the store is handed out with the current
+    /// text lent to it: every range it stores until the next edit is clipped to
+    /// the buffer by the one range rule — past-end ends clamp to the end, a
+    /// non-empty range snaps outward to whole chars ([`Bias::Left`] start,
+    /// [`Bias::Right`] end), an empty one `Left` to its char's start.
     pub fn decorations_mut(&mut self) -> &mut DecorationStore {
+        // O(1): the lent copy shares the rope's structure; the next commit's
+        // mover drops it before the text can differ (see the store's doc).
+        self.decorations.lend_text(&self.buffer);
         &mut self.decorations
     }
 
@@ -1385,8 +1365,13 @@ impl Document {
     /// When it *folds*, any caret the fold would hide is ejected to the gap's
     /// entry edge so it never sits on collapsed text: an inline pair
     /// pulls it to `opener+1` (just after `[`), a block to the header line's
-    /// end (just before the `…` placeholder).
+    /// end (just before the `…` placeholder). A host `opener` is clipped first
+    /// (past the end clamps to the end; inside a char snaps [`Bias::Left`] to
+    /// its start), so a fold is never keyed off the buffer's char grid.
     pub fn toggle_fold_opener(&mut self, opener: u32) -> bool {
+        // An opener is a bracket, which is ASCII, so a clipped mid-char offset
+        // can never be one — the clip only keeps a bad host offset in range.
+        let opener = self.buffer.clip_offset(opener, Bias::Left);
         let changed = self.folds.toggle(opener);
         if changed {
             // A fold toggle is a gesture that can MOVE carets (the ejection
@@ -1397,38 +1382,14 @@ impl Document {
             self.reset_transient();
         }
         if changed && self.folds.is_folded(opener) {
-            if let Some(close) = self.brackets.foldable_partner(opener) {
-                let single_line = self.buffer.offset_to_point(opener).row == self.buffer.offset_to_point(close).row;
-                if single_line {
-                    // The shared gap rule: a caret strictly inside the
-                    // now-hidden interior pulls out to the left landable edge.
-                    self.selections.map_each(|s| {
-                        if crate::row_layout::gap_hides_caret(opener, close, s.head()) {
-                            s.move_to_caret(crate::row_layout::gap_left_edge(opener));
-                        }
-                    });
-                } else {
-                    // Block: eject any caret the fold just hid to the gap's
-                    // entry edge — the header line's end, just before the `…`
-                    // placeholder (the block analog of the inline pull-out
-                    // above), so typing can never edit invisible text. "Hidden"
-                    // comes from the one owner: `display_position` is `None`
-                    // exactly for offsets in a fold's gap.
-                    // The one tab-width owner (hoisted above the destructure that
-                    // borrows the fields — `self.tab_size()` can't be called after).
-                    let tab = self.tab_size();
-                    let Self { selections, buffer, folds, brackets, .. } = self;
-                    let fold_map = crate::fold_map::FoldMap::new(folds, brackets, buffer);
-                    let header = buffer.offset_to_point(opener).row;
-                    let entry = buffer.point_to_offset(Point::new(header, buffer.line_len(header)));
-                    selections.map_each(|s| {
-                        let inside = s.head() > opener && s.head() < close;
-                        if inside && fold_map.display_position(buffer, s.head(), tab).is_none() {
-                            s.move_to_caret(entry);
-                        }
-                    });
-                }
-            }
+            // Eject every caret the fold just hid, so typing can never edit
+            // invisible text — the batch gesture's own pass, reading the
+            // one hiding owner (`entry_edge_if_hidden`) off the MEMOIZED map:
+            // the toggle bumped the fold generation, so this build is the one
+            // the next render reads, not a throwaway the render repeats. A
+            // caret hidden by an enclosing collapsed fold lands on that fold's
+            // (visible) entry edge rather than this one's.
+            self.eject_hidden_carets();
         }
         changed
     }
@@ -1536,16 +1497,22 @@ impl Document {
     }
 
     /// Pull every caret out of a newly-hidden fold gap to the fold's entry edge
-    /// — the batched form of [`Self::toggle_fold_opener`]'s ejection: ONE
-    /// FoldMap build, each caret probed in O(log folds).
+    /// — THE ejection pass, shared by every gesture that can hide a caret (a
+    /// fold toggle, a batch fold, undo/redo's restore), each caret probed in
+    /// O(log folds) by the one hiding test, [`FoldMap::entry_edge_if_hidden`].
+    /// It reads the MEMOIZED map (`ensure_fold_map`), never a throwaway
+    /// `FoldMap::new`: its callers have just changed the fold generation or the
+    /// text, so the memo rebuilds here once and the next render reads that
+    /// build instead of paying a second O(folds) one.
     fn eject_hidden_carets(&mut self) {
-        let Self { selections, buffer, folds, brackets, .. } = self;
-        if folds.is_empty() {
+        if self.folds.is_empty() {
             return;
         }
-        let fold_map = crate::fold_map::FoldMap::new(folds, brackets, buffer);
+        self.ensure_fold_map();
+        let Self { selections, buffer, fold_cache, .. } = self;
+        let cache = fold_cache.borrow();
         selections.map_each(|s| {
-            if let Some(entry) = fold_map.entry_edge_if_hidden(buffer, s.head()) {
+            if let Some(entry) = cache.map.entry_edge_if_hidden(buffer, s.head()) {
                 s.move_to_caret(entry);
             }
         });
@@ -1752,9 +1719,19 @@ impl Document {
     }
 
     /// Ingest a segment tokenized off-thread (the parallel/speculative sweep).
-    /// Returns `false` — absorbing **nothing** — if `revision` no longer
-    /// matches the document (an edit landed since the snapshot the segment was
-    /// computed from; the app drops the stale result and re-dispatches). On a
+    /// Returns `false` — absorbing **nothing** — if the segment is stale on
+    /// either axis:
+    ///
+    /// - `revision` no longer matches the document (an edit landed since the
+    ///   snapshot the segment was computed from), or
+    /// - it was tokenized by an engine other than the highlighter's current
+    ///   one — a [`set_theme`](Document::set_theme) or
+    ///   [`set_syntax`](Document::set_syntax) since
+    ///   [`highlight_engine`](Document::highlight_engine) was fetched (neither
+    ///   moves the revision), or a standalone [`HighlightEngine::new`].
+    ///
+    /// Either way the app drops the result and re-dispatches — after
+    /// re-fetching `highlight_engine` if the revision still matches. On a
     /// match, forwards to `HighlightCache::absorb`:
     ///
     /// - `verified` — the coordinator chained this segment from row 0, so its
@@ -1780,8 +1757,7 @@ impl Document {
             return false;
         }
         let Some(cache) = self.highlight.as_mut() else { return false };
-        cache.absorb(seg, verified);
-        true
+        cache.absorb(seg, verified)
     }
 
     /// The matched brackets — kept current on every edit. Drives
@@ -1797,24 +1773,19 @@ impl Document {
     /// since moved on this returns [`DiagnosticsOutcome::Stale`] having installed
     /// nothing — the previous squiggles keep riding edits via stickiness until
     /// the next publish (no stale set is placed). On a current revision the whole
-    /// diagnostic set is replaced wholesale; spans are first clipped to the buffer
-    /// length. Zero-width spans survive — the squiggle enforces its one-cell
-    /// minimum at draw time.
+    /// diagnostic set is replaced wholesale; spans are first clipped to the
+    /// buffer: clamped to its length (an inverted span collapses to its end),
+    /// then snapped to char boundaries — outward for a non-empty span
+    /// ([`Bias::Left`] start, [`Bias::Right`] end), `Left` for an empty one.
+    /// Zero-width spans survive — the squiggle enforces its one-cell minimum at
+    /// draw time.
     pub fn set_diagnostics(&mut self, revision: Revision, diags: Vec<Diagnostic>) -> DiagnosticsOutcome {
-        let current = self.buffer.revision();
-        if revision != current {
-            return DiagnosticsOutcome::Stale { current: current.0 };
-        }
-        let len = self.buffer.len();
-        let clipped: Vec<Diagnostic> = diags
-            .into_iter()
-            .map(|mut d| {
-                let (s, e) = (d.span.start.min(len), d.span.end.min(len));
-                d.span = s.min(e)..e; // clip to buffer, never inverted
-                d
-            })
-            .collect();
-        self.decorations.set_diagnostics(current.0, current.0, clipped)
+        let current = self.buffer.revision().0;
+        // A compiler's span is host arithmetic (often UTF-16 → byte), so it can
+        // split a char: the store clips each one against the text
+        // `decorations_mut` lends it — the one door every host range into the
+        // store takes — after its own revision gate.
+        self.decorations_mut().set_diagnostics(revision.0, current, diags)
     }
 
     /// Diagnostics overlapping the byte `range`, for squiggle rendering:
@@ -1862,9 +1833,12 @@ impl Document {
     /// knowing it exists.
     ///
     /// The scope then rides every edit's patch like any other derived position,
-    /// growing when text is typed at its edges and dropping if it collapses. An
-    /// empty range clears it rather than pinning zero matches.
+    /// growing when text is typed at its edges and dropping if it collapses. The
+    /// range is clipped to the buffer first — clamped to its length, snapped
+    /// outward to whole chars ([`Bias::Left`] start, [`Bias::Right`] end) — and
+    /// an empty result clears the scope rather than pinning zero matches.
     pub fn set_find_scope(&mut self, scope: Option<Range<u32>>, now_ms: u64) {
+        let scope = scope.map(|r| self.buffer.clip_range(r));
         self.find.set_scope(scope, &self.buffer, &mut self.decorations, now_ms);
     }
 
@@ -1889,7 +1863,8 @@ impl Document {
     /// byte range `within` — the passive occurrence wash (the reading aid for
     /// tracing a PID/label through a script). The window keeps this per-frame
     /// query O(viewport): the widget passes its visible byte range; tests pass
-    /// `0..u32::MAX` (the scan clamps). Every
+    /// `0..u32::MAX` (the window is clipped like any host range: clamped, and
+    /// snapped outward to whole chars). Every
     /// match must be a WHOLE word, judged by the same
     /// `movement::surrounding_word` rule that seeds Ctrl+D — checked against
     /// the full buffer, so a window edge can never fake a word boundary. Empty
@@ -1909,8 +1884,7 @@ impl Document {
             return Vec::new();
         }
         let word = self.buffer.slice(ws..we);
-        let end = within.end.min(self.buffer.len());
-        let base = within.start.min(end);
+        let Range { start: base, end } = self.buffer.clip_range(within);
         let hay = self.buffer.slice(base..end);
         let mut out = Vec::new();
         let mut from = 0usize;
@@ -2014,8 +1988,9 @@ impl Document {
     /// step, and the match set needs no resync — it rides the commit through the
     /// shared view-rebase mover like any other edit.
     /// `preserve_case` (the replace bar's `AB` toggle) re-cases the replacement
-    /// to the match it lands on — an ALL-CAPS match takes an upper-cased
-    /// replacement, a Capitalized match a capitalized one.
+    /// to the match it lands on, by VS Code's rule — an ALL-CAPS match takes an
+    /// upper-cased replacement, a Capitalized one a capitalized one, a camelCase
+    /// one a lower first letter, and `-`/`_` segments are re-cased one by one.
     pub fn replace_next(
         &mut self,
         replacement: &str,
@@ -2035,23 +2010,42 @@ impl Document {
         if armed {
             // The replacement is resolved through the one owner of that rule
             // (regex templating + preserve-case), bounded to this match.
-            let text = self.find.query().cloned().map_or_else(
-                || replacement.to_string(),
-                |q| {
-                    crate::find::replacements(
-                        &self.buffer,
-                        &q,
-                        extent.clone(),
-                        replacement,
-                        preserve_case,
-                    )
-                    .into_iter()
-                    .next()
-                    .map_or_else(|| replacement.to_string(), |(_, t)| t)
-                },
-            );
-            if self.edit(vec![EditOp::new(extent, text)]).is_err() {
-                return None; // a rejected transaction must not read as a replace
+            let text = self
+                .find
+                .replacements(&self.buffer, extent.clone(), replacement, preserve_case)
+                .into_iter()
+                .next()
+                .map_or_else(|| replacement.to_string(), |(_, t)| t);
+            // Advance INSIDE the commit: the next match the replace selects is
+            // the unit's after-set, so redo restores the selection the user saw,
+            // not the caret rebased over the replacement. The pick reads the
+            // post-edit document, whose match set the commit already repaired
+            // around the replacement. (`step_find` would first try a capped
+            // set's debounced refill; the edit's own refill waits for the next
+            // `maybe_rescan_find` — the set is exact up to its coverage.)
+            let mut picked = None; // the next match, as `place` picked it
+            let ops = vec![EditOp::new(extent, text)];
+            let committed = self.edit_placing(ops, GroupingHint::discrete(), |_, doc| {
+                let sel = doc.selections.newest();
+                let target = FindState::pick(sel.head(), sel.start()..sel.end(), &doc.decorations, true);
+                let placed = target.as_ref().map(|(_, range)| {
+                    let mut set = doc.selections.clone();
+                    select_match(&mut set, range);
+                    set
+                });
+                picked = target;
+                placed
+            });
+            match committed {
+                // A rejected transaction must not read as a replace.
+                Err(_) => return None,
+                // `place` runs exactly for an edit that changed text, so a
+                // non-empty commit is one whose `picked` is the real pick.
+                Ok(c) if !c.is_empty() => return self.land_on_match(picked),
+                // A replacement equal to its match commits nothing (`place`
+                // never ran): it still advances, through the ordinary
+                // navigation below.
+                Ok(_) => {}
             }
         }
         self.step_find(true, now_ms)
@@ -2077,21 +2071,20 @@ impl Document {
     /// before it commits. Bounded by the match count and paid once per press.
     ///
     /// `preserve_case` (the replace bar's `AB` toggle) re-cases each replacement
-    /// to the match it lands on — an ALL-CAPS match takes an upper-cased
-    /// replacement, a Capitalized match a capitalized one.
+    /// to the match it lands on, by VS Code's rule — an ALL-CAPS match takes an
+    /// upper-cased replacement, a Capitalized one a capitalized one, a camelCase
+    /// one a lower first letter, and `-`/`_` segments are re-cased one by one.
     ///
     /// [`FIND_MATCH_CAP`]: crate::find::FIND_MATCH_CAP
     pub fn replace_all(&mut self, replacement: &str, preserve_case: bool) -> usize {
-        let Some(query) = self.find.query().cloned() else {
-            return 0; // find is idle
-        };
         // Scoped find replaces only inside its range — the scan bound is the one
         // place that has to know, so every other path inherits it.
         let within = self.find.scope().unwrap_or(0..self.buffer.len());
-        let plan =
-            crate::find::replacements(&self.buffer, &query, within, replacement, preserve_case);
+        let plan = self.find.replacements(&self.buffer, within, replacement, preserve_case);
         if plan.is_empty() {
-            return 0; // no matches ⇒ no transaction, no undo step
+            // Find idle, an unparsed pattern, or no matches ⇒ no transaction,
+            // no undo step.
+            return 0;
         }
         let n = plan.len();
         let ops = plan.into_iter().map(|(r, t)| EditOp::new(r, t)).collect();
@@ -2108,24 +2101,26 @@ impl Document {
         // handles opportunistically before navigating.
         self.find.maybe_rescan(&self.buffer, &mut self.decorations, now_ms);
         let sel = self.selections.newest();
-        let (head, extent) = (sel.head(), sel.start()..sel.end());
-        let found = if forward {
-            self.find.find_next(head, extent, &self.decorations)
-        } else {
-            self.find.find_prev(head, extent, &self.decorations)
-        };
-        if let Some(range) = &found {
-            // Set the selection to the match, head at its end.
-            self.selections
-                .set_single(Selection::from_anchor(SelectionId(0), range.start, range.end));
-            self.reset_transient(); // clears gesture state + seals (a jump is a boundary)
-            // A match inside a collapsed fold unfolds its chain first — the
-            // reveal below must land on a VISIBLE position.
-            self.unfold_to_reveal(range.start);
-            self.unfold_to_reveal(range.end);
-            self.request_reveal(RevealMode::Center); // find navigation centers
-        }
-        found
+        let target = FindState::pick(sel.head(), sel.start()..sel.end(), &self.decorations, forward);
+        self.land_on_match(target)
+    }
+
+    /// Navigation's landing, shared by [`step_find`](Self::step_find) and
+    /// [`replace_next`](Self::replace_next): make the [`FindState::pick`]ed
+    /// match active (no match ⇒ clear the active one, selection untouched),
+    /// select it, and take a jump's boundary, unfold and reveal.
+    fn land_on_match(&mut self, target: Option<(DecorationId, Range<u32>)>) -> Option<Range<u32>> {
+        let range = self.find.activate(target)?;
+        // A replace has already placed this exact selection inside its commit;
+        // re-placing it is a no-op there, and the one rule either way.
+        select_match(&mut self.selections, &range);
+        self.reset_transient(); // clears gesture state + seals (a jump is a boundary)
+        // A match inside a collapsed fold unfolds its chain first — the
+        // reveal below must land on a VISIBLE position.
+        self.unfold_to_reveal(range.start);
+        self.unfold_to_reveal(range.end);
+        self.request_reveal(RevealMode::Center); // find navigation centers
+        Some(range)
     }
 
     /// F8 / Shift+F8: select the next/previous diagnostic from the
@@ -2318,6 +2313,11 @@ struct Views<'a> {
     autoclose: &'a mut DecorationStore,
     folds: &'a mut FoldSet,
     find: &'a mut FindState,
+    /// The incremental-change log — not a position, but the same "must see
+    /// every applied step on every edit path" shape, so it rides the one mover
+    /// rather than being fed per route (feeding it from the forward path alone
+    /// is how undo/redo once went unlogged).
+    changes: &'a mut ChangeLog,
 }
 
 /// The single position-mover for a committed edit — rebase every derived view
@@ -2420,6 +2420,9 @@ fn rebase_views(
     // path: it can't run per-step inside history's callback. Order is immaterial:
     // expand skips broken-pair folds, the only ones reconcile drops.)
     expand_folds_touched(views.folds, views.brackets, buffer, tab, committed);
+    // The change log rides here too, so a forward edit, each undo step, and each
+    // redo step are all logged by this one line (a no-op unless observing).
+    views.changes.record(committed);
     // The re-matched byte region (POST-edit) — the reconcile window (see
     // `reconcile_folds_in`). Empty (`0..0`) on a shift-only edit, which re-scanned
     // nothing, so `is_empty()` is exactly the "structure unchanged" signal.
@@ -2438,6 +2441,13 @@ fn extend_by_unit(origin_unit: (u32, u32), head_unit: (u32, u32), origin: u32, h
     } else {
         (oe, hs.min(os))
     }
+}
+
+/// Select a find match: the whole set collapses to ONE selection over `range`,
+/// head at its end — the rule navigation lands by, and the placement a
+/// replace's commit records, so the two cannot disagree.
+fn select_match(set: &mut SelectionSet, range: &Range<u32>) {
+    set.set_single(Selection::from_anchor(SelectionId(0), range.start, range.end));
 }
 
 /// First untaken literal (case-sensitive, non-overlapping like
@@ -2600,6 +2610,19 @@ mod tests {
     }
 
     #[test]
+    fn programmatic_batch_puts_caret_after_all_text_inserted_at_it() {
+        // Regression (fails-first): a formatter-style batch whose edits TOUCH at
+        // the caret — replace "b" (1..2) and insert at 2 — must carry a caret at 2
+        // past everything inserted there, not leave it splitting the batch's
+        // output (X|Y). The caret rides `Patch::map_many` with Right bias.
+        let mut d = doc("abcd");
+        d.set_selections(SelectionSet::from_offsets(&[2]));
+        d.edit(vec![EditOp::new(1..2, "X"), EditOp::insert(2, "Y")]).unwrap();
+        assert_eq!(d.text(), "aXYcd");
+        assert_eq!(d.selections().newest().head(), 3, "caret after X and Y");
+    }
+
+    #[test]
     fn a_new_edit_invalidates_redo() {
         let mut d = doc("");
         d.edit(vec![EditOp::insert(0, "a")]).unwrap();
@@ -2697,6 +2720,230 @@ mod tests {
         assert_eq!(d.text(), "", "the whole typing run undoes as one unit");
         assert!(d.redo());
         assert_eq!(d.text(), "hello", "and redoes as one unit");
+    }
+
+    /// Every selection as `(tail, head)`, document order — direction included,
+    /// so a restored range must face the way it did.
+    fn spans(d: &Document) -> Vec<(u32, u32)> {
+        d.selections().all().iter().map(|s| (s.tail(), s.head())).collect()
+    }
+
+    #[test]
+    fn undo_restores_every_caret_of_a_multi_cursor_edit() {
+        // Fails-first: undo replaced the set with ONE caret at the reverted
+        // region's start, so three carets came back as `[(0, 0)]`.
+        let mut d = doc("a b c");
+        d.set_selections(SelectionSet::from_offsets(&[0, 2, 4]));
+        d.type_char('X');
+        assert_eq!(d.text(), "Xa Xb Xc");
+        assert!(d.undo());
+        assert_eq!(d.text(), "a b c");
+        assert_eq!(spans(&d), vec![(0, 0), (2, 2), (4, 4)], "undo restores the pre-edit carets");
+    }
+
+    #[test]
+    fn redo_restores_the_carets_the_edit_left() {
+        // Fails-first: redo landed ONE caret at the re-applied region's end.
+        let mut d = doc("a b c");
+        d.set_selections(SelectionSet::from_offsets(&[0, 2, 4]));
+        d.type_char('X');
+        assert!(d.undo());
+        assert!(d.redo());
+        assert_eq!(d.text(), "Xa Xb Xc");
+        assert_eq!(spans(&d), vec![(1, 1), (4, 4), (7, 7)], "redo restores the post-edit carets");
+
+        // The after-set is the VERB's placement, not the set rebased through the
+        // patch: auto-close parks each caret between its pair (2, 6, 10), where a
+        // rebase would have carried it past the closer (3, 7, 11).
+        let mut p = doc("a b c");
+        p.set_selections(SelectionSet::from_offsets(&[1, 3, 5]));
+        p.type_char('(');
+        assert_eq!(p.text(), "a() b() c()");
+        let placed = spans(&p);
+        assert_eq!(placed, vec![(2, 2), (6, 6), (10, 10)]);
+        assert!(p.undo());
+        assert!(p.redo());
+        assert_eq!(spans(&p), placed, "redo restores the verb's caret placement");
+
+        // Ranged sets restore with their direction, both ways: surround keeps
+        // each selection on its interior.
+        let mut s = doc("ab cd");
+        s.set_selections(SelectionSet::from_ranges(&[(2, 0), (3, 5)], 1));
+        let before = spans(&s);
+        s.type_char('(');
+        assert_eq!(s.text(), "(ab) (cd)");
+        let after = spans(&s);
+        assert_eq!(after, vec![(1, 3), (6, 8)]);
+        assert!(s.undo());
+        assert_eq!(spans(&s), before, "undo restores both ranges, the reversed one reversed");
+        assert!(s.redo());
+        assert_eq!(spans(&s), after, "redo restores the surround's interiors");
+    }
+
+    #[test]
+    fn a_merged_typing_run_restores_the_selections_from_before_the_run() {
+        // Type over two selections, then keep typing: the run merges into ONE
+        // unit, and that unit's undo restores the selections from before the
+        // FIRST keystroke — the two ranges — not the carets ahead of the last
+        // keystroke (which would be (2, 6) here, mid-"xy").
+        let mut d = doc("foo bar baz");
+        d.set_selections(SelectionSet::from_ranges(&[(0, 3), (8, 11)], 1));
+        let before = spans(&d);
+        for ch in "xyz".chars() {
+            d.type_char(ch);
+        }
+        assert_eq!(d.text(), "xyz bar xyz");
+        let after = spans(&d);
+        assert_eq!(after, vec![(3, 3), (11, 11)]);
+        assert!(d.undo());
+        assert_eq!(d.text(), "foo bar baz", "one undo reverts the whole run");
+        assert!(!d.can_undo());
+        assert_eq!(spans(&d), before, "undo restores the selections from before the run");
+        assert!(d.redo());
+        assert_eq!(spans(&d), after, "redo restores the carets after the run's last keystroke");
+    }
+
+    #[test]
+    fn restored_carets_are_ejected_from_a_fold_collapsed_since() {
+        // A caret parked inside a block rides an edit elsewhere; the block is
+        // then folded (ejecting the LIVE caret, while history's copies keep the
+        // hidden offset). Undo and redo revert/replay text outside the fold, so
+        // the fold stays collapsed — and the restored caret must still be pulled
+        // out to the header's end, exactly as the fold gesture would have.
+        use crate::Point;
+        let mut d = doc("top\nm {\n  a\n}\n");
+        let hidden = |d: &Document| {
+            let head = d.selections().newest().head();
+            FoldMap::new(d.folds(), d.brackets(), d.buffer()).display_position(d.buffer(), head, d.tab_size()).is_none()
+        };
+        let header_end = |d: &Document| d.buffer().point_to_offset(Point::new(1, 3));
+        d.set_selections(SelectionSet::new(d.buffer().point_to_offset(Point::new(2, 2))));
+        d.edit(vec![EditOp::insert(0, "// ")]).unwrap();
+        let opener = d.buffer().point_to_offset(Point::new(1, 2));
+        assert!(d.toggle_fold_opener(opener));
+        assert!(!hidden(&d), "the fold gesture ejected the live caret");
+
+        assert!(d.undo());
+        assert!(d.folds().is_folded(d.buffer().point_to_offset(Point::new(1, 2))), "fold untouched");
+        assert!(!hidden(&d), "undo's restored caret is not left inside the fold");
+        assert_eq!(d.selections().newest().head(), header_end(&d), "…it lands at the header's end");
+
+        assert!(d.redo());
+        assert!(!hidden(&d), "redo's restored caret is not left inside the fold");
+        assert_eq!(d.selections().newest().head(), header_end(&d));
+    }
+
+    #[test]
+    fn undo_and_redo_restore_the_observed_selections_across_random_verbs() {
+        // The selection-restore oracle. A random walk of multi-caret verbs (typing
+        // runs, auto-close/overtype/surround, deletes, Enter, line verbs, paste)
+        // and selection gestures, interleaved with undo and redo. The model reads
+        // only the public API: a verb that deepened `undo_depth` opened a unit
+        // whose before/after states are what was observed around it; a verb that
+        // moved the revision without deepening merged into the open unit (its
+        // after-state moves). Undo must then land on exactly the unit's observed
+        // before-state — text AND every selection (ids, direction, goal) — and
+        // redo on its after-state. A verb that placed carets outside the commit
+        // shows up here as a redo that disagrees with what the verb displayed.
+        type State = (String, Vec<Selection>);
+        let state = |d: &Document| -> State { (d.text().into_owned(), d.selections().all().to_vec()) };
+        let mut rng = 0x5E1E_C7ED_0008_u64;
+        let mut next = move |m: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        let mut d = doc("fn main() {\n    let a = (1, \"x\");\n}\n");
+        d.set_line_comment(Some("//"));
+        // Units on the line to `current` (undo pops) and the preferred redo path
+        // (redo pops), each as (before, after).
+        let mut units: Vec<(State, State)> = Vec::new();
+        let mut redos: Vec<(State, State)> = Vec::new();
+        let (mut undone, mut redone, mut merged, mut multi) = (0, 0, 0, 0);
+        const CHARS: &[char] = &['a', 'b', ' ', '(', ')', '"', '{', '}', '[', ']'];
+        for step in 0..4_000 {
+            let roll = next(20);
+            if roll < 3 {
+                let ok = d.undo();
+                assert_eq!(ok, !units.is_empty(), "step {step}: undo availability");
+                if let Some(unit) = units.pop() {
+                    assert_eq!(state(&d), unit.0, "step {step}: undo restores the before-state");
+                    redos.push(unit);
+                    undone += 1;
+                }
+                continue;
+            }
+            // Redo only succeeds after an undo, so it gets the heavier weight.
+            if roll < 8 {
+                let ok = d.redo();
+                assert_eq!(ok, !redos.is_empty(), "step {step}: redo availability");
+                if let Some(unit) = redos.pop() {
+                    assert_eq!(state(&d), unit.1, "step {step}: redo restores the after-state");
+                    units.push(unit);
+                    redone += 1;
+                }
+                continue;
+            }
+            if roll < 11 {
+                // Selection gestures: no unit, but each seals the open run.
+                let len = d.buffer().len();
+                match next(4) {
+                    0 => {
+                        let n = 1 + next(4) as usize;
+                        let ranges: Vec<(u32, u32)> = (0..n)
+                            .map(|_| {
+                                let a = next(u64::from(len) + 1) as u32;
+                                let b = if next(2) == 0 { a } else { next(u64::from(len) + 1) as u32 };
+                                (a, b)
+                            })
+                            .collect();
+                        d.set_selections(SelectionSet::from_ranges(&ranges, next(n as u64) as usize));
+                    }
+                    1 => {
+                        let motions = [Motion::Left, Motion::Right, Motion::Up, Motion::Down, Motion::LineEnd];
+                        d.move_carets(motions[next(motions.len() as u64) as usize], next(3) == 0);
+                    }
+                    2 => d.add_caret(next(u64::from(len) + 1) as u32),
+                    _ => d.add_caret_vertical(next(2) == 0),
+                }
+                continue;
+            }
+            let (pre, depth, rev) = (state(&d), d.undo_depth(), d.revision());
+            match next(16) {
+                0..=5 => d.type_char(CHARS[next(CHARS.len() as u64) as usize]),
+                6 => d.backspace(),
+                7 => d.delete_forward(),
+                8 => d.enter(),
+                9 => d.tab(),
+                10 => d.outdent(),
+                11 => d.delete_word_back(),
+                12 => d.insert_text("p\r\nq"),
+                13 => d.toggle_line_comment(),
+                14 => d.insert_line(next(2) == 0),
+                _ => match next(3) {
+                    0 => d.move_line(next(2) == 0),
+                    1 => d.copy_line(next(2) == 0),
+                    _ => d.cut(),
+                },
+            }
+            let post = state(&d);
+            if d.undo_depth() == depth + 1 {
+                multi += usize::from(pre.1.len() > 1);
+                units.push((pre, post));
+                redos.clear(); // a new unit is the tip: nothing to redo from it
+            } else if d.revision() != rev {
+                assert_eq!(d.undo_depth(), depth, "step {step}: a merge keeps the depth");
+                units.last_mut().expect("a merge needs an open unit").1 = post;
+                merged += 1;
+            }
+        }
+        // Guard against a vacuous walk: every route was really exercised.
+        // (This seed: 548 undos, 194 redos, 97 merges, 903 multi-caret units.)
+        assert!(
+            undone > 400 && redone > 140 && merged > 70 && multi > 600,
+            "walk too thin: {undone} undos / {redone} redos / {merged} merges / {multi} multi-caret units",
+        );
     }
 
     #[test]
@@ -2865,6 +3112,16 @@ mod tests {
         let mut w = doc("a  b");
         w.set_selections(SelectionSet::new(2));
         assert!(w.caret_word_occurrences(0..u32::MAX).is_empty());
+    }
+
+    /// Regression (fails-first): the window was clamped to the length but
+    /// sliced as given, so a viewport range starting inside a char panicked
+    /// the per-frame wash. It now snaps outward like every host range.
+    #[test]
+    fn caret_word_occurrences_take_a_mid_char_window() {
+        let mut d = doc("é foo é foo"); // é 0..2, foo 3..6, é 7..9, foo 10..13
+        d.set_selections(SelectionSet::new(11));
+        assert_eq!(d.caret_word_occurrences(1..8), vec![3..6], "both window ends split an 'é'");
     }
 
     #[test]
@@ -3050,6 +3307,26 @@ mod tests {
     }
 
     #[test]
+    fn redo_of_a_replace_restores_the_match_it_advanced_to() {
+        // Fails-first: the replace committed through `edit` and only THEN moved
+        // the selection to the next match, after history had recorded the unit's
+        // after-set — so redo restored the selection rebased over the
+        // replacement (`0..1`, the "X"), not the next match the user saw.
+        let mut d = doc("foo bar foo");
+        d.set_find_query(Some(FindQuery { text: "foo".into(), ..Default::default() }), 0);
+        assert_eq!(d.replace_next("X", false, 0), Some(0..3), "the first press navigates");
+        assert_eq!(d.replace_next("X", false, 0), Some(6..9), "the second replaces and advances");
+        assert_eq!(d.text(), "X bar foo");
+        let seen = spans(&d);
+        assert_eq!(seen, vec![(6, 9)], "the next match is selected");
+        assert!(d.undo());
+        assert_eq!(spans(&d), vec![(0, 3)], "undo restores the match that was replaced");
+        assert!(d.redo());
+        assert_eq!(d.text(), "X bar foo");
+        assert_eq!(spans(&d), seen, "redo restores the match the replace advanced to");
+    }
+
+    #[test]
     fn find_scope_restricts_matches_and_replace_all() {
         let mut d = doc("foo foo | foo foo");
         d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
@@ -3079,6 +3356,22 @@ mod tests {
         // than pinning zero matches forever.
         d.edit(vec![EditOp::delete(6..9)]).unwrap();
         assert_eq!(d.find_scope(), None, "a collapsed scope must clear");
+    }
+
+    /// Regression (fails-first): the find scope stored the host range as-is,
+    /// so a mid-char scope was shaded from inside a char and a past-end one was
+    /// kept as a live scope over no text. It now clips like every stored range:
+    /// outward to whole chars, and a scope that clamps to empty clears.
+    #[test]
+    fn the_find_scope_clips_a_host_range() {
+        let mut d = doc("é foo é"); // é 0..2, foo 3..6, é 7..9
+        d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
+        d.set_find_scope(Some(1..8), 0);
+        assert_eq!(d.find_scope(), Some(0..9));
+        assert_eq!(d.find_match_count(), 1);
+        d.set_find_scope(Some(1000..2000), 0);
+        assert_eq!(d.find_scope(), None, "a scope past the end clamps to empty, which clears");
+        assert_eq!(d.find_match_count(), 1);
     }
 
     #[test]
@@ -3155,7 +3448,9 @@ mod tests {
     /// variable-length pattern, where the literal path's "a match starts at most
     /// k−1 bytes left of a changed byte" argument does not hold at all. `.*` is
     /// the case that makes the point: one edit anywhere rewrites a match
-    /// spanning its entire line.
+    /// spanning its entire line. The punctuation-edged whole-word needles pin
+    /// that the per-match edge check (which reads the neighbour OUTSIDE the
+    /// match) stays inside the line window too.
     #[test]
     fn line_scoped_repair_equals_a_fresh_scan_under_random_edits() {
         let mut seed = 0x00C0_FFEE_u64;
@@ -3165,9 +3460,26 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let base = "foo bar foo baz\nfoo foo bar\nbarfoo foo\n\nqux foofoo\n".repeat(3);
+        let base =
+            "foo bar foo baz\nfoo foo bar\nbarfoo foo\n\nqux foofoo\n(foo) a == b; x=-1 foo.bar\n"
+                .repeat(3);
+        let ww =
+            |text: &str| FindQuery { text: text.into(), whole_word: true, ..Default::default() };
         let queries = [
-            FindQuery { text: "foo".into(), whole_word: true, ..Default::default() },
+            ww("foo"),
+            // Punctuation-edged whole-word needles: a separator edge is free of
+            // its neighbour, so an edit NEXT to one (typing `x` before `(foo`)
+            // must not kill it, while an edit next to a word edge must.
+            ww("(foo"),
+            ww("=="),
+            ww("foo."),
+            ww("-1"),
+            FindQuery {
+                text: r"\(foo|==".into(),
+                whole_word: true,
+                regex: true,
+                ..Default::default()
+            },
             FindQuery { text: "f.o".into(), regex: true, ..Default::default() },
             FindQuery { text: r"\w+o".into(), regex: true, ..Default::default() },
             // The one a fixed-k window can never handle.
@@ -3181,6 +3493,9 @@ mod tests {
             },
         ];
         for (qi, q) in queries.iter().enumerate() {
+            // Trials whose final set is non-empty: equality of two empty sets
+            // proves nothing, so each query must keep real matches to compare.
+            let mut nonempty = 0;
             for trial in 0..40 {
                 let mut d = doc(&base);
                 d.set_find_query(Some(q.clone()), 0);
@@ -3198,7 +3513,10 @@ mod tests {
                         }
                     } else {
                         let at = d.buffer().clip_offset((rng() as u32) % (len + 1), Bias::Left);
-                        let ins = ["foo", "x", "\n", " ", "\nfoo bar"][(rng() % 5) as usize];
+                        // `(` `=` `-1` `.` grow and break the punctuation-edged
+                        // needles; `x` lands against their edges.
+                        let ins = ["foo", "x", "\n", " ", "\nfoo bar", "(", "=", "-1", "."]
+                            [(rng() % 9) as usize];
                         d.edit(vec![EditOp::insert(at, ins)]).unwrap();
                     }
                 }
@@ -3208,7 +3526,9 @@ mod tests {
                 d.set_find_query(Some(q.clone()), 0);
                 let fresh: Vec<_> = d.find_matches_in(0..u32::MAX).map(|(r, _)| r).collect();
                 assert_eq!(incremental, fresh, "query {qi} ({:?}), trial {trial}", q.text);
+                nonempty += usize::from(!fresh.is_empty());
             }
+            assert!(nonempty >= 30, "query {qi} ({:?}) is vacuous: {nonempty}/40", q.text);
         }
     }
 
@@ -3267,7 +3587,7 @@ mod tests {
         let mut d = doc("FOO Foo foo fOo");
         d.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
         assert_eq!(d.replace_all("bar", true), 4);
-        // FOO⇒upper, Foo⇒capitalized, foo⇒lower, fOo⇒mixed (left as typed).
+        // FOO⇒upper, Foo⇒capitalized, foo⇒lower, fOo⇒lower first letter.
         assert_eq!(d.text(), "BAR Bar bar bar");
 
         // Off, the same replacement lands verbatim.
@@ -3275,6 +3595,48 @@ mod tests {
         e.set_find_query(Some(FindQuery { text: "foo".into(), case_sensitive: false, ..Default::default() }), 0);
         assert_eq!(e.replace_all("bar", false), 3);
         assert_eq!(e.text(), "bar bar bar");
+    }
+
+    #[test]
+    fn preserve_case_follows_vs_codes_table() {
+        // (match, replacement, expected): the first block is VS Code's own test
+        // table for `buildReplaceStringWithCasePreserved`; the second is the
+        // camelCase / snake / kebab renames this rule exists for. Each runs
+        // end to end through `replace_all` on a one-match document.
+        let table: &[(&str, &str, &str)] = &[
+            ("abc", "Def", "def"),
+            ("Abc", "Def", "Def"),
+            ("ABC", "Def", "DEF"),
+            ("aBc", "Def", "def"),
+            ("AbC", "Def", "Def"),
+            ("aBC", "Def", "def"),
+            ("aBc", "DeF", "deF"),
+            ("Foo-Bar", "newfoo-newbar", "Newfoo-Newbar"),
+            ("Foo-Bar-Abc", "newfoo-newbar-newabc", "Newfoo-Newbar-Newabc"),
+            ("Foo-Bar-abc", "newfoo-newbar", "Newfoo-newbar"),
+            ("foo-Bar", "newfoo-newbar", "newfoo-Newbar"),
+            ("foo-BAR", "newfoo-newbar", "newfoo-NEWBAR"),
+            ("foO-BAR", "NewFoo-NewBar", "newFoo-NEWBAR"),
+            ("Foo_Bar", "newfoo_newbar", "Newfoo_Newbar"),
+            ("Foo_Bar_Abc", "newfoo_newbar_newabc", "Newfoo_Newbar_Newabc"),
+            ("Foo_Bar_abc", "newfoo_newbar", "Newfoo_newbar"),
+            ("Foo_Bar-abc", "newfoo_newbar-abc", "Newfoo_newbar-abc"),
+            ("foo_Bar", "newfoo_newbar", "newfoo_Newbar"),
+            ("Foo_BAR", "newfoo_newbar", "Newfoo_NEWBAR"),
+            // camelCase keeps its lower first letter; the rest is as typed.
+            ("fooBar", "BazQux", "bazQux"),
+            ("FooBar", "bazQux", "BazQux"),
+            ("FOO_BAR", "baz_qux", "BAZ_QUX"),
+            ("FOO_BAR", "bazQux", "BAZQUX"),
+            ("foo-bar", "Baz-Qux", "baz-qux"),
+            ("foo_barBaz", "Qux_quuxCorge", "qux_quuxCorge"),
+        ];
+        for &(matched, replacement, want) in table {
+            let mut d = doc(matched);
+            d.set_find_query(Some(FindQuery { text: matched.into(), case_sensitive: true, ..Default::default() }), 0);
+            assert_eq!(d.replace_all(replacement, true), 1, "{matched:?}");
+            assert_eq!(d.text(), want, "{matched:?} replaced by {replacement:?}");
+        }
     }
 
     #[test]
@@ -3323,6 +3685,35 @@ mod tests {
         assert_eq!(d.text(), "foo");
         assert!(!d.is_dirty(), "a no-op replace must not open an undo step");
         assert!(!d.undo());
+    }
+
+    #[test]
+    fn replace_reuses_the_matcher_the_query_compiled() {
+        // Fails-first: the replacement plan re-compiled the query's pattern on
+        // every `replace_next` / `replace_all` — a regex compile per press —
+        // beside the matcher `set_find_query` compiles once and every scan and
+        // repair already reads. In every matcher flavor: the folding literal
+        // (its `(?i)` escape), whole-word, and regex.
+        use crate::find::MATCHER_COMPILES;
+        let queries = [
+            FindQuery { text: "foo".into(), ..Default::default() },
+            FindQuery { text: "foo".into(), whole_word: true, ..Default::default() },
+            FindQuery { text: "f(o)o".into(), regex: true, ..Default::default() },
+        ];
+        for q in queries {
+            let mut d = doc("foo foo foo");
+            d.set_find_query(Some(q.clone()), 0);
+            let base = MATCHER_COMPILES.with(std::cell::Cell::get);
+            assert_eq!(d.replace_next("x", false, 0), Some(0..3), "{q:?}: the first press navigates");
+            assert_eq!(d.replace_next("x", false, 0), Some(2..5), "{q:?}: the second replaces");
+            assert_eq!(d.replace_all("y", false), 2, "{q:?}");
+            assert_eq!(d.text(), "x y y", "{q:?}");
+            assert_eq!(
+                MATCHER_COMPILES.with(std::cell::Cell::get) - base,
+                0,
+                "{q:?}: a replace compiled the pattern again"
+            );
+        }
     }
 
     #[test]
@@ -3612,6 +4003,24 @@ mod tests {
         assert_eq!((rows[1].start(), rows[1].end()), (7, 9)); // line1 clamps to its end
     }
 
+    /// Regression (fails-first): a host corner row past the document was kept,
+    /// so the box spanned (and allocated) one selection per *requested* row —
+    /// `u32::MAX` overflowed the row count — and kept that phantom anchor for
+    /// the keyboard to step from. Corner rows now clamp to the last row; cells
+    /// stay virtual, and stepping right from the largest one saturates.
+    #[test]
+    fn column_drag_clamps_host_corners() {
+        let mut d = doc("abcd\nabcd\nabcd");
+        d.column_drag((0, 1), (u32::MAX, 3));
+        let spans: Vec<(u32, u32)> = d.selections().all().iter().map(|s| (s.start(), s.end())).collect();
+        assert_eq!(spans, [(1, 3), (6, 8), (11, 13)], "one row per REAL row, the last one active");
+        d.column_select(ColumnDir::Up); // steps from the clamped last row
+        assert_eq!(d.selections().len(), 2);
+        d.column_drag((0, u32::MAX), (0, u32::MAX));
+        d.column_select(ColumnDir::Right); // must not overflow the virtual cell
+        assert_eq!(heads(&d), [4]);
+    }
+
     #[test]
     fn column_box_is_display_cells_across_tabs() {
         // Row 0 leads with a tab (4 cells); row 1 is plain. A box over cells
@@ -3724,6 +4133,24 @@ mod tests {
         assert_eq!(range(&d), (2, 8));
     }
 
+    /// Regression (fails-first): drag-select took both host offsets unclipped
+    /// — a Word drag from inside a char panicked in the word scan, and a Char
+    /// drag stored mid-char / past-end endpoints. Each offset now clips like a
+    /// caret: past the end → the end, inside a char → its start.
+    #[test]
+    fn drag_select_clips_host_offsets() {
+        let mut d = doc("héllo wörld"); // é 1..3, ö 8..10, len 13
+        d.drag_select(Granularity::Word, 2, 2); // inside 'é'
+        assert_eq!(range(&d), (0, 6), "the word around the snapped origin");
+        d.drag_select(Granularity::Char, 2, 9); // inside 'é' → inside 'ö'
+        assert_eq!(range(&d), (1, 8));
+        d.drag_select(Granularity::Char, 1000, 2);
+        assert_eq!((range(&d), d.selections().newest().head()), ((1, 13), 1));
+        d.drag_select(Granularity::Line, 1000, 1000);
+        assert_eq!(range(&d), (0, 13));
+        d.move_carets(Motion::WordLeft, true); // motions run from valid endpoints
+    }
+
     fn head_row(d: &Document) -> u32 {
         d.buffer().offset_to_point(d.selections().newest().head()).row
     }
@@ -3783,11 +4210,387 @@ mod tests {
     }
 
     #[test]
+    fn move_line_excludes_the_row_a_whole_line_selection_ends_at() {
+        // Fails-first: a triple-click selection ends at column 0 of the NEXT
+        // row, and move_line counted that row as part of the block — so "b" and
+        // "c" moved together past "d".
+        let mut d = doc("a\nb\nc\nd\n"); // a 0, b 2, c 4, d 6
+        d.drag_select(Granularity::Line, 2, 2); // triple-click "b" → (2, 4)
+        assert_eq!(spans(&d), vec![(2, 4)]);
+        d.move_line(true);
+        assert_eq!(d.text(), "a\nc\nb\nd\n");
+        assert_eq!(spans(&d), vec![(4, 6)], "the whole-line selection rides \"b\" down");
+        d.move_line(false);
+        assert_eq!(d.text(), "a\nb\nc\nd\n");
+        assert_eq!(spans(&d), vec![(2, 4)]);
+    }
+
+    #[test]
+    fn copy_line_excludes_the_row_a_whole_line_selection_ends_at() {
+        // Fails-first: the same off-by-one-row block duplicated "b\nc".
+        let mut d = doc("a\nb\nc\nd\n");
+        d.drag_select(Granularity::Line, 2, 2); // triple-click "b" → (2, 4)
+        d.copy_line(true); // below → the selection lands on the lower copy
+        assert_eq!(d.text(), "a\nb\nb\nc\nd\n");
+        assert_eq!(spans(&d), vec![(4, 6)]);
+        let mut u = doc("a\nb\nc\nd\n");
+        u.drag_select(Granularity::Line, 2, 2);
+        u.copy_line(false); // above → the selection stays on the upper copy
+        assert_eq!(u.text(), "a\nb\nb\nc\nd\n");
+        assert_eq!(spans(&u), vec![(2, 4)]);
+    }
+
+    #[test]
+    fn move_line_moves_every_caret_line_and_the_selections_ride() {
+        // Fails-first: only the newest caret's line moved, and the set
+        // collapsed to that one selection.
+        let mut d = doc("l0\nl1\nl2\nl3\nl4\n"); // row r starts at 3r
+        // A caret inside "l1" (the newest) and a REVERSED selection over "l3".
+        d.set_selections(SelectionSet::from_ranges(&[(4, 4), (11, 9)], 0));
+        d.move_line(true);
+        assert_eq!(d.text(), "l0\nl2\nl1\nl4\nl3\n");
+        assert_eq!(spans(&d), vec![(7, 7), (14, 12)], "both ride down a row, direction kept");
+        assert_eq!(d.selections().newest().head(), 7, "the newest selection stays the newest");
+        d.move_line(false);
+        assert_eq!(d.text(), "l0\nl1\nl2\nl3\nl4\n");
+        assert_eq!(spans(&d), vec![(4, 4), (11, 9)]);
+    }
+
+    #[test]
+    fn move_line_merges_overlapping_and_adjacent_blocks() {
+        // Carets on consecutive rows: one block, else both would claim the row
+        // between them as their swap neighbour.
+        let mut d = doc("l0\nl1\nl2\nl3\nl4\n"); // row r starts at 3r
+        d.set_selections(SelectionSet::from_offsets(&[4, 7])); // rows 1 and 2
+        d.move_line(true);
+        assert_eq!(d.text(), "l0\nl3\nl1\nl2\nl4\n");
+        assert_eq!(spans(&d), vec![(7, 7), (10, 10)]);
+        // A selection over rows 1–2 and a caret later on row 2: the blocks share
+        // row 2 and move as one.
+        let mut o = doc("l0\nl1\nl2\nl3\nl4\n");
+        o.set_selections(SelectionSet::from_ranges(&[(4, 7), (8, 8)], 1));
+        o.move_line(false);
+        assert_eq!(o.text(), "l1\nl2\nl0\nl3\nl4\n");
+        assert_eq!(spans(&o), vec![(1, 4), (5, 5)]);
+    }
+
+    #[test]
+    fn move_line_leaves_an_edge_block_and_moves_the_rest() {
+        let mut d = doc("l0\nl1\nl2\nl3");
+        d.set_selections(SelectionSet::from_offsets(&[1, 7])); // rows 0 and 2
+        d.move_line(false); // row 0 is at the top; row 2 still moves up
+        assert_eq!(d.text(), "l0\nl2\nl1\nl3");
+        assert_eq!(spans(&d), vec![(1, 1), (4, 4)]);
+        // Moving onto the final line (no trailing `\n`): a whole-line selection's
+        // end, past the block's `\n`, clamps to the buffer end.
+        let mut w = doc("a\nb\nc");
+        w.drag_select(Granularity::Line, 2, 2); // "b\n" → (2, 4)
+        w.move_line(true);
+        assert_eq!(w.text(), "a\nc\nb");
+        assert_eq!(spans(&w), vec![(4, 5)]);
+    }
+
+    #[test]
+    fn copy_line_copies_every_caret_line_and_the_selections_land_on_the_copies() {
+        // Fails-first: only the newest caret's line was copied, and the set
+        // collapsed to that one selection.
+        let src = "l0\nl1\nl2\nl3\nl4\n"; // row r starts at 3r
+        let both = "l0\nl1\nl1\nl2\nl3\nl3\nl4\n";
+        let mut d = doc(src);
+        // A caret inside "l1" (the newest) and a REVERSED selection over "l3".
+        d.set_selections(SelectionSet::from_ranges(&[(4, 4), (11, 9)], 0));
+        d.copy_line(true); // below → onto the lower copies
+        assert_eq!(d.text(), both);
+        assert_eq!(spans(&d), vec![(7, 7), (17, 15)], "both land on their copies, direction kept");
+        assert_eq!(d.selections().newest().head(), 7, "the newest selection stays the newest");
+        let mut u = doc(src);
+        u.set_selections(SelectionSet::from_ranges(&[(4, 4), (11, 9)], 0));
+        u.copy_line(false); // above → onto the upper copies
+        assert_eq!(u.text(), both);
+        assert_eq!(spans(&u), vec![(4, 4), (14, 12)]);
+    }
+
+    #[test]
+    fn copy_line_merges_blocks_that_share_a_row() {
+        // A selection over rows 1–2 and a caret later on row 2: one block, copied
+        // once (not row 2 twice).
+        let mut o = doc("l0\nl1\nl2\nl3\nl4\n");
+        o.set_selections(SelectionSet::from_ranges(&[(4, 7), (8, 8)], 1));
+        o.copy_line(true);
+        assert_eq!(o.text(), "l0\nl1\nl2\nl1\nl2\nl3\nl4\n");
+        assert_eq!(spans(&o), vec![(10, 13), (14, 14)]);
+        // Carets on consecutive rows share no row: each line is copied below
+        // itself (VS Code), and each caret lands on its own copy.
+        let mut a = doc("l0\nl1\nl2\nl3\nl4\n");
+        a.set_selections(SelectionSet::from_offsets(&[4, 7])); // rows 1 and 2
+        a.copy_line(true);
+        assert_eq!(a.text(), "l0\nl1\nl1\nl2\nl2\nl3\nl4\n");
+        assert_eq!(spans(&a), vec![(7, 7), (13, 13)]);
+    }
+
+    #[test]
+    fn a_multi_block_move_or_copy_undoes_in_one_step() {
+        let src = "l0\nl1\nl2\nl3\nl4\n";
+        let before = vec![(4, 4), (11, 9)];
+        for copy in [false, true] {
+            let mut d = doc(src);
+            d.set_selections(SelectionSet::from_ranges(&[(4, 4), (11, 9)], 0));
+            let depth = d.undo_depth();
+            if copy {
+                d.copy_line(true);
+            } else {
+                d.move_line(true);
+            }
+            assert_eq!(d.undo_depth(), depth + 1, "copy={copy}: both blocks, one unit");
+            let (after_text, after) = (d.text().into_owned(), spans(&d));
+            assert!(d.undo());
+            assert_eq!(d.text(), src, "copy={copy}: one undo restores the text");
+            assert_eq!(spans(&d), before, "copy={copy}: …and every selection");
+            assert!(d.redo());
+            assert_eq!((d.text().into_owned(), spans(&d)), (after_text, after), "copy={copy}");
+        }
+    }
+
+    #[test]
+    fn move_and_copy_line_carry_every_selection_with_its_text() {
+        // Seeded property walk: small documents (multibyte and empty lines, with
+        // and without a trailing `\n`), random multi-selections, all four
+        // directions. Read through the public API only: a move permutes the
+        // lines and a copy only adds some; every selection (by id) still selects
+        // the same text — less the `\n` a whole-line selection drops when its
+        // block becomes the final line — in the same direction; a caret keeps
+        // its line and column; one undo restores the text and every selection.
+        let mut rng = 0x5E1E_C7ED_0007_u64;
+        let mut next = move |m: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        const LINES: &[&str] = &["", "a", "bc", "é", "x y", "  {"];
+        let sorted_lines = |t: &str| {
+            let mut v: Vec<String> = t.split('\n').map(str::to_owned).collect();
+            v.sort();
+            v
+        };
+        // The line holding `off`, and `off`'s column on it.
+        let line_at = |t: &str, off: u32| {
+            let start = t[..off as usize].rfind('\n').map_or(0, |i| i + 1);
+            let end = t[start..].find('\n').map_or(t.len(), |i| start + i);
+            (t[start..end].to_owned(), off as usize - start)
+        };
+        let mut checked = 0;
+        for step in 0..3_000 {
+            let n = 1 + next(6);
+            let mut src: String =
+                (0..n).map(|_| LINES[next(LINES.len() as u64) as usize]).collect::<Vec<_>>().join("\n");
+            if next(2) == 0 {
+                src.push('\n');
+            }
+            let mut d = doc(&src);
+            let len = u64::from(d.buffer().len()) + 1;
+            let k = 1 + next(3) as usize;
+            let raw: Vec<(u32, u32)> = (0..k)
+                .map(|_| {
+                    let a = next(len) as u32;
+                    (a, if next(2) == 0 { a } else { next(len) as u32 })
+                })
+                .collect();
+            let clip = |o: u32| d.buffer().clip_offset(o, Bias::Left);
+            let ranges: Vec<(u32, u32)> = raw.iter().map(|&(a, b)| (clip(a), clip(b))).collect();
+            d.set_selections(SelectionSet::from_ranges(&ranges, next(k as u64) as usize));
+            let before = d.selections().all().to_vec();
+            let depth = d.undo_depth();
+            let (copy, down) = (next(2) == 0, next(2) == 0);
+            if copy {
+                d.copy_line(down);
+            } else {
+                d.move_line(down);
+            }
+            let text = d.text().into_owned();
+            let ctx = format!("step {step}: {src:?} {before:?} copy={copy} down={down} → {text:?}");
+            if copy {
+                let mut added = sorted_lines(&text);
+                for line in sorted_lines(&src) {
+                    let i = added.iter().position(|l| *l == line).unwrap_or_else(|| panic!("{ctx}"));
+                    added.remove(i);
+                }
+                assert!(!added.is_empty(), "{ctx}: a copy adds lines");
+            } else {
+                assert_eq!(sorted_lines(&text), sorted_lines(&src), "{ctx}: a move permutes lines");
+            }
+            // A carried selection can land touching another (a whole-line
+            // selection's end meeting a caret that stayed put) and merge under the
+            // set's own rule; only a merge-free step pairs every selection by id.
+            let carried = d.selections().len() == before.len();
+            for s in before.iter().filter(|_| carried) {
+                let t = d.selections().all().iter().find(|t| t.id == s.id).expect("ids are kept");
+                checked += 1;
+                let was = &src[s.start() as usize..s.end() as usize];
+                let now = &text[t.start() as usize..t.end() as usize];
+                let dropped_nl = was.strip_suffix('\n') == Some(now) && t.end() as usize == text.len();
+                assert!(now == was || dropped_nl, "{ctx}: {s:?} → {t:?} selects {now:?}, not {was:?}");
+                if !t.is_empty() {
+                    assert_eq!(t.head() < t.tail(), s.head() < s.tail(), "{ctx}: direction kept");
+                }
+                if s.is_empty() {
+                    assert_eq!(line_at(&text, t.head()), line_at(&src, s.head()), "{ctx}: caret rides");
+                }
+            }
+            if d.undo_depth() > depth {
+                assert!(d.undo());
+                assert_eq!(d.text(), src, "{ctx}: one undo restores the text");
+                assert_eq!(d.selections().all(), &before[..], "{ctx}: …and the selections");
+            } else {
+                assert_eq!(text, src, "{ctx}: no unit, no change");
+            }
+        }
+        assert!(checked > 3_000, "the walk checks enough selections ({checked})");
+    }
+
+    #[test]
     fn add_caret_adds_a_second_cursor() {
         let mut d = doc("abcdef");
         assert_eq!(d.selections().len(), 1);
         d.add_caret(3);
         assert_eq!(d.selections().len(), 2);
+    }
+
+    fn heads(d: &Document) -> Vec<u32> {
+        d.selections().all().iter().map(|s| s.head()).collect()
+    }
+
+    /// Regression (fails-first): `set_selections` documented clamping but
+    /// installed the set as-is, so a host caret at byte 1 of `"é"` (inside the
+    /// 2-byte char) reached the motion layer, whose char read sliced the rope
+    /// mid-char and panicked. It now snaps to the char's start.
+    #[test]
+    fn set_selections_snaps_a_mid_char_caret_so_motion_cannot_panic() {
+        let mut d = doc("é");
+        d.set_selections(SelectionSet::new(1));
+        assert_eq!(heads(&d), [0], "a caret inside a char snaps Left, to its start");
+        d.move_carets(Motion::Right, false);
+        assert_eq!(heads(&d), [2]);
+    }
+
+    /// Regression (fails-first): an out-of-range caret was kept as-is, so it
+    /// sat past the document end and motions stepped from there (Left from
+    /// 1000 in `"abc"` gave 999). It now clamps to the end.
+    #[test]
+    fn set_selections_clamps_an_out_of_range_caret() {
+        let mut d = doc("abc");
+        d.set_selections(SelectionSet::new(1000));
+        assert_eq!(heads(&d), [3]);
+        d.move_carets(Motion::Left, false);
+        assert_eq!(heads(&d), [2]);
+    }
+
+    /// A ranged host selection snaps OUTWARD (it never drops part of a char it
+    /// covers) and keeps its direction; carets the clamp lands on one offset
+    /// merge into one.
+    #[test]
+    fn set_selections_snaps_ranges_outward_and_merges_clamped_carets() {
+        let mut d = doc("aéb"); // a 0, é 1..3, b 3
+        d.set_selections(SelectionSet::from_ranges(&[(2, 0)], 0)); // reversed, ends mid-'é'
+        let s = *d.selections().newest();
+        assert_eq!((s.start(), s.end(), s.head()), (0, 3, 0), "grows over the whole 'é', head kept");
+        d.set_selections(SelectionSet::from_offsets(&[1, 50, 99]));
+        assert_eq!(heads(&d), [1, 4], "the two past-end carets merge at the end");
+    }
+
+    /// Regression (fails-first): Alt+Click's `add_caret` took a host offset
+    /// unclipped, so a mid-char caret panicked the next motion.
+    #[test]
+    fn add_caret_clips_a_host_offset() {
+        let mut d = doc("é\né");
+        d.add_caret(1); // inside the first 'é' → its start, merging with the caret at 0
+        d.add_caret(4); // inside the second 'é' (3..5) → 3
+        d.add_caret(1000); // past the end → 5
+        assert_eq!(heads(&d), [0, 3, 5]);
+        d.move_carets(Motion::Right, false);
+        assert_eq!(heads(&d), [2, 5]);
+    }
+
+    /// Seeded walk over every host-position entry point — `set_selections`,
+    /// `add_caret`, `drag_select`, `column_drag`, `set_diagnostics` — fed raw
+    /// offsets that land mid-char, past the end, and at `u32::MAX`, each
+    /// followed by a random motion. After every step each selection endpoint
+    /// and diagnostic span must sit on a char boundary within the text, judged
+    /// independently by `str::is_char_boundary` on the materialized text (not
+    /// by the clip under test). Any unclipped entry point panics in the motion
+    /// or fails the check.
+    #[test]
+    fn host_positions_never_leave_the_char_grid() {
+        let text = "aé🦀b\n\t日本語 x\n\n🦀🦀 é\nzz";
+        let mut d = doc(text);
+        let len = d.buffer().len();
+        let mut state = 0x5EED_2002_u64; // deterministic LCG
+        let mut rand = move |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) % bound.max(1)) as u32
+        };
+        // Mostly in or just past the text (so most land inside a multibyte char
+        // somewhere), occasionally the extreme.
+        let mut raw = move || if rand(16) == 0 { u32::MAX } else { rand(u64::from(len) + 8) };
+        let motions = [
+            Motion::Left, Motion::Right, Motion::Up, Motion::Down, Motion::WordLeft, Motion::WordRight,
+            Motion::LineStart, Motion::LineEnd, Motion::PageUp(2), Motion::PageDown(2),
+        ];
+        let assert_on_grid = |d: &Document, step: usize, what: &str| {
+            for s in d.selections().all() {
+                for off in [s.start(), s.end()] {
+                    assert!(text.is_char_boundary(off as usize), "step {step} ({what}): selection end {off}");
+                }
+            }
+            for (span, ..) in d.diagnostics_in(0..u32::MAX) {
+                for off in [span.start, span.end] {
+                    assert!(text.is_char_boundary(off as usize), "step {step} ({what}): diagnostic end {off}");
+                }
+            }
+        };
+        let mut mid_char_inputs = 0;
+        for step in 0..2000 {
+            let (a, b) = (raw(), raw());
+            mid_char_inputs += usize::from(!text.is_char_boundary(a as usize) && (a as usize) < text.len());
+            let what = match step % 6 {
+                0 => {
+                    d.set_selections(SelectionSet::from_ranges(&[(a, b), (b, raw())], 0));
+                    "set_selections"
+                }
+                1 => {
+                    d.add_caret(a);
+                    "add_caret"
+                }
+                2 => {
+                    let g = [Granularity::Char, Granularity::Word, Granularity::Line][step % 3];
+                    d.drag_select(g, a, b);
+                    "drag_select"
+                }
+                3 => {
+                    // Rows past the document and cells past every line.
+                    d.column_drag((a % 9, b), (b % 9, a));
+                    "column_drag"
+                }
+                4 => {
+                    let rev = d.revision();
+                    let diags = vec![
+                        Diagnostic::new(a..b, Severity::Error, "x"),
+                        Diagnostic::new(b..b, Severity::Warning, "y"),
+                    ];
+                    assert_eq!(d.set_diagnostics(rev, diags), DiagnosticsOutcome::Applied { count: 2 });
+                    "set_diagnostics"
+                }
+                _ => {
+                    d.set_selections(SelectionSet::from_offsets(&[a, b]));
+                    "set_selections (carets)"
+                }
+            };
+            assert_on_grid(&d, step, what);
+            d.move_carets(motions[step % motions.len()], step % 4 == 0);
+            assert_on_grid(&d, step, "the motion after it");
+        }
+        // Keep the walk honest: it must actually have fed mid-char offsets.
+        assert!(mid_char_inputs >= 200, "only {mid_char_inputs} mid-char inputs");
     }
 
     #[test]
@@ -4008,6 +4811,120 @@ mod tests {
         assert!(d.highlight_line_spans(920).is_some());
     }
 
+    // Engine identity: a segment is only as good as the grammar + theme that
+    // tokenized it. `set_theme` / `set_syntax` don't move the buffer revision, so
+    // the revision gate alone cannot catch a segment from the outgoing engine.
+
+    /// A `.tmTheme` whose `keyword` scope is `keyword_hex` (default text white).
+    fn keyword_theme(keyword_hex: &str) -> crate::TokenTheme {
+        crate::TokenTheme::from_tm_theme(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>settings</key><array>
+<dict><key>settings</key><dict><key>foreground</key><string>#FFFFFF</string></dict></dict>
+<dict><key>scope</key><string>keyword</string><key>settings</key><dict><key>foreground</key><string>{keyword_hex}</string></dict></dict>
+</array></dict></plist>"#
+        ))
+        .unwrap()
+    }
+    const HL_RED: crate::Rgba = crate::Rgba { r: 0xff, g: 0, b: 0, a: 0xff };
+    const HL_GREEN: crate::Rgba = crate::Rgba { r: 0, g: 0xff, b: 0, a: 0xff };
+
+    /// The colour of row `row`'s span starting at byte `col` (after a full drive).
+    fn color_at(d: &Document, row: u32, col: u32) -> crate::Rgba {
+        d.highlight_line_spans(row)
+            .unwrap_or_else(|| panic!("row {row} has spans"))
+            .iter()
+            .find(|s| s.range.start == col)
+            .unwrap_or_else(|| panic!("row {row} has a span at byte {col}"))
+            .style
+            .fg
+    }
+
+    fn drive_highlight(d: &mut Document) {
+        while d.highlight_frontier().is_some() {
+            d.tokenize_highlight(u32::MAX);
+        }
+    }
+
+    /// Fails-first (the ticket's theme repro): a verified segment tokenized with
+    /// the red theme, absorbed after `set_theme(green)`, used to be accepted —
+    /// row 10's keyword stayed red and the frontier jumped past row 600, so those
+    /// rows stayed wrong until edited. It must be rejected, absorbing nothing.
+    #[test]
+    fn absorb_highlight_rejects_a_segment_from_the_previous_theme() {
+        let mut d = doc(&"kw word\n".repeat(2_000));
+        d.set_syntax(crate::SyntaxDef::from_sublime_syntax(HL_G).unwrap(), keyword_theme("#FF0000"));
+        let engine = d.highlight_engine().unwrap();
+        let snap = d.snapshot();
+        let rev = d.revision();
+        let seg =
+            crate::tokenize_segment(&engine, &snap, 0..600, crate::SegmentStart::Fresh, Some(0..600), None);
+        d.set_theme(keyword_theme("#00FF00"));
+        assert!(!d.absorb_highlight(rev, seg, true), "an old-theme segment must be rejected");
+        assert_eq!(d.highlight_frontier(), Some(0), "a rejected absorb must not move the frontier");
+        drive_highlight(&mut d);
+        assert_eq!(color_at(&d, 10, 0), HL_GREEN, "row 10's keyword repaints in the new theme");
+    }
+
+    /// Fails-first (the ticket's grammar repro): the same hole through
+    /// `set_syntax`. The old grammar makes `kw` the keyword, the new one `word`;
+    /// an old-grammar segment absorbed after the swap would leave `kw` red.
+    #[test]
+    fn absorb_highlight_rejects_a_segment_from_the_previous_grammar() {
+        const WORD_G: &str = "%YAML 1.2\n---\nname: W\nscope: source.w\ncontexts:\n  main:\n    - match: '\\bword\\b'\n      scope: keyword.w\n";
+        let mut d = doc(&"kw word\n".repeat(2_000));
+        d.set_syntax(crate::SyntaxDef::from_sublime_syntax(HL_G).unwrap(), keyword_theme("#FF0000"));
+        let engine = d.highlight_engine().unwrap();
+        let snap = d.snapshot();
+        let rev = d.revision();
+        let seg =
+            crate::tokenize_segment(&engine, &snap, 0..600, crate::SegmentStart::Fresh, Some(0..600), None);
+        d.set_syntax(crate::SyntaxDef::from_sublime_syntax(WORD_G).unwrap(), keyword_theme("#FF0000"));
+        assert!(!d.absorb_highlight(rev, seg, true), "an old-grammar segment must be rejected");
+        assert_eq!(d.highlight_frontier(), Some(0), "a rejected absorb must not move the frontier");
+        drive_highlight(&mut d);
+        assert_eq!(color_at(&d, 10, 3), HL_RED, "`word` is the new grammar's keyword");
+        assert_ne!(color_at(&d, 10, 0), HL_RED, "`kw` is plain text under the new grammar");
+    }
+
+    /// Provenance covers a segment's INPUTS, not just the engine that ran it: a
+    /// coordinator chaining across a swap can hand the current engine an
+    /// old-engine boundary to resume from, or an old-engine segment to splice a
+    /// converged tail from. Either result carries old-engine state or spans, so
+    /// it must be refused like the old engine's own output.
+    #[test]
+    fn absorb_highlight_rejects_a_segment_built_on_the_previous_engines_output() {
+        let mut d = doc(&"kw word\n".repeat(2_000));
+        d.set_syntax(crate::SyntaxDef::from_sublime_syntax(HL_G).unwrap(), keyword_theme("#FF0000"));
+        let old = d.highlight_engine().unwrap();
+        let snap = d.snapshot();
+        let rev = d.revision();
+        let old_prefix = crate::tokenize_segment(&old, &snap, 0..300, crate::SegmentStart::Fresh, None, None);
+        let old_guess =
+            crate::tokenize_segment(&old, &snap, 300..800, crate::SegmentStart::Fresh, Some(300..800), None);
+        d.set_theme(keyword_theme("#00FF00"));
+        let new = d.highlight_engine().unwrap();
+
+        // Resumed from the old engine's end boundary.
+        let after_old = crate::SegmentStart::After(old_prefix.end_boundary().clone());
+        let chained = crate::tokenize_segment(&new, &snap, 300..800, after_old, Some(300..800), None);
+        assert!(!d.absorb_highlight(rev, chained, true), "resumed from an old-engine boundary");
+
+        // A converging re-run against the old engine's segment: the stateless
+        // grammar converges at the first stride checkpoint, so without the
+        // provenance rule the old (red) tail would be spliced in under the new
+        // engine's stamp.
+        let new_prefix = crate::tokenize_segment(&new, &snap, 0..300, crate::SegmentStart::Fresh, None, None);
+        let after_new = crate::SegmentStart::After(new_prefix.end_boundary().clone());
+        let rerun = crate::tokenize_segment(&new, &snap, 300..800, after_new, None, Some(&old_guess));
+        assert!(!d.absorb_highlight(rev, rerun, true), "spliced from an old-engine segment");
+
+        assert_eq!(d.highlight_frontier(), Some(0), "nothing was absorbed");
+        // The new engine's own chain is still accepted.
+        assert!(d.absorb_highlight(rev, new_prefix, true), "the current engine's own segment");
+    }
+
     #[test]
     fn diagnostics_install_then_ride_a_forward_edit() {
         use crate::{Diagnostic, DiagnosticsOutcome, Severity};
@@ -4042,6 +4959,83 @@ mod tests {
         let rev = d.revision();
         d.set_diagnostics(rev, vec![Diagnostic::new(2..99, Severity::Error, "past eof")]);
         assert_eq!(d.diagnostics_in(0..100).next().unwrap().0, 2..3, "clipped to buffer len");
+    }
+
+    /// Regression (fails-first): spans were clipped to the length but not to
+    /// char boundaries, so `1..3` over `"é"` was stored as-is — a squiggle
+    /// starting inside a char, which diagnostic navigation then installed as
+    /// a selection. Spans now snap outward to whole chars; an empty span snaps
+    /// to the start of the char it split and stays empty.
+    #[test]
+    fn diagnostic_spans_snap_to_char_boundaries() {
+        use crate::{Diagnostic, Severity};
+        let mut d = doc("é\néé"); // é 0..2, \n 2, é 3..5, é 5..7
+        let rev = d.revision();
+        let diag = |span| Diagnostic::new(span, Severity::Error, "x");
+        d.set_diagnostics(rev, vec![diag(1..3), diag(4..4), diag(6..900)]);
+        let spans: Vec<Range<u32>> = d.diagnostics_in(0..u32::MAX).map(|(r, ..)| r).collect();
+        assert_eq!(spans, [0..3, 3..3, 5..7]);
+        // Navigation selects each span: every one must be motion-safe.
+        for want in [0..3, 3..3, 5..7] {
+            assert_eq!(d.next_diagnostic(true), Some(want.clone()));
+            assert_eq!(range(&d), (want.start, want.end));
+            d.move_carets(Motion::Right, true);
+        }
+    }
+
+    #[test]
+    fn host_decorations_snap_to_char_boundaries() {
+        // Fails-first: `decorations_mut` hands the host the document's
+        // own store, which installed every range verbatim — `1..3` over "éé"
+        // was stored mid-char at both ends, and a past-end span stayed past the
+        // end. Every store door that stores a caller's range now clips it
+        // through the one range rule, against the document's current text.
+        use crate::{Diagnostic, DiagnosticsOutcome};
+        let mut d = doc("éé"); // é 0..2, é 2..4
+        let stop = |index| DecorationKind::SnippetStop { index };
+        let range_of = |d: &Document, id| d.decorations().decoration_range(id);
+        let a = d.decorations_mut().add_decoration(1..3, stop(0), Stickiness::NeverGrows);
+        let b = d.decorations_mut().add_decoration(3..900, stop(1), Stickiness::NeverGrows);
+        let c = d.decorations_mut().add_decoration(1..1, stop(2), Stickiness::AlwaysGrows);
+        assert_eq!(range_of(&d, a), Some(0..4), "a mid-char span snaps outward to whole chars");
+        assert_eq!(range_of(&d, b), Some(2..4), "a past-end end clamps to the end");
+        assert_eq!(range_of(&d, c), Some(0..0), "an empty span stays empty, at its char's start");
+        // The batch doors, and the store's own diagnostics door, clip alike.
+        let batch = d.decorations_mut().add_sorted_batch([1..3, 5..9], stop(3), Stickiness::NeverGrows);
+        let spliced = d.decorations_mut().splice_sorted_batch(&[3..3, 9..9], stop(4), Stickiness::NeverGrows);
+        let ranges: Vec<_> = batch.iter().chain(&spliced).map(|&id| range_of(&d, id)).collect();
+        assert_eq!(ranges, [Some(0..4), Some(4..4), Some(2..2), Some(4..4)]);
+        let rev = d.revision().0;
+        let diags = vec![Diagnostic::new(1..3, Severity::Error, "x")];
+        assert_eq!(d.decorations_mut().set_diagnostics(rev, rev, diags), DiagnosticsOutcome::Applied { count: 1 });
+        let spans: Vec<Range<u32>> = d.diagnostics_in(0..u32::MAX).map(|(r, ..)| r).collect();
+        assert_eq!((spans.len(), spans.first().cloned()), (1, Some(0..4)));
+        // Against the CURRENT text: after an edit shifts the chars, a span
+        // clips to where they are now.
+        d.edit(vec![EditOp::insert(0, "a")]).unwrap(); // é 1..3, é 3..5
+        let e = d.decorations_mut().add_decoration(2..4, stop(5), Stickiness::NeverGrows);
+        assert_eq!(range_of(&d, e), Some(1..5));
+        // A standalone store knows no text: it still installs verbatim.
+        let mut lone = DecorationStore::new();
+        let f = lone.add_decoration(1..3, stop(6), Stickiness::NeverGrows);
+        assert_eq!(lone.decoration_range(f), Some(1..3));
+    }
+
+    #[test]
+    fn a_host_fold_opener_is_clipped_to_the_buffer() {
+        // Fails-first: `toggle_fold_opener` keyed the fold by its host
+        // offset as given, so a fold at 1000 outlived a 4-byte document, and
+        // one at byte 1 of "é" split a char.
+        let mut d = doc("a{b}");
+        assert!(d.toggle_fold_opener(1000));
+        let len = d.buffer().len();
+        assert!(d.folds().iter().all(|o| o <= len), "a fold past the end: {:?}", d.folds().iter().collect::<Vec<_>>());
+        assert!(d.toggle_fold_opener(1000), "the same host offset toggles the clipped fold back");
+        assert!(d.folds().is_empty());
+        let mut e = doc("é{\n}");
+        assert!(e.toggle_fold_opener(1));
+        let text = e.text().into_owned();
+        assert!(e.folds().iter().all(|o| text.is_char_boundary(o as usize)), "a fold inside a char");
     }
 
     #[test]
@@ -4501,6 +5495,38 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_build_the_fold_map_once() {
+        // Undo/redo can't shift the memo through their patches (the whole-set
+        // reconcile they run bumps the fold generation), so ONE rebuild each is
+        // the floor. The restore's caret ejection must BE that rebuild — the
+        // memo, which the next render then reads — not a throwaway
+        // `FoldMap::new` the render follows with a second O(folds) build.
+        use crate::fold_map::FOLD_BUILDS;
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&format!("fn f{i}() {{\n    body\n}}\n"));
+        }
+        let mut d = doc(&text);
+        let opens: Vec<u32> = d.collapsible_pairs().into_iter().map(|(o, ..)| o).collect();
+        d.set_selections(SelectionSet::from_offsets(&opens));
+        d.fold_at_carets(false); // collapse everything
+        // A caret at the start of every header row — visible, and outside the
+        // fold it heads, so the typed unit leaves every fold collapsed.
+        d.move_carets(Motion::LineStart, false);
+        d.type_char('x');
+        assert_eq!(d.folds().len(), opens.len(), "typing before the headers folds nothing open");
+        let _ = d.fold_map(); // warm the memo
+        let builds = |d: &mut Document, step: fn(&mut Document) -> bool| {
+            let base = FOLD_BUILDS.with(std::cell::Cell::get);
+            assert!(step(d));
+            let _ = d.fold_map(); // the render's read
+            FOLD_BUILDS.with(std::cell::Cell::get) - base
+        };
+        assert_eq!(builds(&mut d, Document::undo), 1, "undo + render build the fold map once");
+        assert_eq!(builds(&mut d, Document::redo), 1, "redo + render build the fold map once");
+    }
+
+    #[test]
     fn keystroke_with_document_scale_decorations_does_not_resort_the_store() {
         // The per-keystroke DECORATION gate: typing with a document-scale
         // decoration set present must NOT re-sort the whole store — apply_patch
@@ -4644,6 +5670,53 @@ mod tests {
         // pull it to the visible header row, never leave it on invisible text.
         let row = d.buffer().offset_to_point(d.selections().newest().head()).row;
         assert_eq!(row, 0, "caret ejected to the header row");
+    }
+
+    #[test]
+    fn fold_at_carets_ejects_a_caret_on_the_closing_rows_indent() {
+        // Fails-first: the batched ejection read only rows STRICTLY inside a
+        // block as hidden, so a caret in the closing row's leading whitespace —
+        // which renders nowhere (`display_position` is `None` there) — stayed
+        // put after Ctrl+Shift+[, where the single-fold toggle ejected it.
+        use crate::SelectionSet;
+        let mut d = doc("m {\n  a\n  }\nz"); // rows: "m {", "  a", "  }", "z"
+        d.set_selections(SelectionSet::new(d.buffer().point_to_offset(Point::new(2, 1))));
+        assert!(d.fold_at_carets(false), "the block folds");
+        let head = d.selections().newest().head();
+        assert_eq!(head, d.buffer().point_to_offset(Point::new(0, 3)), "ejected to the header's end");
+        assert!(d.fold_map().display_position(d.buffer(), head, d.tab_size()).is_some());
+    }
+
+    #[test]
+    fn caret_ejection_hides_exactly_what_display_position_cannot_place() {
+        // The one "hidden" owner, checked against THE owner of where an offset
+        // renders: over every offset of documents with every pair collapsed,
+        // `entry_edge_if_hidden` ejects exactly the offsets `display_position`
+        // cannot place (a block's gap, its closing row's indent) plus an inline
+        // gap's interior, which `display_position` clips to the chip instead.
+        for text in [
+            "m {\n  a\n  }\nz",
+            "m {\n\ta\n\t}\nz",
+            "m {\n  [1, 2]\n  }",
+            "m { [1, 2]\n  a\n  }",
+            "x [1, 2] y",
+            "a {\n  b {\n    c\n  }\n  d\n}\n",
+        ] {
+            let mut d = doc(text);
+            let openers: Vec<u32> = d.collapsible_pairs().into_iter().map(|(o, ..)| o).collect();
+            d.set_selections(SelectionSet::from_offsets(&openers));
+            d.fold_at_carets(false);
+            let map = d.fold_map();
+            for off in 0..=d.buffer().len() {
+                let unplaceable = map.display_position(d.buffer(), off, d.tab_size()).is_none();
+                let in_inline_gap = map.inline_fold_before(off).is_some_and(|f| f.hides_caret_at(off));
+                assert_eq!(
+                    map.entry_edge_if_hidden(d.buffer(), off).is_some(),
+                    unplaceable || in_inline_gap,
+                    "{text:?} @ {off}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5315,6 +6388,92 @@ mod tests {
             }
             let (oracle, _) = crate::find::scan(&d.buffer().text(), &fq);
             assert_eq!(match_ranges(&d), oracle, "step {step} diverged from the oracle");
+        }
+    }
+
+    #[test]
+    fn folding_repair_equals_full_scan_property() {
+        // The repair oracle under Unicode simple case folding, where a match's
+        // BYTE length is not the needle's: `k` folds with `K` KELVIN SIGN (3
+        // bytes), `s` with `ſ` LONG S (2), `ß` with `ẞ` (3), `σ` with `Σ`/`ς`.
+        // After every commit — forward edits, multi-edit transactions, undo,
+        // redo — the live set must equal a fresh `scan` of the live text. Each
+        // needle's first char occurs nowhere else in it, so it cannot overlap
+        // itself even under folding and equality is exact.
+        //
+        // `kkkkks` is the case with teeth: 7 bytes typed but up to 17 folded
+        // (`KKKKKſ`, KELVIN SIGNs). The repair reaches about twice the margin
+        // left of an edit (the window, then the removed extents widened again),
+        // so a margin sized from the TYPED length — the pre-folding `k` — only
+        // fails once a folded match outgrows the typed one by more than 2×,
+        // which only KELVIN's 3 bytes do: a join that completes a match far
+        // left of the edit point (deleting the gap in `KKKKK ſ`) then goes
+        // unfound. (Verified: that mutation fails here, with the bounds
+        // `debug_assert` in the scan disabled.)
+        let ks = ['k', 'K', '\u{212A}', '\u{212A}', '\u{212A}', 's', 'S', '\u{17F}', ' '];
+        let sharp = ['ß', '\u{1E9E}', 'σ', 'Σ', 'ς', 'ς', ' '];
+        let cases: [(u64, &str, &[char], &str); 4] = [
+            (0x5DEE_CE66_D1CE_4E5B, "ks", &ks, "ks \u{212A}ſ KS k s "),
+            (
+                0x2545_F491_4F6C_DD1D,
+                "kkkkks",
+                &ks,
+                "\u{212A}\u{212A}\u{212A}\u{212A}\u{212A}ſ kkkkks \u{212A}\u{212A}\u{212A}\u{212A}\u{212A} ſ KK\u{212A}KkS ",
+            ),
+            (0x9E37_79B9_7F4A_7C15, "\u{212A}ſſſ", &ks, "kSSS \u{212A}ſſſ Ksss "),
+            (0x0DDB_A11C_AFE5_EED5, "ßσσσ", &sharp, "\u{1E9E}ΣΣΣ ßσσς \u{1E9E}ςςς ẞσσ "),
+        ];
+        for (seed, needle, alphabet, seed_text) in cases {
+            let fq = crate::FindQuery { text: needle.into(), case_sensitive: false, ..Default::default() };
+            let mut next = xorshift(seed);
+            let rand_str = |next: &mut dyn FnMut() -> u64| -> String {
+                (0..1 + next() % 3).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect()
+            };
+            let mut d = doc(&seed_text.repeat(6));
+            d.set_find_query(Some(fq.clone()), 0);
+            // Random byte offsets snapped to char boundaries (edits must land on them).
+            let at = |d: &Document, raw: u64| {
+                d.buffer().clip_offset((raw % u64::from(d.buffer().len() + 1)) as u32, Bias::Left)
+            };
+            let mut nonempty = 0;
+            for step in 0..400 {
+                match next() % 6 {
+                    0 | 1 => {
+                        let p = at(&d, next());
+                        let s = rand_str(&mut next);
+                        d.edit(vec![EditOp::insert(p, s)]).unwrap();
+                    }
+                    2 if !d.buffer().is_empty() => {
+                        let a = at(&d, next());
+                        let b = d.buffer().clip_offset(a + 1 + (next() % 8) as u32, Bias::Right);
+                        if a < b {
+                            d.edit(vec![EditOp::delete(a..b)]).unwrap();
+                        }
+                    }
+                    3 => {
+                        // Two scattered inserts as ONE transaction.
+                        let (a, b) = (at(&d, next()), at(&d, next()));
+                        let (a, b) = (a.min(b), a.max(b));
+                        let (s, t) = (rand_str(&mut next), rand_str(&mut next));
+                        let ops = if a == b {
+                            vec![EditOp::insert(a, s + &t)]
+                        } else {
+                            vec![EditOp::insert(a, s), EditOp::insert(b, t)]
+                        };
+                        d.edit(ops).unwrap();
+                    }
+                    4 => {
+                        d.undo();
+                    }
+                    _ => {
+                        d.redo();
+                    }
+                }
+                let (oracle, _) = crate::find::scan(&d.buffer().text(), &fq);
+                nonempty += usize::from(!oracle.is_empty());
+                assert_eq!(match_ranges(&d), oracle, "{needle:?} step {step} diverged from the oracle");
+            }
+            assert!(nonempty > 200, "{needle:?}: the oracle must not pass vacuously ({nonempty})");
         }
     }
 

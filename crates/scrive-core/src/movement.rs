@@ -85,6 +85,15 @@ pub enum ColumnDir {
 /// caret at the motion target. Re-merges afterward (a move can make two
 /// selections coincide). `tab` is the document's tab-stop width — vertical
 /// motion keeps a *visual* goal column, so it needs the display projection.
+///
+/// # Panics
+///
+/// If a selection's head splits a multibyte char. `set` is taken as given —
+/// neither clipped nor clamped — because a set reaching here through
+/// [`Document`](crate::Document) is already valid
+/// ([`Document::set_selections`](crate::Document::set_selections) clips a
+/// host-built one); build a set for this low-level call from char-boundary
+/// offsets ([`Buffer::clip_offset`]).
 pub fn move_selections(set: &mut SelectionSet, buffer: &Buffer, folds: &FoldMap, tab: u32, motion: Motion, extend: bool) {
     set.map_each(|s| {
         let (target, goal) = motion_target(buffer, folds, tab, s.head(), s.goal, motion);
@@ -310,9 +319,10 @@ enum CharKind {
 }
 
 /// Whether `c` is a word character — alphanumeric or `_`. The ONE owner of the
-/// word-boundary rule: word motion ([`char_kind`]) and the auto-close
-/// quote guard ([`crate::autoclose::is_word_char`], which delegates here) share
-/// it, so they cannot disagree about where a word ends. (Completion's word rule
+/// word-boundary rule: word motion ([`char_kind`]), the auto-close
+/// quote guard ([`crate::autoclose::is_word_char`], which delegates here), and
+/// whole-word find's edge check (`find::LineMatcher`) share it, so they cannot
+/// disagree about where a word ends. (Completion's word rule
 /// is deliberately *wider* — it admits `-` for kebab identifiers — and stays
 /// distinct: see [`crate::intel::providers::is_completion_word_char`].)
 pub(crate) fn is_word_char(c: char) -> bool {

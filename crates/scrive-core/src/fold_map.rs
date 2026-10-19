@@ -844,17 +844,27 @@ impl FoldMap {
 
     /// If `offset` is HIDDEN inside a collapsed fold, the caret's eject target — a
     /// block's header line end, or an inline gap's left landable edge; `None` when
-    /// visible. `O(log folds)` (regions and inline roots are sorted and disjoint),
-    /// so a multi-caret fold pulls every hidden caret out in one `O(carets·log
-    /// folds)` pass instead of an `O(carets·folds)` [`Self::display_position`]
-    /// probe each — the "collapse all" ejection at document scale.
+    /// visible. THE caret-hiding test every ejection reads (a fold toggle, a
+    /// batch fold, undo/redo's restore). A block hides exactly the offsets
+    /// [`Self::display_position`] cannot place; an inline gap hides its interior,
+    /// which `display_position` instead clips to the chip (a render question,
+    /// where hiding is a landing one). `O(log folds)` (regions and inline roots
+    /// are sorted and disjoint), so a multi-caret fold pulls every hidden caret
+    /// out in one `O(carets·log folds)` pass instead of an `O(carets·folds)`
+    /// `display_position` probe each — the "collapse all" ejection at document
+    /// scale.
     #[must_use]
     pub fn entry_edge_if_hidden(&self, buffer: &Buffer, offset: u32) -> Option<u32> {
-        // Block: is `offset`'s row STRICTLY inside a region's hidden interior?
-        // (The tail row `last` rides the header and stays visible, so `< last`.)
-        let row = buffer.offset_to_point(offset).row;
-        if let Some(l) = self.locate(row) {
-            if l.header < row && row < l.last {
+        // Block: is `offset` in a region's gap — on a row strictly inside it, or
+        // on its tail row before the visible tail? The tail row rides the header
+        // from its first non-whitespace column on; its leading whitespace renders
+        // nowhere. `containing` (tail-inclusive), not `locate`, so a tail row
+        // resolves to its own fold.
+        let p = buffer.offset_to_point(offset);
+        if let Some(l) = self.containing(p.row) {
+            let in_gap = l.header < p.row
+                && (p.row < l.last || p.col < crate::row_layout::tail_start_col(&buffer.line(p.row)));
+            if in_gap {
                 let end = buffer.line_len(l.header);
                 return Some(buffer.point_to_offset(Point::new(l.header, end)));
             }

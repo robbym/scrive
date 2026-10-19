@@ -29,6 +29,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::buffer::Buffer;
 use crate::coords::Bias;
 use crate::patch::Patch;
 use crate::sum_tree::{Dimension, Item, Summary, SumTree};
@@ -441,6 +442,29 @@ pub struct DecorationStore {
     /// the per-keystroke mover is.
     tree: SumTree<DecoItem>,
     next_id: u64,
+    /// The text a [`Document`](crate::Document) lent this store when it handed
+    /// it to a host ([`Document::decorations_mut`](crate::Document::decorations_mut)):
+    /// while present, every door that stores a caller's range clips it through
+    /// the one range rule ([`Buffer::clip_range`]), so a host range can never
+    /// sit mid-char or past the end. Never stale: the text changes only through
+    /// a commit, and every commit runs [`apply_patch`](Self::apply_patch) — which
+    /// drops it — before anything else touches the store; the next
+    /// `decorations_mut` lends the new text. An O(1) rope clone that shares the
+    /// buffer's structure. A standalone store has none and installs ranges
+    /// verbatim.
+    lent: Option<LentText>,
+}
+
+/// The document text a store clips host ranges against (the store's `lent`
+/// field). A newtype only so `Debug` names the revision instead of dumping the
+/// text.
+#[derive(Clone)]
+struct LentText(Buffer);
+
+impl core::fmt::Debug for LentText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("LentText").field(&self.0.revision()).finish()
+    }
 }
 
 impl Default for DecorationStore {
@@ -453,7 +477,21 @@ impl DecorationStore {
     /// An empty store.
     #[must_use]
     pub fn new() -> Self {
-        Self { tree: SumTree::new(), next_id: 1 }
+        Self { tree: SumTree::new(), next_id: 1, lent: None }
+    }
+
+    /// Lend the store the document's current text, so host ranges stored until
+    /// the next commit clip against it — called as the store is handed out.
+    pub(crate) fn lend_text(&mut self, buffer: &Buffer) {
+        self.lent = Some(LentText(buffer.clone()));
+    }
+
+    /// `range` clipped to the lent text, or as given when none is lent.
+    fn clip(&self, range: Range<u32>) -> Range<u32> {
+        match &self.lent {
+            Some(LentText(buffer)) => buffer.clip_range(range),
+            None => range,
+        }
     }
 
     /// Number of tracked ranges.
@@ -471,15 +509,19 @@ impl DecorationStore {
     /// Insert one tracked range and return its fresh id. Producers: the snippet
     /// session (stops), auto-close, and find.
     ///
-    /// The caller supplies current-revision offsets; per-endpoint char-boundary
-    /// clipping needs the buffer, so it is the `Document`'s responsibility, not
-    /// this standalone store's.
+    /// The caller supplies current-revision offsets. Reached through
+    /// [`Document::decorations_mut`](crate::Document::decorations_mut), the range
+    /// is clipped to the document's text by the one range rule (past-end ends
+    /// clamp, a non-empty range snaps outward to whole chars, an empty one to
+    /// its char's start); a standalone store, knowing no text, installs it
+    /// verbatim.
     pub fn add_decoration(
         &mut self,
         range: Range<u32>,
         kind: DecorationKind,
         stickiness: Stickiness,
     ) -> DecorationId {
+        let range = self.clip(range);
         let id = self.mint();
         let mut v = self.to_vec();
         v.push(TrackedRange { id, range, kind, stickiness });
@@ -624,7 +666,9 @@ impl DecorationStore {
     /// Ids are minted in span order and exceed every existing id, so a tie at a
     /// shared start places the new item AFTER the existing one — byte-identical to
     /// `set_sorted`. Insertion moves no bytes, so the suffix
-    /// `reanchor` runs with `delta = 0`.
+    /// `reanchor` runs with `delta = 0`. Spans clip as
+    /// [`add_decoration`](Self::add_decoration)'s do (the clip is monotone, so
+    /// the batch stays ascending).
     pub fn splice_sorted_batch(
         &mut self,
         spans: &[Range<u32>],
@@ -639,12 +683,13 @@ impl DecorationStore {
         for span in spans {
             let id = self.mint();
             ids.push(id);
-            batch.push(TrackedRange { id, range: span.clone(), kind: kind.clone(), stickiness });
+            let range = self.clip(span.clone());
+            batch.push(TrackedRange { id, range, kind: kind.clone(), stickiness });
         }
         // The touched band: existing items whose start ∈ [lo, hi] (every batch
         // start lies here, so the batch merges entirely into it).
-        let lo = spans.first().expect("non-empty").start;
-        let hi = spans.last().expect("non-empty").start;
+        let lo = batch.first().expect("non-empty").range.start;
+        let hi = batch.last().expect("non-empty").range.start;
         let k_lo = self.tree.summary_before(&StartDim(lo)).count; // start < lo
         let k_hi = self.tree.summary_before(&StartDim(hi.saturating_add(1))).count; // start ≤ hi
 
@@ -742,7 +787,8 @@ impl DecorationStore {
     /// the minted ids, in span order — ONE sort-and-rebuild for the whole batch
     /// instead of one per span, so installing a 10k-match find set is a single
     /// sort rather than one per match. The find re-scan installs its whole match
-    /// set through this.
+    /// set through this. Spans clip as
+    /// [`add_decoration`](Self::add_decoration)'s do.
     pub fn add_sorted_batch(
         &mut self,
         spans: impl IntoIterator<Item = Range<u32>>,
@@ -752,6 +798,7 @@ impl DecorationStore {
         let mut v = self.to_vec();
         let mut ids = Vec::new();
         for range in spans {
+            let range = self.clip(range);
             let id = self.mint();
             v.push(TrackedRange { id, range, kind: kind.clone(), stickiness });
             ids.push(id);
@@ -833,6 +880,8 @@ impl DecorationStore {
     /// coordinates, so one `map_range` per range applies the whole transaction
     /// at once — no back-to-front bookkeeping here (that lives in the patch).
     pub fn apply_patch(&mut self, patch: &Patch) {
+        // The text moved on: a lent copy no longer indexes it (see `lent`).
+        self.lent = None;
         if patch.is_empty() {
             return;
         }
@@ -930,9 +979,11 @@ impl DecorationStore {
     ///    variant. Non-diagnostic decorations (snippet stops, find matches,
     ///    auto-close) are untouched.
     ///
-    /// Span clipping and degenerate-span normalization need the buffer, so they
-    /// are the `Document`'s responsibility; this standalone store installs spans
-    /// verbatim.
+    /// Spans clip as [`add_decoration`](Self::add_decoration)'s do: to the
+    /// document's text when reached through
+    /// [`Document::decorations_mut`](crate::Document::decorations_mut) or
+    /// [`Document::set_diagnostics`](crate::Document::set_diagnostics), verbatim
+    /// in a standalone store.
     pub fn set_diagnostics(
         &mut self,
         revision: u64,
@@ -951,7 +1002,7 @@ impl DecorationStore {
             let id = self.mint();
             v.push(TrackedRange {
                 id,
-                range: d.span,
+                range: self.clip(d.span),
                 kind: DecorationKind::Diagnostic {
                     severity: d.severity,
                     message: Arc::from(d.message),

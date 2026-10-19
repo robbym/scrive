@@ -24,6 +24,17 @@
 //! cursor move, glue on space, and the other coalescing rules that match how
 //! mainstream editors group typing into undo steps) lives in the verbs layer.
 //!
+//! Each undo unit also carries the **selection set from either side of it**
+//! (`sel_before` / `sel_after`), so undo hands back the carets the user had
+//! before the unit and redo the carets the unit left — a three-caret keystroke
+//! undoes to three carets, not one. For a merged unit (a typing run) the
+//! before-set is the one captured ahead of the run's FIRST keystroke and the
+//! after-set is overwritten by each merged step, so the unit restores as one
+//! piece in both directions. Both sets are exact, never rebased: undo returns
+//! the buffer byte-for-byte to the state the before-set was captured against,
+//! and redo to the after-set's. They are small next to the op text they
+//! accompany (one `Selection` per caret, against at least one op per caret).
+//!
 //! Dirty tracking uses an alternative-version id (`alt`): a fresh id per recorded
 //! transaction, stored per element and *restored* by undo/redo. This makes
 //! dirtiness a comparison against the id captured at the last save — undoing
@@ -89,13 +100,20 @@ struct Step {
 
 /// One undo unit: the edit from a node's parent to the node, as a chronological
 /// list of [`Step`]s (one for a discrete edit, several for a merged typing run).
-/// `alt_before`/`alt_after` are the document versions on either side of the unit.
+/// `alt_before`/`alt_after` are the document versions on either side of the unit,
+/// and `sel_before`/`sel_after` the selection sets — what undo and redo restore.
 #[derive(Clone, Debug)]
 struct Element {
     steps: Vec<Step>,
     op: OpClass,
     alt_before: u64,
     alt_after: u64,
+    /// The selections ahead of the unit's FIRST step — set once, when the unit
+    /// opens; a merged step never touches it.
+    sel_before: SelectionSet,
+    /// The selections the unit's LATEST step left (verb caret placement
+    /// included) — overwritten by every merged step.
+    sel_after: SelectionSet,
 }
 
 /// Arena index into [`History::nodes`]. Node `0` is the root (base state).
@@ -179,15 +197,40 @@ impl History {
         self.nodes[self.current].preferred_child.is_some()
     }
 
+    /// Whether an edit recorded under `hint` right now would merge into
+    /// `current`'s element rather than open a new unit — the one merge rule,
+    /// shared by [`record`](Self::record) and the commit path, which asks it
+    /// BEFORE applying so it clones the pre-edit selections only for an edit
+    /// that opens a unit (a merged keystroke never needs them).
+    pub(crate) fn merges(&self, hint: GroupingHint) -> bool {
+        self.open
+            && !hint.seal_before
+            && hint.op != OpClass::Other
+            && self.nodes[self.current].elem.as_ref().is_some_and(|e| e.op == hint.op)
+    }
+
     /// Record a committed transaction under `hint`, given its ops in both
     /// directions (`forward` = the applied ops, `inverse` =
-    /// [`Committed::into_inverse`]).
+    /// [`Committed::into_inverse`]) and the selections on either side of it:
+    /// `before` = the set ahead of the edit — required exactly when the edit
+    /// opens a unit (`!merges(hint)`), ignored when it merges — and `after` =
+    /// the set the edit left, caret placement included.
     ///
     /// Merges into `current`'s element when the classes match and nothing seals
     /// between them; otherwise opens a **new child** of `current` and moves there.
     /// Unlike a two-stack history there is no redo to clear — a sibling branch
     /// created earlier simply remains reachable via [`select_redo_branch`].
-    pub(crate) fn record(&mut self, forward: Vec<EditOp>, inverse: Vec<EditOp>, hint: GroupingHint) {
+    pub(crate) fn record(
+        &mut self,
+        forward: Vec<EditOp>,
+        inverse: Vec<EditOp>,
+        hint: GroupingHint,
+        before: Option<SelectionSet>,
+        after: &SelectionSet,
+    ) {
+        // Decided before `seal_before` closes the element below — `merges`
+        // already reads `seal_before` as "won't merge".
+        let can_merge = self.merges(hint);
         if hint.seal_before {
             self.open = false;
         }
@@ -198,22 +241,31 @@ impl History {
         let alt_after = self.alt;
 
         let step = Step { forward, inverse };
-        let can_merge = self.open
-            && hint.op != OpClass::Other
-            && self.nodes[self.current].elem.as_ref().is_some_and(|e| e.op == hint.op);
-
         if can_merge {
             let elem = self.nodes[self.current].elem.as_mut().expect("open implies an element");
             elem.steps.push(step);
             elem.alt_after = alt_after;
+            // The run's before-set stays the one from ahead of its first step;
+            // only the after-set moves. `assign_from` reuses its buffer, so a
+            // merged keystroke allocates nothing here.
+            elem.sel_after.assign_from(after);
         } else {
+            let sel_before =
+                before.expect("an edit that opens a unit carries its before-selections (see `merges`)");
             let parent = self.current;
             let new_id = self.nodes.len();
             self.nodes.push(UndoNode {
                 parent: Some(parent),
                 children: Vec::new(),
                 preferred_child: None,
-                elem: Some(Element { steps: vec![step], op: hint.op, alt_before, alt_after }),
+                elem: Some(Element {
+                    steps: vec![step],
+                    op: hint.op,
+                    alt_before,
+                    alt_after,
+                    sel_before,
+                    sel_after: after.clone(),
+                }),
             });
             let parent_node = &mut self.nodes[parent];
             parent_node.children.push(new_id);
@@ -286,50 +338,48 @@ impl History {
         self.nodes = fresh;
     }
 
-    /// Undo the edit at `current` against `buffer`, moving to the parent and
-    /// rebasing `selections` through each reverted step so carets stay valid.
+    /// Undo the edit at `current` against `buffer`, moving to the parent.
     /// `on_step` fires after each reverted step with its [`Committed`] and the
     /// post-step buffer, so the caller rebases its derived views through the same
     /// patch — the one mover that keeps every derived view consistent across
-    /// undo. Returns `false` if there is nothing to undo.
+    /// undo. Returns the unit's **before-selections** for the caller to restore
+    /// (exact for the reverted buffer — see module docs), or `None` if there is
+    /// nothing to undo.
     pub(crate) fn undo(
         &mut self,
         buffer: &mut Buffer,
-        selections: &mut SelectionSet,
         on_step: impl FnMut(&Committed, &Buffer),
-    ) -> bool {
+    ) -> Option<SelectionSet> {
         if self.current == 0 {
-            return false;
+            return None;
         }
         let elem = self.nodes[self.current].elem.clone().expect("non-root nodes carry an element");
         // Revert the element's steps newest-first; each step's inverse is in the
         // coordinates of the buffer state at that point (see module docs).
-        replay(buffer, selections, elem.steps.iter().rev().map(|s| &s.inverse), on_step);
+        replay(buffer, elem.steps.iter().rev().map(|s| &s.inverse), on_step);
         self.current = self.nodes[self.current].parent.expect("non-root nodes have a parent");
         self.alt = elem.alt_before;
         self.open = false;
-        true
+        Some(elem.sel_before)
     }
 
     /// Redo along `current`'s preferred branch — the [`undo`](Self::undo) mirror,
-    /// replaying the child's forward steps through the same mover. Returns
-    /// `false` if there is nothing to redo.
+    /// replaying the child's forward steps through the same mover. Returns the
+    /// unit's **after-selections** for the caller to restore, or `None` if there
+    /// is nothing to redo.
     pub(crate) fn redo(
         &mut self,
         buffer: &mut Buffer,
-        selections: &mut SelectionSet,
         on_step: impl FnMut(&Committed, &Buffer),
-    ) -> bool {
-        let Some(child) = self.nodes[self.current].preferred_child else {
-            return false;
-        };
+    ) -> Option<SelectionSet> {
+        let child = self.nodes[self.current].preferred_child?;
         let elem = self.nodes[child].elem.clone().expect("child nodes carry an element");
         // Re-apply the element's steps oldest-first (forward coordinates).
-        replay(buffer, selections, elem.steps.iter().map(|s| &s.forward), on_step);
+        replay(buffer, elem.steps.iter().map(|s| &s.forward), on_step);
         self.current = child;
         self.alt = elem.alt_after;
         self.open = false;
-        true
+        Some(elem.sel_after)
     }
 
     /// The number of redo branches available from `current` — 1 for the classic
@@ -368,21 +418,19 @@ impl History {
     }
 }
 
-/// Apply each op-set to `buffer` in the given order, rebasing `selections`
-/// through each patch so carets track the change, and firing `on_step` with each
+/// Apply each op-set to `buffer` in the given order, firing `on_step` with each
 /// step's [`Committed`] + the post-step buffer (so the caller rebases its derived
 /// views through the same patch). The ops are already stored in the direction
 /// being replayed, so — unlike a two-stack history — nothing is collected or
-/// flipped here.
+/// flipped here. Selections are deliberately NOT rebased step by step: the unit
+/// carries the exact set for the state it lands on, which the caller restores.
 fn replay<'a>(
     buffer: &mut Buffer,
-    selections: &mut SelectionSet,
     steps: impl Iterator<Item = &'a Vec<EditOp>>,
     mut on_step: impl FnMut(&Committed, &Buffer),
 ) {
     for step in steps {
         let committed = apply(buffer, step.clone()).expect("history ops are disjoint by construction");
-        selections.rebase(committed.patch());
         on_step(&committed, buffer);
     }
 }

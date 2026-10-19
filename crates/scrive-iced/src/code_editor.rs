@@ -333,6 +333,9 @@ impl CodeEditor {
     pub fn theme(mut self, theme: TokenTheme) -> Self {
         if self.has_syntax {
             self.doc.set_theme(theme.clone());
+            // `language` already started a large document's pool with the
+            // previous theme's engine.
+            self.repaint_after_theme_swap();
         }
         self.theme = theme;
         self
@@ -500,7 +503,7 @@ impl CodeEditor {
     pub fn set_theme(&mut self, theme: TokenTheme) {
         self.doc.set_theme(theme.clone());
         self.theme = theme;
-        self.doc.tokenize_highlight(self.viewport.end);
+        self.repaint_after_theme_swap();
     }
 
     /// Publish a diagnostic set from the host's (debounced, off-thread) compile
@@ -580,9 +583,10 @@ impl CodeEditor {
         self.doc.observe_changes(on);
     }
 
-    /// Drain the incremental-change log: every applied edit since the last drain,
-    /// as `EditOp` deltas ready to translate into LSP content changes. Empty
-    /// unless [`observe_changes`](CodeEditor::observe_changes) is on. Forwards to
+    /// Drain the incremental-change log: every applied change since the last
+    /// drain — edits, undo, and redo alike — as `EditOp` deltas in sequential
+    /// replay order, ready to translate into LSP content changes. Empty unless
+    /// [`observe_changes`](CodeEditor::observe_changes) is on. Forwards to
     /// [`Document::drain_changes`].
     pub fn drain_changes(&mut self) -> Vec<EditOp> {
         self.doc.drain_changes()
@@ -1167,6 +1171,25 @@ impl CodeEditor {
             let n = self.doc.buffer().line_count();
             self.doc.set_highlight_window(0..n);
             self.doc.tokenize_highlight(n);
+        }
+    }
+
+    /// Repaint after a theme swap (the document's theme is already swapped). The
+    /// swap minted a new highlight engine and the document refuses segments from
+    /// any other — and it leaves the revision unchanged, so the sweep's
+    /// edit-restart check would never notice it. A large document's pool is
+    /// therefore RESTARTED here against the new engine (no pool yet ⇒ the next
+    /// sweep creates one with it); left alone, its in-flight old-theme sweep would
+    /// be refused wholesale and the budgeted synchronous fallback would repaint
+    /// the whole buffer a few hundred rows a frame. A small document repaints
+    /// synchronously down to the viewport, as before.
+    fn repaint_after_theme_swap(&mut self) {
+        if self.doc.buffer().len() >= PARALLEL_MIN_BYTES {
+            if let Some(pool) = self.hl_pool.as_mut() {
+                pool.restart(&mut self.doc, self.viewport.clone());
+            }
+        } else {
+            self.doc.tokenize_highlight(self.viewport.end);
         }
     }
 
@@ -1978,6 +2001,117 @@ mod tests {
         assert!(small.hl_pool.is_none(), "a small document keeps the synchronous path");
     }
 
+    /// A `.tmTheme` with the given default and `keyword` foregrounds.
+    fn two_colour_theme(default_hex: &str, keyword_hex: &str) -> TokenTheme {
+        TokenTheme::from_tm_theme(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>settings</key><array>
+<dict><key>settings</key><dict><key>foreground</key><string>{default_hex}</string></dict></dict>
+<dict><key>scope</key><string>keyword</string><key>settings</key><dict><key>foreground</key><string>{keyword_hex}</string></dict></dict>
+</array></dict></plist>"#
+        ))
+        .expect("theme parses")
+    }
+
+    /// Pump the frames-gated sweep until the pool is idle and the frontier is
+    /// clean — what the `subscription` does frame by frame. The pool's workers
+    /// are real threads, so this polls (deadline-guarded) rather than counting.
+    fn drive_sweep(ed: &mut CodeEditor) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            let _ = ed.update(Event::HighlightSweep);
+            let pool_active = ed.hl_pool.as_ref().is_some_and(|p| p.active);
+            if !pool_active && ed.document().highlight_frontier().is_none() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the highlight sweep never converged");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The pool half of a theme swap on a large document: both theme entry points
+    /// (the runtime `set_theme`, and the `theme` builder after `language`) must
+    /// restart the pool against the NEW engine, so the off-thread sweep — not the
+    /// synchronous fallback, a budgeted few hundred rows a frame — repaints.
+    /// Pumping ONLY the pool must therefore leave the frontier clean. Fails-first
+    /// against swaps that left the pool sweeping with the old engine, whose every
+    /// segment the document now refuses.
+    #[test]
+    fn theme_swaps_restart_the_pool_against_the_new_engine() {
+        let big = || format!("kw {}\n", "x".repeat(2_000)).repeat(1_100);
+        let grammar = || SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
+        let pool_alone_cleans_the_frontier = |mut ed: CodeEditor| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            let mut pool = ed.hl_pool.take().expect("a large document has a pool");
+            while pool.active {
+                pool.poll(&mut ed.doc);
+                assert!(std::time::Instant::now() < deadline, "the pool sweep never finished");
+                std::thread::yield_now();
+            }
+            ed.document().highlight_frontier().is_none()
+        };
+
+        let mut runtime = CodeEditor::new(big()).theme(two_colour_theme("#FFFFFF", "#FF0000")).language(grammar());
+        let _ = runtime.update(Event::Editor(Action::ViewportChanged(0..40)));
+        runtime.set_theme(two_colour_theme("#AAAAAA", "#00FF00"));
+        assert!(pool_alone_cleans_the_frontier(runtime), "set_theme restarts the pool");
+
+        // The viewport report first, so the restarted pool aims at the same
+        // padded window the document retains (at construction the two defaults
+        // differ, and the gap is the sync refill's job, not dirt).
+        let mut builder = CodeEditor::new(big()).language(grammar());
+        let _ = builder.update(Event::Editor(Action::ViewportChanged(0..40)));
+        let builder = builder.theme(two_colour_theme("#AAAAAA", "#00FF00"));
+        assert!(pool_alone_cleans_the_frontier(builder), "the theme builder restarts the pool");
+    }
+
+    /// The acceptance test for a runtime theme swap on a large (pool-driven)
+    /// document: once the sweep completes, NO row is painted in an old-theme
+    /// colour. Fails-first: the pool kept its old engine across `set_theme` and
+    /// the cache accepted its verified segments (same revision), so the rows they
+    /// covered were marked clean in the old colours, never to be repainted.
+    #[test]
+    fn set_theme_on_a_large_document_leaves_no_old_theme_colour() {
+        let old = two_colour_theme("#FFFFFF", "#FF0000");
+        let (new_default, new_keyword) = (
+            scrive_core::Rgba { r: 0xaa, g: 0xaa, b: 0xaa, a: 0xff },
+            scrive_core::Rgba { r: 0, g: 0xff, b: 0, a: 0xff },
+        );
+        let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
+        // ~2.2 MB over ~1.1k long rows: past PARALLEL_MIN_BYTES (so the pool owns
+        // the sweep) while staying cheap to tokenize in a debug build.
+        let big = format!("kw {}\n", "x".repeat(2_000)).repeat(1_100);
+        let mut ed = CodeEditor::new(big).theme(old).language(grammar);
+        assert!(ed.hl_pool.is_some(), "the document is large enough for the pool");
+        let _ = ed.update(Event::Editor(Action::ViewportChanged(0..40)));
+        // Swap while the pool's first (old-theme) sweep is still in flight.
+        ed.set_theme(two_colour_theme("#AAAAAA", "#00FF00"));
+        drive_sweep(&mut ed);
+
+        // Walk the viewport down the document so every row is painted at least
+        // once, and check each painted row's every span.
+        let n = ed.document().buffer().line_count();
+        for top in (0..n).step_by(1_000) {
+            let viewport = top..(top + 40).min(n);
+            let _ = ed.update(Event::Editor(Action::ViewportChanged(viewport.clone())));
+            drive_sweep(&mut ed);
+            for row in scrive_core::padded_highlight_window(viewport, n) {
+                let spans = ed.document().highlight_line_spans(row).unwrap_or_else(|| {
+                    panic!("row {row} is inside the converged window but unpainted")
+                });
+                for s in spans {
+                    assert!(
+                        s.style.fg == new_default || s.style.fg == new_keyword,
+                        "row {row} span {:?} is painted {:?}, not a new-theme colour",
+                        s.range,
+                        s.style.fg,
+                    );
+                }
+            }
+        }
+    }
+
     /// `dirty` tracks actual text change: a bare caret move must not dirty the
     /// document (else a host would schedule a needless recompile / save), but
     /// typing does.
@@ -1991,7 +2125,8 @@ mod tests {
     }
 
     /// The incremental-change log (LSP `didChange`) is off by default and logs
-    /// applied edits once enabled, draining clean. Full-sync hosts never touch it.
+    /// applied edits — and their undo — once enabled, draining clean. Full-sync
+    /// hosts never touch it.
     #[test]
     fn drain_changes_mirrors_edits_when_observing() {
         let mut ed = CodeEditor::new("hello\n");
@@ -2002,5 +2137,8 @@ mod tests {
         assert_eq!(changes.len(), 1, "one keystroke logs one change");
         assert_eq!(changes[0].text, "X");
         assert!(ed.drain_changes().is_empty(), "draining clears the log");
+        // Ctrl+Z reaches the log too (it once drained `[]`, stranding the host).
+        let _ = ed.update(Event::Editor(Action::Undo));
+        assert_eq!(ed.drain_changes(), vec![EditOp::delete(0..1)], "undo logs the revert");
     }
 }

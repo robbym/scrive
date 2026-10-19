@@ -66,6 +66,51 @@ fn keystroke(c: &mut Criterion) {
             );
         });
     }
+    // Undo / redo of a multi-caret unit over a document-scale fold set: every
+    // generator block's `fn` body collapsed (~4k folds in 1 MB) and a caret at
+    // the start of every block's comment line (visible, outside every fold),
+    // one char typed. The restore brings back every caret and ejects them
+    // against the folds; the measured step ends with the frame's `fold_map`
+    // read, so a second fold-map build after the restore's would show here.
+    let text = support::gen_doc(1_000_000, 7);
+    let folded_typed = || {
+        let mut d = doc_at(&text, 0);
+        let openers: Vec<u32> = text
+            .match_indices("fn pid_")
+            .map(|(i, _)| (i + text[i..].find('{').expect("a fn line opens a block")) as u32)
+            .collect();
+        d.set_selections(SelectionSet::from_offsets(&openers));
+        d.fold_at_carets(false);
+        let carets: Vec<u32> = text.match_indices("// block").map(|(i, _)| i as u32).collect();
+        d.set_selections(SelectionSet::from_offsets(&carets));
+        d.type_char('x');
+        d
+    };
+    g.bench_function("undo_multicaret_folded_1m", |b| {
+        b.iter_batched(
+            folded_typed,
+            |mut d| {
+                d.undo();
+                black_box(d.fold_map().display_row_count());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    g.bench_function("redo_multicaret_folded_1m", |b| {
+        b.iter_batched(
+            || {
+                let mut d = folded_typed();
+                d.undo();
+                let _ = d.fold_map().display_row_count();
+                d
+            },
+            |mut d| {
+                d.redo();
+                black_box(d.fold_map().display_row_count());
+            },
+            BatchSize::PerIteration,
+        );
+    });
     g.finish();
 }
 
@@ -73,6 +118,12 @@ fn find(c: &mut Criterion) {
     let mut g = c.benchmark_group("find");
     g.sample_size(10).measurement_time(Duration::from_secs(3));
     let query = || Some(FindQuery::new("return"));
+    // The same needle through the whole-word (line-scoped) engine.
+    let whole_word = || {
+        let mut q = FindQuery::new("return");
+        q.whole_word = true;
+        Some(q)
+    };
     for (label, text) in support::sized() {
         g.bench_function(format!("set_query_{label}"), |b| {
             b.iter_batched(
@@ -96,6 +147,27 @@ fn find(c: &mut Criterion) {
                     // Past the debounce window → refresh the match set. The
                     // per-commit windowed repair keeps this cheap: the set is
                     // already current, so this confirms rather than re-scans.
+                    d.maybe_rescan_find(1_000);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        g.bench_function(format!("set_query_whole_word_{label}"), |b| {
+            b.iter_batched(
+                || doc_at(&text, 0),
+                |mut d| d.set_find_query(whole_word(), 0),
+                BatchSize::PerIteration,
+            );
+        });
+        g.bench_function(format!("keystroke_whole_word_{label}"), |b| {
+            b.iter_batched(
+                || {
+                    let mut d = doc_at(&text, mid);
+                    d.set_find_query(whole_word(), 0);
+                    d
+                },
+                |mut d| {
+                    d.type_char('x');
                     d.maybe_rescan_find(1_000);
                 },
                 BatchSize::PerIteration,
@@ -308,6 +380,31 @@ fn query(c: &mut Criterion) {
     g.finish();
 }
 
+fn position(c: &mut Criterion) {
+    let mut g = c.benchmark_group("position");
+    g.sample_size(20).measurement_time(Duration::from_secs(3));
+    // `Buffer::point_to_offset` — the door every row/col position (go-to-line,
+    // an LSP range, a goal column) takes into a byte offset, which also snaps a
+    // mid-char column to a char boundary. 1,024 points spread evenly down the
+    // document, each at column 7, per iteration.
+    for (label, text) in support::sized() {
+        let d = doc_at(&text, 0);
+        let rows = d.buffer().line_count();
+        let points: Vec<scrive_core::Point> = (0..1_024u32)
+            .map(|i| scrive_core::Point::new(i * (rows / 1_024).max(1) % rows, 7))
+            .collect();
+        g.bench_function(format!("point_to_offset_{label}"), |b| {
+            b.iter(|| {
+                points
+                    .iter()
+                    .map(|&p| d.buffer().point_to_offset(black_box(p)))
+                    .fold(0u32, u32::wrapping_add)
+            });
+        });
+    }
+    g.finish();
+}
+
 fn snapshot(c: &mut Criterion) {
     let mut g = c.benchmark_group("snapshot");
     g.sample_size(20).measurement_time(Duration::from_secs(3));
@@ -367,6 +464,6 @@ fn brackets(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches, keystroke, find, highlight, checkpoints, query, snapshot, rope, brackets
+    benches, keystroke, find, highlight, checkpoints, query, position, snapshot, rope, brackets
 );
 criterion_main!(benches);

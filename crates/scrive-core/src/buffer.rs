@@ -23,8 +23,8 @@
 //! must not call it.
 //!
 //! Internal text is **LF-only** and the trailing terminator, if any, is an
-//! empty final line — never a flag. The original EOL flavor is remembered only
-//! to re-expand at [`Buffer::serialize`].
+//! empty final line — never a flag. The file's majority EOL flavor (see
+//! [`EolFlavor`]) is remembered only to re-expand at [`Buffer::serialize`].
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -83,12 +83,60 @@ static NEXT_DOC_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The line-ending flavor detected at load; consulted only by
 /// [`Buffer::serialize`]. Internal text is always LF.
+///
+/// Detection is a **majority vote** over the file's terminators, matching VS
+/// Code: `CrLf` iff CRLF terminators strictly outnumber LF ones, so a **tie
+/// goes to `Lf`** — including the no-terminator case (an empty or one-line
+/// file). A lone `\r` is normalized to `\n` but casts no vote. Saving in the
+/// detected flavor therefore round-trips a uniformly terminated file
+/// byte-for-byte and rewrites only the minority lines of a mixed one.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum EolFlavor {
     /// Unix `\n`.
     Lf,
     /// Windows `\r\n`.
     CrLf,
+}
+
+impl EolFlavor {
+    /// The one owner of the vote rule (see the type docs): strict CRLF
+    /// majority, else `Lf`.
+    fn majority(lf: usize, crlf: usize) -> EolFlavor {
+        if crlf > lf {
+            EolFlavor::CrLf
+        } else {
+            EolFlavor::Lf
+        }
+    }
+}
+
+/// Normalize `\r\n | \r → \n` in one pass over `input`'s CRs, starting at
+/// `first_cr` (the first one; the caller already found it), and report what it
+/// rewrote: `(normalized, crlf, lone_cr)`. The counts feed the [`EolFlavor`]
+/// vote (the caller derives the LF side from them), gathered here so
+/// detection costs no pass of its own.
+/// Slicing at CR/LF positions is sound: both are ASCII, so every cut is a char
+/// boundary.
+fn normalize_eol(input: &str, first_cr: usize) -> (String, usize, usize) {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let (mut crlf, mut lone_cr) = (0, 0);
+    let mut copied = 0; // input[..copied] is already in `out` (normalized)
+    for cr in memchr::memchr_iter(b'\r', &bytes[first_cr..]).map(|i| first_cr + i) {
+        out.push_str(&input[copied..cr]);
+        out.push('\n');
+        // `\r\r\n` is a lone CR then a CRLF: the pair test looks only at the
+        // next byte, and a skipped '\n' is never a CR the iterator could yield.
+        if bytes.get(cr + 1) == Some(&b'\n') {
+            crlf += 1;
+            copied = cr + 2;
+        } else {
+            lone_cr += 1;
+            copied = cr + 1;
+        }
+    }
+    out.push_str(&input[copied..]);
+    (out, crlf, lone_cr)
 }
 
 /// An immutable, `Send + Sync` copy of the document for background consumers
@@ -128,6 +176,13 @@ impl Snapshot {
 
     /// The text in `range` (byte offsets on char boundaries). Clamps to the
     /// snapshot end.
+    ///
+    /// # Panics
+    ///
+    /// If either end of the (clamped) range splits a multibyte char — the same
+    /// kept precondition as [`Buffer::slice`]. A snapshot is the buffer's text
+    /// at one revision, so offsets clipped by that buffer's
+    /// [`Buffer::clip_offset`] at that revision are safe here.
     #[must_use]
     pub fn slice(&self, range: Range<u32>) -> Cow<'_, str> {
         self.text.slice(range)
@@ -180,22 +235,26 @@ impl Buffer {
     /// Load `input` as a new document.
     ///
     /// Refuses only input past the `u32` offset space (see [`LoadError`] — no
-    /// policy limit); normalizes `\r\n | \r → \n`, remembering the detected
-    /// [`EolFlavor`]; mints a fresh [`DocId`] at revision `0`.
+    /// policy limit); normalizes `\r\n | \r → \n`, remembering the majority
+    /// [`EolFlavor`] (tie → `Lf`); mints a fresh [`DocId`] at revision `0`.
     pub fn new(input: &str) -> Result<Self, LoadError> {
         check_load_len(input.len())?;
-        let eol_flavor = if input.contains("\r\n") {
-            EolFlavor::CrLf
-        } else {
-            EolFlavor::Lf
-        };
-        // Normalize to LF only. Avoid the intermediate String when the input
-        // is already clean (normalization only shrinks, so the length check
-        // above covers both paths).
-        let text = if input.bytes().any(|b| b == b'\r') {
-            Rope::from_str(&input.replace("\r\n", "\n").replace('\r', "\n"))
-        } else {
-            Rope::from_str(input)
+        // Detection rides passes load already makes — never a counting pass of
+        // its own. A CR-free input (the common case, settled by one memchr) is
+        // already LF-only: it has no CRLF terminators, so the majority is LF
+        // whatever its newline count, and the input is chunked without a copy.
+        // Otherwise the one normalizing pass counts the CRLFs and lone CRs it
+        // rewrites, and the LF count falls out of the rope's O(1) newline
+        // total: every terminator became exactly one '\n'. (Normalization only
+        // shrinks, so the length check above covers both paths.)
+        let (text, eol_flavor) = match memchr::memchr(b'\r', input.as_bytes()) {
+            None => (Rope::from_str(input), EolFlavor::Lf),
+            Some(first_cr) => {
+                let (normalized, crlf, lone_cr) = normalize_eol(input, first_cr);
+                let text = Rope::from_str(&normalized);
+                let lf = (text.line_count() - 1) as usize - crlf - lone_cr;
+                (text, EolFlavor::majority(lf, crlf))
+            }
         };
         Ok(Self {
             text,
@@ -234,6 +293,15 @@ impl Buffer {
     /// `str` slicing). Clamps to the document end. The workhorse ranged read —
     /// `Borrowed` while the range sits in one rope chunk, `Owned` across
     /// chunks.
+    ///
+    /// # Panics
+    ///
+    /// If either end of the (clamped) range splits a multibyte char. The
+    /// precondition is kept rather than clipped: this low-level read sits
+    /// under every scan, where a silently snapped end would turn a caller's
+    /// off-by-a-byte bug into a wrong read. Snap host offsets first with
+    /// [`Buffer::clip_offset`] (the editing APIs on
+    /// [`Document`](crate::Document) already do).
     #[must_use]
     pub fn slice(&self, range: Range<u32>) -> Cow<'_, str> {
         self.text.slice(range)
@@ -249,6 +317,12 @@ impl Buffer {
     /// The char whose first byte is at `offset` — `None` at/past the end.
     /// (`offset` must be a char boundary.) The forward one-char read every
     /// boundary scan uses instead of slicing the whole text. `O(log chunks)`.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is inside the document but splits a multibyte char — kept,
+    /// like [`Buffer::slice`]'s, so a boundary-scan bug cannot read a char
+    /// that is not there; snap host offsets with [`Buffer::clip_offset`].
     #[must_use]
     pub fn char_at(&self, offset: u32) -> Option<char> {
         let off = offset.min(self.len());
@@ -261,6 +335,11 @@ impl Buffer {
 
     /// The char ending at `offset` — `None` at 0. (`offset` must be a char
     /// boundary.) The backward twin of [`Buffer::char_at`].
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is inside the document but splits a multibyte char — the
+    /// same kept precondition as [`Buffer::char_at`].
     #[must_use]
     pub fn char_before(&self, offset: u32) -> Option<char> {
         let off = offset.min(self.len());
@@ -300,7 +379,9 @@ impl Buffer {
         self.doc_id
     }
 
-    /// The EOL flavor detected at load.
+    /// The EOL flavor detected at load: the file's majority terminator, tie →
+    /// `Lf` (see [`EolFlavor`]). Pass it to [`Buffer::serialize`] to save in
+    /// the file's own convention.
     #[must_use]
     pub fn eol_flavor(&self) -> EolFlavor {
         self.eol_flavor
@@ -315,11 +396,24 @@ impl Buffer {
     }
 
     /// Convert a [`Point`] to a byte offset, clamping the row to the last line
-    /// and the column to that line's length. `O(log chunks)`.
+    /// and the column to that line's length, then snapping a column that falls
+    /// inside a multibyte char [`Bias::Left`] to that char's start — so the
+    /// result is always a char boundary, whatever arithmetic (UTF-16 / LSP
+    /// columns, a goal column carried across lines) produced `point`. For the
+    /// other snap direction use [`Buffer::clip_point`]. `O(log chunks)`.
     #[must_use]
     pub fn point_to_offset(&self, point: Point) -> u32 {
+        self.point_to_offset_snapped(point, Bias::Left)
+    }
+
+    /// [`Buffer::point_to_offset`] with the snap direction chosen — the one
+    /// owner of the clamp-then-snap, shared with [`Buffer::clip_point`].
+    fn point_to_offset_snapped(&self, point: Point, bias: Bias) -> u32 {
         crate::perf::charge(1); // complexity gate: one position query
-        self.text.point_to_offset(point)
+        // The rope clamps row and col but counts the col in raw bytes; the
+        // snap is one more chunk descent, and a boundary (col 0, the line
+        // end, any ASCII column) comes back unchanged.
+        self.clip_offset(self.text.point_to_offset(point), bias)
     }
 
     /// Clamp a byte offset into `[0, len]` and snap it to a char boundary
@@ -332,6 +426,28 @@ impl Buffer {
         // containing `off`.
         let (chunk, chunk_start) = self.text.chunk_at(off);
         chunk_start + snap_char_boundary(chunk, off - chunk_start, bias)
+    }
+
+    /// Clip a host-supplied range to valid offsets — THE rule every API that
+    /// stores a caller's range (selections, diagnostics, the find scope) shares,
+    /// so they cannot disagree about what a mid-char or past-end range means.
+    ///
+    /// Both ends clamp into `[0, len]`; an inverted range collapses to an empty
+    /// one at its (clamped) end, as [`Buffer::slice`] reads it. A non-empty
+    /// range then snaps **outward** (start [`Bias::Left`], end [`Bias::Right`]),
+    /// so it never drops part of a char it covers — the transaction engine's
+    /// rule for edit ranges. An empty one snaps both ends `Left`, so a caret or
+    /// zero-width span stays empty, at the start of the char it split, instead
+    /// of growing over that char.
+    #[must_use]
+    pub(crate) fn clip_range(&self, range: Range<u32>) -> Range<u32> {
+        let end = range.end.min(self.len());
+        let start = range.start.min(end);
+        if start == end {
+            let at = self.clip_offset(start, Bias::Left);
+            return at..at;
+        }
+        self.clip_offset(start, Bias::Left)..self.clip_offset(end, Bias::Right)
     }
 
     /// Where a windowed literal scan resumes after examining the window
@@ -355,10 +471,12 @@ impl Buffer {
     }
 
     /// Clip a [`Point`] to a valid position: clamp the row/col, then snap the
-    /// resulting offset to a char boundary.
+    /// resulting offset to a char boundary (direction from `bias`).
     #[must_use]
     pub fn clip_point(&self, point: Point, bias: Bias) -> Point {
-        self.offset_to_point(self.clip_offset(self.point_to_offset(point), bias))
+        // Not via `point_to_offset`: it has already snapped `Left`, which
+        // would swallow a `Right` bias.
+        self.offset_to_point(self.point_to_offset_snapped(point, bias))
     }
 
     /// An immutable copy for background consumers. **O(1)** — the
@@ -503,6 +621,125 @@ mod tests {
         assert_eq!(b2.serialize(EolFlavor::Lf), "x\ny");
     }
 
+    /// Regression: one stray CRLF in a mostly-LF file used to flip the whole
+    /// file to CRLF, so an untouched save rewrote every line. The majority (3
+    /// LF vs 1 CRLF) wins, and saving in it diffs only the stray line.
+    #[test]
+    fn one_stray_crlf_does_not_flip_a_mostly_lf_file() {
+        let b = buf("a\nb\nc\nd\r\n");
+        assert_eq!(b.eol_flavor(), EolFlavor::Lf);
+        assert_eq!(b.serialize(b.eol_flavor()), "a\nb\nc\nd\n");
+    }
+
+    /// The mirror case: a stray LF in a CRLF file is the minority, so the
+    /// file stays CRLF and only the stray line changes on save.
+    #[test]
+    fn one_stray_lf_does_not_flip_a_mostly_crlf_file() {
+        let b = buf("a\r\nb\r\nc\nd\r\n");
+        assert_eq!(b.eol_flavor(), EolFlavor::CrLf);
+        assert_eq!(b.serialize(b.eol_flavor()), "a\r\nb\r\nc\r\nd\r\n");
+    }
+
+    /// The documented tie rule: equal counts go to LF, and so does a file
+    /// with no terminators at all (0 vs 0).
+    #[test]
+    fn an_eol_tie_goes_to_lf() {
+        assert_eq!(buf("a\r\nb\n").eol_flavor(), EolFlavor::Lf);
+        assert_eq!(buf("a\nb\r\nc\r\nd\n").eol_flavor(), EolFlavor::Lf);
+        assert_eq!(buf("").eol_flavor(), EolFlavor::Lf);
+        assert_eq!(buf("one line").eol_flavor(), EolFlavor::Lf);
+    }
+
+    /// A lone CR is normalized to '\n' but casts no vote — in particular not
+    /// an LF one, though it becomes one '\n' in the rope's newline total that
+    /// the LF count is derived from. 2 CRLF vs 0 LF (3 lone CR) is CRLF.
+    #[test]
+    fn lone_cr_casts_no_eol_vote() {
+        let b = buf("a\r\nb\r\nc\rd\re\rf");
+        assert_eq!(b.text(), "a\nb\nc\nd\ne\nf");
+        assert_eq!(b.eol_flavor(), EolFlavor::CrLf);
+        // Only lone CRs: no vote either way, so the 0-0 tie rule applies.
+        assert_eq!(buf("a\rb\r").eol_flavor(), EolFlavor::Lf);
+    }
+
+    /// Seeded oracle over random terminator mixes — uniform LF, uniform CRLF,
+    /// random shares (near-ties included), and lone CRs incl. the `\r\r\n`
+    /// straddle — with multibyte bodies and multi-chunk sizes. Load must
+    /// normalize exactly like the retained two-`replace` chain, pick the
+    /// flavor an independent per-terminator count gives (the LF count is
+    /// derived from the rope total, so this pins that derivation), and
+    /// round-trip a uniformly terminated input byte-for-byte.
+    #[test]
+    fn eol_detection_matches_a_counting_oracle() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64; // deterministic LCG
+        let mut rand = move |bound: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        let bodies = ["", "x", "fn main() {}", "äöü ß", "🦀 rope", "\t  indented", "日本語"];
+        // Outcomes among MIXED inputs (both kinds present) — where the bug was.
+        let (mut mixed_lf, mut mixed_crlf, mut round_trips, mut lone_cases, mut multi_chunk) =
+            (0, 0, 0, 0, 0);
+        for case in 0..400 {
+            let mix = case % 4; // 0 all-LF, 1 all-CRLF, 2 random share, 3 + lone CRs
+            let crlf_pct = match mix {
+                0 => 0,
+                1 => 100,
+                _ => rand(101),
+            };
+            let lines = if case % 16 < 2 { 2000 + rand(500) } else { rand(40) };
+            let mut input = String::new();
+            for _ in 0..lines {
+                input.push_str(bodies[rand(bodies.len())]);
+                if mix == 3 && rand(6) == 0 {
+                    input.push('\r'); // a lone CR, or the straddle `\r\r\n`
+                }
+                input.push_str(if rand(100) < crlf_pct { "\r\n" } else { "\n" });
+            }
+            if rand(2) == 0 {
+                input.push_str("no trailing terminator");
+            }
+
+            // Independent count: a piece of `split_inclusive('\n')` ends in
+            // exactly one terminator; a lone CR never ends a piece.
+            let (mut lf, mut crlf) = (0, 0);
+            for piece in input.split_inclusive('\n') {
+                if piece.ends_with("\r\n") {
+                    crlf += 1;
+                } else if piece.ends_with('\n') {
+                    lf += 1;
+                }
+            }
+            let has_lone_cr = input.matches('\r').count() > crlf;
+            let want = if crlf > lf { EolFlavor::CrLf } else { EolFlavor::Lf };
+
+            let b = buf(&input);
+            assert_eq!(
+                b.text(),
+                input.replace("\r\n", "\n").replace('\r', "\n"),
+                "normalization diverged in case {case}"
+            );
+            assert_eq!(b.eol_flavor(), want, "case {case}: {lf} LF vs {crlf} CRLF");
+            if !has_lone_cr && (lf == 0 || crlf == 0) {
+                assert_eq!(b.serialize(b.eol_flavor()), input, "uniform case {case} must round-trip");
+                round_trips += 1;
+            }
+            if lf > 0 && crlf > 0 {
+                match want {
+                    EolFlavor::Lf => mixed_lf += 1,
+                    EolFlavor::CrLf => mixed_crlf += 1,
+                }
+            }
+            lone_cases += usize::from(has_lone_cr);
+            multi_chunk += usize::from(b.text.chunks().nth(1).is_some());
+        }
+        // Keep the oracle honest: every regime it claims must actually occur.
+        assert!(mixed_lf >= 50 && mixed_crlf >= 50, "mixed: {mixed_lf} LF / {mixed_crlf} CRLF wins");
+        assert!(round_trips >= 150, "only {round_trips} uniform round-trips");
+        assert!(lone_cases >= 50, "only {lone_cases} lone-CR cases");
+        assert!(multi_chunk >= 40, "only {multi_chunk} multi-chunk cases");
+    }
+
     #[test]
     fn only_the_u32_offset_space_is_refused() {
         // No policy limit: a 2 MB document loads fine…
@@ -543,6 +780,39 @@ mod tests {
         let b = buf("ab\ncd");
         assert_eq!(b.point_to_offset(Point::new(0, 99)), 2); // col clamps to line end
         assert_eq!(b.point_to_offset(Point::new(9, 0)), 3); // row clamps to last line start
+    }
+
+    /// Regression (fails-first): a column inside a multibyte char (UTF-16 /
+    /// LSP column math) came back as a mid-char offset, which the next
+    /// `char_at`/`slice` panicked on. Every column now lands on a char
+    /// boundary — the one at or before it — checked exhaustively against a
+    /// `String` model over every (row, col) in and past each line, multi-chunk
+    /// so seams are crossed.
+    #[test]
+    fn point_to_offset_snaps_every_column_to_a_char_boundary() {
+        let lines = ["aé🦀b", "", "日本語", "🦀🦀"];
+        let mut model = String::new();
+        for i in 0..40 {
+            if i > 0 {
+                model.push('\n');
+            }
+            model.push_str(lines[i % lines.len()]);
+        }
+        let b = buf(&model);
+        assert!(b.text.chunks().nth(1).is_some(), "corpus must span multiple chunks");
+        let mut start = 0usize;
+        for (row, line) in model.split('\n').enumerate() {
+            for col in 0..=line.len() + 2 {
+                let want = (0..=col.min(line.len())).rev().find(|&c| line.is_char_boundary(c)).unwrap();
+                let got = b.point_to_offset(Point::new(row as u32, col as u32));
+                assert_eq!(got as usize, start + want, "({row}, {col})");
+                assert_eq!(b.char_at(got), model[got as usize..].chars().next(), "readable at ({row}, {col})");
+            }
+            start += line.len() + 1;
+        }
+        // `clip_point` keeps its caller's bias: Right still snaps forward.
+        assert_eq!(b.clip_point(Point::new(0, 2), Bias::Right), Point::new(0, 3));
+        assert_eq!(b.clip_point(Point::new(0, 2), Bias::Left), Point::new(0, 1));
     }
 
     #[test]

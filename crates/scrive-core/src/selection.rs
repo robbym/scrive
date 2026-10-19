@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 
+use crate::buffer::Buffer;
 use crate::coords::Bias;
 use crate::patch::Patch;
 
@@ -203,6 +204,54 @@ impl SelectionSet {
     #[must_use]
     pub fn newest(&self) -> &Selection {
         self.selections.iter().max_by_key(|s| s.id).expect("set is non-empty")
+    }
+
+    /// Overwrite this set with a copy of `other`, reusing this set's buffer —
+    /// `clone_from` semantics, which `#[derive(Clone)]` does not forward to the
+    /// fields. History refreshes an open unit's after-set on every merged
+    /// keystroke through this, so a typing run allocates nothing for it once the
+    /// buffer has grown to the caret count.
+    pub(crate) fn assign_from(&mut self, other: &SelectionSet) {
+        self.selections.clone_from(&other.selections);
+        self.next_id = other.next_id;
+    }
+
+    /// Clip every selection to `buffer` through the one range rule,
+    /// [`Buffer::clip_range`]: past-end endpoints clamp to the end, a ranged
+    /// selection snaps outward to whole chars, and a caret inside a char snaps
+    /// to that char's start. Then re-merge, since clamping can land distinct
+    /// selections on one offset (two past-end carets become one at the end).
+    ///
+    /// The boundary every externally built set crosses on its way into a
+    /// [`Document`](crate::Document) — host offsets (LSP, go-to-line, UTF-16
+    /// arithmetic) are untrusted, while every other path that installs a set
+    /// derives it from the live buffer and needs no clip. `O(selections · log
+    /// chunks)`: one clip per endpoint, never a scan.
+    pub(crate) fn clip_to(&mut self, buffer: &Buffer) {
+        for s in &mut self.selections {
+            let r = buffer.clip_range(s.start..s.end);
+            s.start = r.start;
+            s.end = r.end;
+            // A range clipped down to empty is a caret, and carets are never
+            // reversed (`Selection::caret`) — keep the canonical form.
+            s.reversed &= s.start != s.end;
+        }
+        self.normalize();
+    }
+
+    /// This set with each selection moved to its `(tail, head)` in `spans`
+    /// (document order, one per selection), then re-merged. Ids — and so the
+    /// newest — are kept, direction follows each span, goals clear. The
+    /// placement for a verb that carries every selection along with its text
+    /// (move / copy line), where minting fresh carets would lose all three.
+    pub(crate) fn moved_to(&self, spans: &[(u32, u32)]) -> SelectionSet {
+        debug_assert_eq!(spans.len(), self.selections.len(), "one span per selection");
+        let mut set = self.clone();
+        for (s, &(tail, head)) in set.selections.iter_mut().zip(spans) {
+            *s = Selection::from_anchor(s.id, tail, head);
+        }
+        set.normalize();
+        set
     }
 
     /// Mint the next selection id.

@@ -287,7 +287,9 @@ impl<'a> RowLayout<'a> {
                 return s.fold.left_edge() - self.row_start; // on the chip → just after `[`
             }
         }
-        let raw_cell = (dc as i32 + extra).max(0) as u32;
+        // Widened: a virtual cell past i32::MAX (a host box corner) would wrap
+        // negative as i32 and hit column 0 instead of the line end.
+        let raw_cell = (i64::from(dc) + i64::from(extra)).clamp(0, i64::from(u32::MAX)) as u32;
         display_map::collapse(&self.line, raw_cell, self.tab, bias)
     }
 

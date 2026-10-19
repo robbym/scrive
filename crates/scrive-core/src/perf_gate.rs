@@ -213,6 +213,110 @@ fn single_fold_edit_is_size_independent() {
     assert_budget("size: type on 1 fold", Budget::Constant, cell(s), cell(b));
 }
 
+// ── UNDO / REDO. Each restores the unit's whole selection set (O(carets)) and
+//    runs the whole-set fold reconcile plus ONE memoized fold-map rebuild
+//    (O(folds)) — linear in carets and folds together, never their product (a
+//    per-caret fold rebuild or a per-fold caret pass reads ~4× here) — and flat
+//    in document size: the reverted steps ride the same windowed mover as a
+//    forward edit. ─────────────────────────────────────────────────────────
+
+/// `k` folded blocks of a `BLOCKS`-block document, a caret at the start of
+/// each folded header row (visible, and outside the fold it heads, so the
+/// typed unit expands nothing), one typed char committed: a unit with `k`
+/// carets to restore over `k` folds.
+fn typed_over_folds(blocks: usize, k: usize) -> Document {
+    let mut d = build(blocks);
+    fold_first(&mut d, k);
+    let carets: Vec<u32> = (0..k).map(block_start).collect();
+    d.set_selections(SelectionSet::from_offsets(&carets));
+    d.insert_text("a");
+    let _ = d.fold_map(); // steady state: the memo is current before the measure
+    d
+}
+
+#[test]
+fn undo_redo_over_folds_and_carets_is_linear() {
+    const BLOCKS: usize = 700;
+    let (s, b) = (150usize, 300usize);
+    let undo = |k: usize| meter_of(&mut typed_over_folds(BLOCKS, k), |d| assert!(d.undo()));
+    assert_budget("undo: N carets over N folds", Budget::Linear, undo(s), undo(b));
+    let redo = |k: usize| {
+        let mut d = typed_over_folds(BLOCKS, k);
+        assert!(d.undo());
+        meter_of(&mut d, |d| assert!(d.redo()))
+    };
+    assert_budget("redo: N carets over N folds", Budget::Linear, redo(s), redo(b));
+}
+
+#[test]
+fn undo_redo_is_size_independent() {
+    let (s, b) = (400usize, 800usize);
+    // One caret, one fold, mid-document: only the document size varies.
+    let typed = |blocks: usize| {
+        let mut d = build(blocks);
+        fold_first(&mut d, 1);
+        d.set_selections(SelectionSet::new(block_start(blocks / 2)));
+        d.insert_text("a");
+        let _ = d.fold_map();
+        d
+    };
+    let undo = |blocks: usize| meter_of(&mut typed(blocks), |d| assert!(d.undo()));
+    assert_budget("size: undo, 1 caret", Budget::Constant, undo(s), undo(b));
+    let redo = |blocks: usize| {
+        let mut d = typed(blocks);
+        assert!(d.undo());
+        meter_of(&mut d, |d| assert!(d.redo()))
+    };
+    assert_budget("size: redo, 1 caret", Budget::Constant, redo(s), redo(b));
+}
+
+// ── MOVE / COPY LINE. Every caret moves or copies its own line-block in ONE
+//    transaction: building the runs and placing the carets is O(carets), and a
+//    per-caret whole-set pass (re-deriving runs, re-mapping every caret per
+//    block) reads ~4×. A single caret's swap is flat in document size. ───────
+
+/// A caret on each of the first `k` blocks' body line (`    mark = 0`): rows
+/// two apart, so every caret is its own run, and moving down swaps each body
+/// with its block's `}` — a neighbour no other run owns.
+fn carets_on_bodies(d: &mut Document, k: usize) {
+    let body = BLOCK.find('\n').unwrap() as u32 + 1;
+    let carets: Vec<u32> = (0..k).map(|i| block_start(i) + body).collect();
+    d.set_selections(SelectionSet::from_offsets(&carets));
+}
+
+fn move_down(d: &mut Document) {
+    d.move_line(true);
+}
+fn copy_down(d: &mut Document) {
+    d.copy_line(true);
+}
+
+#[test]
+fn multicaret_move_and_copy_line_are_linear() {
+    const BLOCKS: usize = 700;
+    let (s, b) = (150usize, 300usize);
+    let cell = |k: usize, op: fn(&mut Document)| {
+        let mut d = build(BLOCKS);
+        carets_on_bodies(&mut d, k);
+        meter_of(&mut d, op)
+    };
+    assert_budget("move line: N carets", Budget::Linear, cell(s, move_down), cell(b, move_down));
+    assert_budget("copy line: N carets", Budget::Linear, cell(s, copy_down), cell(b, copy_down));
+}
+
+#[test]
+fn move_and_copy_line_are_size_independent() {
+    let (s, b) = (400usize, 800usize);
+    let cell = |blocks: usize, op: fn(&mut Document)| {
+        let mut d = build(blocks);
+        let body = BLOCK.find('\n').unwrap() as u32 + 1;
+        d.set_selections(SelectionSet::new(block_start(blocks / 2) + body));
+        meter_of(&mut d, op)
+    };
+    assert_budget("size: move line, 1 caret", Budget::Constant, cell(s, move_down), cell(b, move_down));
+    assert_budget("size: copy line, 1 caret", Budget::Constant, cell(s, copy_down), cell(b, copy_down));
+}
+
 // ── AUTO-CLOSE × decorations. The ≤C auto-close provenance set lives in its own
 //    store, so `validate_autoclose` (every commit) and `clear_autoclose` (every
 //    arrow key) are O(C) — flat in the bulk diagnostic count — rather than an

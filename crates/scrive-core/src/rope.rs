@@ -235,11 +235,15 @@ impl Rope {
     }
 
     /// `Point` → byte offset, clamping the row to the last line and the col to that
-    /// row's byte length.
+    /// row's byte length. The col is raw bytes, so the result may split a char —
+    /// [`crate::buffer::Buffer::point_to_offset`] snaps it.
     #[must_use]
     pub fn point_to_offset(&self, point: Point) -> u32 {
         let row = point.row.min(self.line_count() - 1);
-        self.line_to_byte(row) + point.col.min(self.line_len(row))
+        // One descent per line edge (not `line_len`, which would re-seek the
+        // start), so the caller's boundary snap costs no net descent.
+        let start = self.line_to_byte(row);
+        start + point.col.min(self.line_end_byte(row) - start)
     }
 
     /// The chunk containing byte `offset` (the right-hand chunk at an exact
