@@ -4,7 +4,7 @@ members = ["crates/scrive-core", "crates/scrive-iced"]
 
 # Shared metadata.
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
