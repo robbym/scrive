@@ -3,6 +3,51 @@
 Notable changes to `scrive-core` and `scrive-iced`. The two crates share one
 version and are released together.
 
+## 0.3.3 — 2026-10-21
+
+### Fixed
+
+- **scrive-iced:** the hover popup no longer closes at the slightest pointer
+  move when the pointer rests on the right half of a word's last character, or
+  just before a diagnostic's squiggle. The test that opens the popup and the
+  test that keeps it open now use the same rule: the pointer's caret offset
+  touches the range, `start..=end`.
+- **scrive-iced:** a collapsed block's fold preview shows the folded pair as one
+  piece: the opener, the hidden code, then the closer. It used to start at the
+  first hidden row and end with the closing row's full text, so the `{` never
+  showed while a trailing `} else {` or `];` did. The opener now sits at the
+  closer's indent, so the two line up, and the body keeps its indentation under
+  them. A long block's body used to lose that indent. A pair on one row still
+  previews its whole row.
+- **scrive-iced:** brackets in the fold preview take their pair-depth colours,
+  as they do in the editor.
+
+### Changed
+
+Behaviour changes to check when upgrading. No public signatures changed.
+
+- **scrive-iced:** the hover popup and the fold preview behave like a VS Code
+  hover. Leaving the word or `…` chip starts a 300 ms hiding delay instead of
+  closing at once, so the pointer can move into the panel. Inside it, a drag,
+  double-click or triple-click selects text, Ctrl+C copies it as plain text
+  (markdown markers removed, wrapped lines rejoined), and a press never reaches
+  the code underneath. A panel that has been clicked into stays open until a
+  click elsewhere, a key, Escape or an editor scroll.
+- **scrive-iced:** the widget publishes `Action::HoverDismiss` in more places:
+  when the hiding delay ends, and on a click outside the popup, a key press, or
+  an editor scroll. A host driving `Editor` directly should treat it as the one
+  signal to close its popup.
+- **scrive-iced:** any key except a bare modifier closes an open hover panel.
+  Escape closes a clicked-into panel and does nothing else.
+- **scrive-iced:** the fold preview scrolls with the wheel and shows a
+  scrollbar in place of the "… N more lines" footer.
+
+### Internal
+
+- **scrive-iced:** both panels share one private `panel` module for selection,
+  copy, markdown wrapping and the fold preview's line choice. New end-to-end
+  tests drive the real widget headlessly with an injected clock.
+
 ## 0.3.2 — 2026-10-19
 
 ### Fixed
