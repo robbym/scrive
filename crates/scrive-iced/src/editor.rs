@@ -40,6 +40,7 @@ use scrive_core::{
 };
 
 use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
+use crate::panel::{self, FoldFragment, HoverText, MdStyle, PanelId, PanelSelection, PanelState, PreviewLine, TextPos};
 use crate::popup;
 
 use crate::metrics::Metrics;
@@ -137,6 +138,17 @@ const BRACKET_DEPTH: [Color; 3] = [
 ];
 /// An unmatched bracket's color — a strong red so a dangling delimiter stands out.
 const UNMATCHED_BRACKET: Color = Color::from_rgba8(0xFF, 0x12, 0x12, 0.8);
+
+/// A bracket's pair-colorization color: its nesting depth's, or red when it
+/// has no partner — the one rule every surface that paints a bracket shares
+/// (visible rows, a collapsed fold's closing tail, the fold preview).
+fn bracket_color(b: &scrive_core::Bracket) -> Color {
+    if b.partner.is_none() {
+        UNMATCHED_BRACKET
+    } else {
+        BRACKET_DEPTH[b.depth as usize % BRACKET_DEPTH.len()]
+    }
+}
 /// Indentation-guide line width (px).
 const GUIDE_WIDTH: f32 = 1.0;
 /// Indent-guide alpha over the foreground: idle (dim) and the active guide (the
@@ -160,8 +172,15 @@ const CODE_PILL_BG: Color = Color::from_rgba8(0x0a, 0x0a, 0x0a, 0.4);
 /// Max visible wrapped lines in the hover before it scrolls (rather than
 /// truncate).
 const HOVER_MAX_VISIBLE: usize = 12;
-/// Width (px) of the hover's auto scrollbar — thinner than the editor's.
+/// Max visible rows in a fold preview before it scrolls through the rest of
+/// the hidden block.
+pub(crate) const FOLD_PREVIEW_MAX_VISIBLE: usize = 18;
+/// Width (px) of a hover panel's auto scrollbar — thinner than the editor's.
 const HOVER_SB_W: f32 = 6.0;
+/// How long an open hover panel outlives the pointer leaving both it and what
+/// it describes — VS Code's `editor.hover.hidingDelay` (300 ms by default), the
+/// grace that lets the pointer cross a gap or cut a corner into the panel.
+const HOVER_HIDING_DELAY_MS: u64 = 300;
 /// Find-match highlight wash: an amber fill behind every match, brighter
 /// for the active one — a warm yellow at two alphas (a theme may override).
 const FIND_MATCH: Color = Color::from_rgba8(0xfc, 0xe5, 0x66, 0.22);
@@ -360,7 +379,10 @@ pub enum Action {
     /// The pointer rested over byte `offset` long enough for a hover query.
     /// The app resolves the word + queries its provider.
     HoverQuery(u32),
-    /// Close the hover popup (pointer left the word).
+    /// Close the hover popup. The popup is sticky, as a VS Code hover is: this
+    /// comes once the pointer has been off both the word and the popup for the
+    /// hiding delay (300 ms), or on a click outside it, a key press, an editor
+    /// scroll, or Escape once it has been clicked into.
     HoverDismiss,
     /// Toggle the fold whose pair opens at byte offset `opener` — a
     /// gutter-chevron click or `Ctrl+Shift+[`/`]`. The app calls
@@ -510,9 +532,10 @@ struct State {
     hover_pos: Option<Point>,
     hover_rearm: bool,
     hover_at: Option<Instant>,
-    /// Vertical scroll offset (px) of the open hover popup's content, for hovers
-    /// taller than `HOVER_MAX_VISIBLE`. Reset to 0 when the hovered word changes.
-    hover_scroll: f32,
+    /// The open hover panel's view state — scroll, text selection, pin, and
+    /// hiding delay — for whichever panel is open (the hover popup or the fold
+    /// preview; see [`crate::panel`]). Reset whenever the open panel changes.
+    panel: PanelState,
     /// Whether the pointer is over the gutter: the expanded (chevron-down) fold
     /// controls show only while it is, so an unfolded block reveals its control
     /// on hover — as mainstream editors do. Tracked so a move on/off the gutter
@@ -524,8 +547,9 @@ struct State {
     /// exactly once; `None` off the gutter.
     gutter_hover_row: Option<u32>,
     /// The collapsed fold (its opening-bracket offset) whose `…` chip the pointer
-    /// is resting on — drives the widget-drawn hover preview of its hidden
-    /// content. Set when the hover idle timer fires over a chip; cleared on any move.
+    /// rested on — drives the widget-drawn hover preview of its hidden content.
+    /// Set when the hover idle timer fires over a chip; it then behaves as a
+    /// hover panel (`panel`), closing when the pointer leaves it and its chip.
     fold_preview: Option<u32>,
     /// The collapsed fold whose chip the (non-Ctrl) pointer is currently over —
     /// drives the immediate plain-hover expand highlight. Tracked so a move
@@ -554,7 +578,7 @@ impl Default for State {
             hover_pos: None,
             hover_rearm: false,
             hover_at: None,
-            hover_scroll: 0.0,
+            panel: PanelState::default(),
             gutter_hover: false,
             gutter_hover_row: None,
             fold_preview: None,
@@ -1584,16 +1608,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 let last_start = buffer.point_to_offset(BufPoint { row: hl.last_row().0, col: 0 });
                 for g in hl.tail_glyphs() {
                     let off = last_start + g.col;
-                    let color = self.doc.brackets().at(off).map_or(
-                        text_color,
-                        |b| {
-                            if b.partner.is_none() {
-                                UNMATCHED_BRACKET
-                            } else {
-                                BRACKET_DEPTH[b.depth as usize % BRACKET_DEPTH.len()]
-                            }
-                        },
-                    );
+                    let color = self.doc.brackets().at(off).map_or(text_color, |b| bracket_color(&b));
                     let x = geo.cell_x(g.cell as f32);
                     self.draw_line(renderer, g.ch.to_string(), Point::new(x, y), color, Alignment::Left, code_clip);
                 }
@@ -1624,12 +1639,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     continue;
                 }
                 let x = geo.cell_x(row_layout.display_cell(col) as f32);
-                let color = if br.partner.is_none() {
-                    UNMATCHED_BRACKET
-                } else {
-                    BRACKET_DEPTH[br.depth as usize % BRACKET_DEPTH.len()]
-                };
-                self.draw_line(renderer, ch.to_string(), Point::new(x, y), color, Alignment::Left, code_clip);
+                self.draw_line(renderer, ch.to_string(), Point::new(x, y), bracket_color(&br), Alignment::Left, code_clip);
             }
         }
 
@@ -1898,9 +1908,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             fill(renderer, Rectangle { x: hb.thumb_x, y: hb.y, width: hb.thumb_w, height: SCROLLBAR_WIDTH }, thumb);
         }
 
-        // Hover popup — a markdown box at the hovered word.
-        if let Some(info) = self.hover {
-            self.draw_hover(renderer, info, &geo, text_color, state.hover_scroll);
+        // The open hover panel: the hover popup (a markdown box at the hovered
+        // word, under the signature box) or the fold preview (the collapsed
+        // fold's hidden content under its `…` chip, over it). In the overlay
+        // layer so either rides over the code.
+        let panel = self.open_panel(state.fold_preview, &geo);
+        if let Some(p) = panel.as_ref().filter(|p| matches!(p.id, PanelId::Hover { .. })) {
+            self.draw_panel(renderer, p, &geo, text_color, selection_color, &state.panel);
         }
 
         // Signature-help box — above the caret, under the completion popup.
@@ -1908,11 +1922,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             self.draw_signature(renderer, sig, &geo, text_color);
         }
 
-        // Fold hover preview — the collapsed fold's hidden content in a
-        // floating panel, anchored under its `…` chip. In the overlay layer so it
-        // rides over the code like the other popups.
-        if let Some(opener) = state.fold_preview {
-            self.draw_fold_preview(renderer, &geo, opener, text_color);
+        if let Some(p) = panel.as_ref().filter(|p| matches!(p.id, PanelId::Fold(_))) {
+            self.draw_panel(renderer, p, &geo, text_color, selection_color, &state.panel);
         }
 
         // Completion popup — render it over everything, clipped to
@@ -1959,14 +1970,23 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             shell.publish((self.on_action)(Action::ViewportChanged(visible)));
         }
 
+        // The open hover panel's view state belongs to that one panel: when
+        // the panel changes (opened, closed, or replaced — by the app's hover or
+        // the fold preview), start it fresh, so a new panel never inherits the
+        // last one's scroll, selection, or pin.
+        let open = self.open_panel(state.fold_preview, &self.geo(state, bounds)).map(|p| p.id);
+        if state.panel.id != open {
+            state.panel = PanelState::new(open);
+        }
+
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let Some(pos) = cursor.position_over(bounds) else {
                     state.unfocus();
+                    self.close_panel(state, shell); // a click elsewhere closes the hover panel
                     return;
                 };
                 state.focus();
-                state.fold_preview = None; // a click dismisses any open fold preview
                 let geo = self.geo(state, bounds);
                 // A click inside the open completion popup (on top of everything)
                 // accepts the row it lands on — never a caret or the scrollbar.
@@ -1974,6 +1994,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 if let Some(list) = self.popup.filter(|l| !l.filtered.is_empty()) {
                     let (origin, sz) = self.popup_layout(list, &geo);
                     if (Rectangle { x: origin.x, y: origin.y, width: sz.width, height: sz.height }).contains(pos) {
+                        self.close_panel(state, shell);
                         let n = list.filtered.len();
                         let visible = n.min(popup::POPUP_MAX_VISIBLE);
                         // The inverse of draw_popup's row map — the same pair in
@@ -1986,6 +2007,18 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         return;
                     }
                 }
+                // A press inside the open hover panel selects its text — never
+                // the code beneath — and pins the panel open, as in a VS Code
+                // hover.
+                if let Some(panel) = self.open_panel(state.fold_preview, &geo).filter(|p| p.rect.contains(pos)) {
+                    self.press_panel(state, &panel, &geo, pos);
+                    shell.request_redraw();
+                    shell.capture_event();
+                    return;
+                }
+                // Any other press closes it, as a click in the editor hides a
+                // VS Code hover.
+                self.close_panel(state, shell);
                 // A press in the scrollbar band drives the scrollbar, never a
                 // caret: on the thumb it starts a drag from the grab point; on
                 // the bare track it jumps the thumb to center on the click and
@@ -2120,14 +2153,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() {
                     shell.request_redraw();
                 }
-                // Any pointer move dismisses an open fold preview; it re-arms after
-                // the idle delay if the pointer is still resting on a chip.
-                if state.fold_preview.take().is_some() {
-                    shell.request_redraw();
-                }
+                // The open hover panel (the hover popup or the fold preview) and
+                // whether the pointer is over it — it sits over the code, so
+                // nothing beneath it reacts to the pointer.
+                let panel = self.open_panel(state.fold_preview, &geo);
+                let over_panel = cursor.position_over(bounds).is_some_and(|p| panel.as_ref().is_some_and(|l| l.rect.contains(p)));
                 // Track the collapsed chip under the (non-Ctrl) pointer for the
                 // immediate plain-hover expand highlight — repaint only when it changes.
-                let chip = (!state.modifiers.command())
+                let chip = (!state.modifiers.command() && !over_panel)
                     .then(|| cursor.position_over(bounds).and_then(|p| self.collapsed_chip_at(&geo, p)))
                     .flatten();
                 if chip != state.hover_chip {
@@ -2149,7 +2182,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // Extend an armed drag to the cursor. Use the raw position (not
                 // `position_over`) so a drag past the viewport edge keeps
                 // selecting — `hit_test` clamps to the buffer.
-                if let Some(grab) = state.scrollbar_grab {
+                if let (true, Some(panel), Some(pos)) = (state.panel.drag, panel.as_ref(), cursor.position()) {
+                    // A selection drag inside the hover panel: past its edge it
+                    // keeps selecting, scrolling the panel a line per move.
+                    self.drag_panel(state, panel, &geo, pos);
+                    shell.request_redraw();
+                    shell.capture_event();
+                } else if let Some(grab) = state.scrollbar_grab {
                     // A scrollbar-thumb drag takes precedence over everything:
                     // the thumb top follows the cursor, keeping the grab point.
                     if let (Some(sb), Some(pos)) =
@@ -2184,51 +2223,69 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         head,
                     }));
                     shell.capture_event();
-                } else if let Some(pos) =
-                    cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x))
-                {
-                    // A plain move (no drag) over the CODE AREA: drive the hover
-                    // idle timer. Restricted to the code area so a move over
-                    // the gutter/chevrons never arms a hover (else a column-0 word
-                    // on an unindented line would pop up). If the pointer is still
-                    // over the open hover's word, keep it; otherwise dismiss and
-                    // re-arm the timer for the new position (accurate `now` stamped
-                    // on the next RedrawRequested).
-                    let off = self.hit_test(&geo, pos);
-                    // Keep the hover open while the pointer is over its word OR over
-                    // the hover box itself — so it can be moved into and scrolled.
-                    let still_in = self.hover.is_some_and(|h| {
-                        (off >= h.range.start && off < h.range.end)
-                            || self.hover_layout(h, &geo).rect.contains(pos)
-                    });
-                    if !still_in {
-                        if self.hover.is_some() {
-                            shell.publish((self.on_action)(Action::HoverDismiss));
+                } else {
+                    // A plain move (no drag). An open hover panel is sticky, as
+                    // VS Code's is: it stays while the pointer is over it or over
+                    // what it describes (or it was clicked into), and leaving both
+                    // starts the hiding delay rather than closing it — so the
+                    // pointer can cross a gap or cut a corner into the panel.
+                    let code = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x));
+                    if let Some(panel) = &panel {
+                        let held = state.panel.pinned
+                            || over_panel
+                            || code.is_some_and(|p| self.panel_subject_under(panel, &geo, p));
+                        if held {
+                            // Back over it: cancel a pending hide, and the query
+                            // the excursion armed (it would replace this panel).
+                            state.panel.keep();
+                            state.hover_rearm = false;
+                            state.hover_at = None;
+                            return;
                         }
+                        if !state.panel.hide_arm && state.panel.hide_at.is_none() {
+                            state.panel.hide_arm = true;
+                            shell.request_redraw();
+                        }
+                    }
+                    if let Some(pos) = code {
+                        // Over the CODE AREA: (re-)arm the hover idle timer for
+                        // where the pointer now is (an accurate `now` is stamped
+                        // on the next RedrawRequested). Restricted to the code
+                        // area so a move over the gutter/chevrons never arms a
+                        // hover (else a column-0 word on an unindented line
+                        // would pop up).
                         state.hover_pos = Some(pos);
                         state.hover_rearm = true;
-                        state.hover_scroll = 0.0; // a fresh hover starts un-scrolled
                         shell.request_redraw();
-                    }
-                } else {
-                    // Pointer over the gutter or off the widget — cancel any
-                    // pending / open hover.
-                    state.hover_pos = None;
-                    state.hover_at = None;
-                    state.hover_scroll = 0.0;
-                    if self.hover.is_some() {
-                        shell.publish((self.on_action)(Action::HoverDismiss));
+                    } else {
+                        // Over the gutter or off the widget — cancel any
+                        // pending query.
+                        state.hover_pos = None;
+                        state.hover_rearm = false;
+                        state.hover_at = None;
                     }
                 }
+            }
+            // The pointer left the window: an unpinned hover panel starts its
+            // hiding delay (no further move will arrive to start it).
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                if state.panel.id.is_some() && !state.panel.pinned && !state.panel.drag && state.panel.hide_at.is_none() {
+                    state.panel.hide_arm = true;
+                    shell.request_redraw();
+                }
+                state.hover_pos = None;
+                state.hover_rearm = false;
+                state.hover_at = None;
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 // End any in-progress drag; capture the release only if we were
                 // dragging, so a plain click's release still propagates.
+                let ended_panel = std::mem::take(&mut state.panel.drag);
                 let ended_drag = state.drag.take().is_some();
                 let ended_box = state.column_drag_anchor.take().is_some();
                 let ended_sb = state.scrollbar_grab.take().is_some();
                 let ended_hsb = state.hscrollbar_grab.take().is_some();
-                if ended_drag || ended_box || ended_sb || ended_hsb {
+                if ended_panel || ended_drag || ended_box || ended_sb || ended_hsb {
                     shell.capture_event();
                 }
             }
@@ -2247,18 +2304,17 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         return;
                     }
                 }
-                // Wheel over an overflowing hover scrolls its content (widget
-                // state, snapped to whole lines), captured so it never reaches
+                // Wheel over an overflowing hover panel scrolls its content
+                // (widget state, in whole lines), captured so it never reaches
                 // the editor beneath.
-                if let (Some(info), Some(pos)) = (self.hover, cursor.position_over(bounds)) {
-                    let l = self.hover_layout(info, &geo);
-                    if l.overflow && l.rect.contains(pos) {
+                if let (Some(l), Some(pos)) = (self.open_panel(state.fold_preview, &geo), cursor.position_over(bounds)) {
+                    if l.overflow() && l.rect.contains(pos) {
                         let dy = match delta {
                             mouse::ScrollDelta::Lines { y, .. } => y * line_h,
                             mouse::ScrollDelta::Pixels { y, .. } => *y,
                         };
-                        let raw = (state.hover_scroll - dy).clamp(0.0, l.max_scroll);
-                        state.hover_scroll = (raw / line_h).round() * line_h;
+                        let first = (state.panel.scroll as f32 - dy / line_h).round();
+                        state.panel.scroll = (first.max(0.0) as usize).min(l.max_first());
                         shell.request_redraw();
                         shell.capture_event();
                         return;
@@ -2273,6 +2329,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 {
                     return;
                 }
+                // Scrolling the editor closes the hover panel (as it hides a
+                // VS Code hover) rather than leave it floating over moved code.
+                self.close_panel(state, shell);
                 let (dx, dy) = match delta {
                     mouse::ScrollDelta::Lines { x, y } => (x * advance * WHEEL_COLS, y * line_h * WHEEL_ROWS),
                     mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
@@ -2302,6 +2361,28 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             Event::Keyboard(Keyboard::KeyPressed { key, text, modifiers, physical_key, .. }) => {
                 if !state.is_focused() {
                     return;
+                }
+                // The open hover panel answers the keyboard first, as a VS Code
+                // hover does: Ctrl+C copies its selection (and leaves it open),
+                // Escape closes one that was clicked into and stops there, and
+                // any other key — a bare modifier aside — closes it and then acts
+                // as usual.
+                if state.panel.id.is_some() && !is_modifier_key(key) {
+                    let copy = modifiers.command() && !modifiers.alt() && matches!(key, Key::Character(c) if c.as_str() == "c");
+                    let sel = state.panel.sel.filter(|s| !s.is_empty());
+                    if let (true, Some(sel), Some(panel)) = (copy, sel, self.open_panel(state.fold_preview, &self.geo(state, bounds))) {
+                        let exported = crate::clipboard::export_eol(&self.panel_copy(&panel, sel));
+                        crate::clipboard::record(&exported, false);
+                        clipboard.write(ClipboardKind::Standard, exported);
+                        shell.capture_event();
+                        return;
+                    }
+                    let pinned = state.panel.pinned;
+                    self.close_panel(state, shell);
+                    if pinned && matches!(key, Key::Named(Named::Escape)) {
+                        shell.capture_event();
+                        return;
+                    }
                 }
                 // Numpad-with-NumLock quirk (iced/winit on Windows): a numpad
                 // digit reports a *navigation* logical key (Numpad2 → ArrowDown,
@@ -2463,6 +2544,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             // next move. (CursorLeft is deliberately NOT a trigger: a drag past
             // the viewport edge must keep selecting.)
             Event::Window(window::Event::Unfocused) => {
+                state.panel.drag = false;
                 state.drag = None;
                 state.column_drag_anchor = None;
                 state.scrollbar_grab = None;
@@ -2477,6 +2559,20 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     let elapsed = now.saturating_duration_since(focus.updated_at).as_millis();
                     let until = BLINK_MS - elapsed % BLINK_MS;
                     shell.request_redraw_at(*now + Duration::from_millis(until as u64));
+                }
+                // The hover panel's hiding delay, on the same stamp-then-fire
+                // pattern as the idle timer below (and ahead of it, so a query
+                // due on the same frame opens its panel after this one closes).
+                // Not focus-gated: an open panel must still close when focus
+                // has gone elsewhere.
+                if state.panel.hide_arm {
+                    state.panel.hide_arm = false;
+                    let at = *now + Duration::from_millis(HOVER_HIDING_DELAY_MS);
+                    state.panel.hide_at = Some(at);
+                    shell.request_redraw_at(at);
+                }
+                if state.panel.hide_at.is_some_and(|at| *now >= at) {
+                    self.close_panel(state, shell);
                 }
                 // Hover idle timer: a move armed a re-arm — stamp the target
                 // instant here (accurate `now`) and schedule a redraw for it. When
@@ -2504,6 +2600,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                                     shell.publish((self.on_action)(Action::HoverDismiss));
                                 }
                             } else {
+                                if state.fold_preview.take().is_some() {
+                                    shell.request_redraw(); // the word's hover replaces it
+                                }
                                 let off = self.hit_test(&geo, pos);
                                 shell.publish((self.on_action)(Action::HoverQuery(off)));
                             }
@@ -2536,6 +2635,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         }
         let line_h = state.metrics.line_height;
         let geo = self.geo(state, bounds);
+        // Over the open hover panel, or selecting in it: the I-beam — its text
+        // is selectable, and nothing beneath it is reachable.
+        if state.panel.drag
+            || cursor.position_over(bounds).is_some_and(|p| {
+                self.open_panel(state.fold_preview, &geo).is_some_and(|l| l.rect.contains(p))
+            })
+        {
+            return mouse::Interaction::Text;
+        }
         // Ctrl held over a collapsible → the finger cursor (Ctrl+Click folds it).
         if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() {
             if let Some(p) = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x)) {
@@ -2630,25 +2738,31 @@ impl<Message> Editor<'_, Message> {
         (origin, size)
     }
 
-    /// Geometry + wrapped content for the hover popup — one source of truth,
-    /// shared by `draw_hover` and the wheel-scroll handler. Parses the markdown,
-    /// word-wraps each source line at the box width, caps the visible height at
-    /// `HOVER_MAX_VISIBLE`, and places the box above the word (flips below when
-    /// tight).
-    fn hover_layout(&self, info: &HoverInfo, geo: &Geo) -> HoverLayout {
+    /// The open hover panel's layout — the fold preview when one is open (it
+    /// replaced the hover when it opened), else the app's hover popup. Every
+    /// panel surface reads it: drawing, hit-testing, the wheel, the keep-open
+    /// test, selection, and copy.
+    fn open_panel(&self, fold_preview: Option<u32>, geo: &Geo) -> Option<PanelLayout> {
+        match fold_preview {
+            Some(opener) => self.fold_preview_layout(geo, opener),
+            None => self.hover.map(|info| self.hover_layout(info, geo)),
+        }
+    }
+
+    /// Geometry + wrapped content for the hover popup. Parses the markdown,
+    /// word-wraps each source line at the box width ([`HoverText`]), caps the
+    /// visible height at `HOVER_MAX_VISIBLE`, and places the box above the word
+    /// (flips below when tight).
+    fn hover_layout(&self, info: &HoverInfo, geo: &Geo) -> PanelLayout {
         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
         let pad_x = 8.0_f32; // hovers breathe more on the x axis
         let pad_y = popup::POPUP_PAD;
-        let md_lines: Vec<Vec<(String, MdStyle)>> = info.markdown.lines().map(parse_md_runs).collect();
-        let vis_len = |runs: &[(String, MdStyle)]| runs.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
-        let cells = md_lines.iter().map(|r| vis_len(r)).max().unwrap_or(0).clamp(popup::POPUP_MIN_CH, popup::POPUP_MAX_CH);
-        let lines: Vec<Vec<(String, MdStyle)>> = md_lines.iter().flat_map(|r| wrap_runs(r, cells)).collect();
-        let total = lines.len().max(1);
+        let text = HoverText::new(&info.markdown);
+        let total = text.lines.len();
         let visible = total.min(HOVER_MAX_VISIBLE);
-        let overflow = total > visible;
 
-        let inner_w = cells as f32 * advance;
-        let sb_w = if overflow { HOVER_SB_W } else { 0.0 };
+        let inner_w = text.cells as f32 * advance;
+        let sb_w = if total > visible { HOVER_SB_W } else { 0.0 };
         let width = inner_w + 2.0 * pad_x + sb_w;
         let height = visible as f32 * line_h + 2.0 * pad_y;
 
@@ -2659,64 +2773,331 @@ impl<Message> Editor<'_, Message> {
         let y = if word_top - height >= bounds.y { word_top - height } else { word_bottom };
         let x = word_x.clamp(bounds.x, (bounds.x + bounds.width - width).max(bounds.x));
 
-        HoverLayout {
+        PanelLayout {
+            id: PanelId::hover(info),
             rect: Rectangle { x, y, width, height },
-            lines,
+            content: PanelContent::Hover(text),
+            total,
             visible,
-            max_scroll: (total - visible) as f32 * line_h,
             pad_x,
             pad_y,
-            overflow,
+            radius: 8.0,
         }
     }
 
-    /// Render the hover popup — a rich-markdown box anchored at the hovered
-    /// word (above it, flips below when tight). Wraps at the box width; when the
-    /// content is taller than `HOVER_MAX_VISIBLE` it scrolls (wheel-driven
-    /// `hover_scroll`, snapped to whole lines) with an auto scrollbar.
-    fn draw_hover(
+    /// Geometry for the fold preview of the collapsed pair opened at `opener`:
+    /// a panel under its `…` chip showing the folded code in the editor's
+    /// syntax colors — a folded-region hover like other editors'. A block
+    /// shows as one fragment, its opener through its closer
+    /// ([`FoldFragment`]); an inline pair shows its own row expanded. Sized
+    /// from its first `FOLD_PREVIEW_MAX_VISIBLE` lines (the rest scroll into
+    /// view), so a document-scale block costs O(visible), never O(hidden
+    /// rows). `None` if it is not a live collapsed fold (expanded since the
+    /// preview armed) or its chip is not on screen.
+    fn fold_preview_layout(&self, geo: &Geo, opener: u32) -> Option<PanelLayout> {
+        let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
+        if !self.doc.folds().is_folded(opener) {
+            return None; // expanded since the preview armed — nothing hidden
+        }
+        let buffer = self.doc.buffer();
+        let close = self.doc.brackets().at(opener).filter(|b| b.open)?.partner?;
+        let header = buffer.offset_to_point(opener).row;
+        let last = buffer.offset_to_point(close).row;
+        let fold_map = self.fold_map();
+        // Anchor at the `…` chip being previewed — the SAME rect the hover
+        // wash, finger cursor, and expand click measure against, so the panel
+        // opens under the thing the pointer is on (a mid-line inline chip
+        // included, not the row's end). `None` when no chip is on screen (the
+        // header scrolled away, or hidden inside an outer fold).
+        let chip = self.collapsed_chip_rect(&fold_map, geo, opener)?;
+        // Content: the folded pair as one fragment, opener to closer
+        // ([`FoldFragment`]), its shared indent stripped so it sits at the
+        // panel's left edge with its own shape intact. The indent is measured
+        // over the first `visible` lines only, which always include the opener
+        // line — set at the closer's indent — so the delimiters' column bounds
+        // it; a shallower row further down just keeps its extra indent.
+        let close_pt = buffer.offset_to_point(close);
+        let frag = FoldFragment::new(
+            (header, opener - buffer.point_to_offset(BufPoint { row: header, col: 0 })),
+            (last, close_pt.col),
+            line_indent_cells(&buffer.line(last)),
+        );
+        let total = frag.len();
+        let visible = total.min(FOLD_PREVIEW_MAX_VISIBLE);
+        let (mut strip, mut max_cells) = (u32::MAX, 0u32);
+        for i in 0..visible {
+            let line = buffer.line(frag.row(i));
+            let (shown, _) = fold_line_text(&line, &frag.line(i, line.len() as u32), 0);
+            if shown.trim().is_empty() {
+                continue;
+            }
+            strip = strip.min(shown.chars().take_while(|&c| c == ' ').count() as u32);
+            max_cells = max_cells.max(shown.chars().count() as u32);
+        }
+        let strip = if strip == u32::MAX { 0 } else { strip };
+        let pad = 8.0_f32;
+        let sb_w = if total > visible { HOVER_SB_W } else { 0.0 };
+        let code_w = (bounds.width - geo.gutter() - SCROLLBAR_WIDTH).max(advance * 8.0);
+        let width = (max_cells.saturating_sub(strip) as f32 * advance + 2.0 * pad + sb_w).clamp(advance * 8.0, code_w);
+        let height = visible as f32 * line_h + 2.0 * pad;
+        // Below the chip's line; flip above when it would overflow the
+        // bottom, and clamp horizontally.
+        let code_left = geo.code_left();
+        let x = chip.x.clamp(code_left, (bounds.x + bounds.width - width - 4.0).max(code_left));
+        let line_top = geo.row_y(fold_map.to_display_row(BufferRow(header)));
+        let below = line_top + line_h + 2.0;
+        let y = if below + height <= bounds.y + bounds.height { below } else { (line_top - height - 2.0).max(bounds.y) };
+        Some(PanelLayout {
+            id: PanelId::Fold(opener),
+            rect: Rectangle { x, y, width, height },
+            content: PanelContent::Fold { frag, strip },
+            total,
+            visible,
+            pad_x: pad,
+            pad_y: pad,
+            radius: 4.0,
+        })
+    }
+
+    /// Content line `i` of panel `p` as it shows it — plain text, one char
+    /// per cell.
+    fn panel_line(&self, p: &PanelLayout, i: usize) -> String {
+        match &p.content {
+            PanelContent::Hover(text) => text.line_text(i),
+            PanelContent::Fold { frag, strip } => {
+                let line = self.doc.buffer().line(frag.row(i));
+                fold_line_text(&line, &frag.line(i, line.len() as u32), *strip).0
+            }
+        }
+    }
+
+    /// The content lines `first..=last` a triple-click on line `i` selects:
+    /// the hover's wrapped paragraph (its source line), or the one row.
+    fn panel_paragraph(&self, p: &PanelLayout, i: usize) -> (usize, usize) {
+        match &p.content {
+            PanelContent::Hover(text) => text.paragraph(i),
+            PanelContent::Fold { .. } => (i, i),
+        }
+    }
+
+    /// The text a selection in panel `p` copies: the hover's markdown source
+    /// as plain text (soft wraps rejoined, markers gone), or the fold
+    /// preview's rows as shown, joined by `\n`.
+    fn panel_copy(&self, p: &PanelLayout, sel: PanelSelection) -> String {
+        let (a, b) = sel.ordered();
+        match &p.content {
+            PanelContent::Hover(text) => text.copy(a, b),
+            PanelContent::Fold { .. } => (a.line..=b.line.min(p.total - 1))
+                .map(|i| {
+                    let from = if i == a.line { a.col } else { 0 };
+                    let to = if i == b.line { b.col } else { usize::MAX };
+                    panel::char_slice(&self.panel_line(p, i), from, to)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// The content line and fractional cell under `pos` in panel `p` scrolled
+    /// to line `first`. The line clamps to the visible window, so a drag past
+    /// the panel's edge selects to its first/last visible line.
+    fn panel_hit(&self, p: &PanelLayout, geo: &Geo, first: usize, pos: Point) -> (usize, f32) {
+        let row = ((pos.y - p.rect.y - p.pad_y) / geo.line_h()).floor().clamp(0.0, (p.visible - 1) as f32);
+        ((first + row as usize).min(p.total - 1), (pos.x - p.rect.x - p.pad_x) / geo.advance())
+    }
+
+    /// The caret position under `pos` in panel `p`: its line, and the column
+    /// nearest the pointer (clamped to the line).
+    fn panel_caret(&self, p: &PanelLayout, geo: &Geo, first: usize, pos: Point) -> TextPos {
+        let (line, cell) = self.panel_hit(p, geo, first, pos);
+        let len = self.panel_line(p, line).chars().count();
+        TextPos::new(line, (cell.round().max(0.0) as usize).min(len))
+    }
+
+    /// Whether code-area point `pos` is over what panel `p` describes: the
+    /// hover's word, or the fold preview's `…` chip. The pointer is a
+    /// caret-rounded offset, so "over" the word means touching it
+    /// (`start..=end`) — the rule the query that opened it used (see
+    /// [`HoverInfo::range`]); a half-open test would let the right half of the
+    /// word's last char open a hover the very next move dismissed.
+    fn panel_subject_under(&self, p: &PanelLayout, geo: &Geo, pos: Point) -> bool {
+        match p.id {
+            PanelId::Hover { start, end, .. } => (start..=end).contains(&self.hit_test(geo, pos)),
+            PanelId::Fold(opener) => self.collapsed_chip_at(geo, pos) == Some(opener),
+        }
+    }
+
+    /// A left press inside panel `p`. It pins the panel (it now outlives the
+    /// pointer leaving, as a clicked VS Code hover does) and selects: a single
+    /// click places the caret (Shift extends the selection to it) and arms a
+    /// drag; a double click selects the word under the pointer; a triple click
+    /// its whole line (a hover's wrapped paragraph).
+    fn press_panel(&self, state: &mut State, p: &PanelLayout, geo: &Geo, pos: Point) {
+        let first = state.panel.scroll.min(p.max_first());
+        let caret = self.panel_caret(p, geo, first, pos);
+        let click = mouse::Click::new(pos, mouse::Button::Left, state.panel.click);
+        let (shift, prev) = (state.modifiers.shift(), state.panel.sel);
+        state.panel.click = Some(click);
+        state.panel.pinned = true;
+        state.panel.drag = matches!(click.kind(), mouse::click::Kind::Single);
+        state.panel.keep();
+        state.hover_rearm = false;
+        state.hover_at = None;
+        state.panel.sel = Some(match click.kind() {
+            mouse::click::Kind::Single => {
+                let anchor = prev.filter(|_| shift).map_or(caret, |s| s.anchor);
+                PanelSelection::new(anchor, caret)
+            }
+            mouse::click::Kind::Double => {
+                let (_, cell) = self.panel_hit(p, geo, first, pos);
+                let (a, b) = panel::word_span(&self.panel_line(p, caret.line), cell.floor().max(0.0) as usize);
+                PanelSelection::new(TextPos::new(caret.line, a), TextPos::new(caret.line, b))
+            }
+            mouse::click::Kind::Triple => {
+                let (a, b) = self.panel_paragraph(p, caret.line);
+                PanelSelection::new(TextPos::new(a, 0), TextPos::new(b, self.panel_line(p, b).chars().count()))
+            }
+        });
+    }
+
+    /// Extend a drag selection in panel `p` to `pos` — the raw pointer, which
+    /// may have left the panel. Above or below the text it scrolls the panel a
+    /// line per move toward the pointer, so a drag can select past the window.
+    fn drag_panel(&self, state: &mut State, p: &PanelLayout, geo: &Geo, pos: Point) {
+        let top = p.rect.y + p.pad_y;
+        let mut first = state.panel.scroll.min(p.max_first());
+        if pos.y < top {
+            first = first.saturating_sub(1);
+        } else if pos.y >= top + p.visible as f32 * geo.line_h() {
+            first = (first + 1).min(p.max_first());
+        }
+        state.panel.scroll = first;
+        let head = self.panel_caret(p, geo, first, pos);
+        if let Some(sel) = &mut state.panel.sel {
+            sel.head = head;
+        }
+    }
+
+    /// Close the open hover panel: the widget's own fold preview directly,
+    /// the app's hover popup by asking ([`Action::HoverDismiss`]). Its view
+    /// state goes with it.
+    fn close_panel(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
+        if state.fold_preview.take().is_some() {
+            shell.request_redraw();
+        }
+        if self.hover.is_some() {
+            shell.publish((self.on_action)(Action::HoverDismiss));
+        }
+        state.panel = PanelState::default();
+    }
+
+    /// Paint an open hover panel: its surface, the selection wash, the visible
+    /// window of its content (the hover's styled markdown runs, or the fold
+    /// preview's rows in their syntax colors), and an auto scrollbar when the
+    /// content overflows. `view` is the open panel's state, honored only if it
+    /// belongs to `p` — otherwise `p` paints fresh (unscrolled, unselected).
+    fn draw_panel(
         &self,
         renderer: &mut iced::Renderer,
-        info: &HoverInfo,
+        p: &PanelLayout,
         geo: &Geo,
         text_color: Color,
-        hover_scroll: f32,
+        selection_color: Color,
+        view: &PanelState,
     ) {
         let (advance, line_h) = (geo.advance(), geo.line_h());
-        let l = self.hover_layout(info, geo);
-        fill_panel(renderer, l.rect, POPUP_SURFACE, POPUP_BORDER, 8.0);
-
-        let scroll = hover_scroll.clamp(0.0, l.max_scroll);
-        let first = (scroll / line_h).round() as usize;
-        // Each visible line's runs, left-to-right (monospace ⇒ cell = char): bold
-        // in a bold weight, inline `code` over a rounded pill, plain as-is.
-        for (vi, line) in l.lines.iter().skip(first).take(l.visible).enumerate() {
-            let ly = l.rect.y + l.pad_y + vi as f32 * line_h;
-            let mut col = 0usize;
-            for (run, st) in line {
-                let rx = l.rect.x + l.pad_x + col as f32 * advance;
-                let n = run.chars().count();
-                if *st == MdStyle::Code {
-                    let pill = Rectangle { x: rx - 2.0, y: ly + 1.0, width: n as f32 * advance + 4.0, height: line_h - 2.0 };
-                    fill_rounded(renderer, pill, CODE_PILL_BG, 3.0);
+        let (first, sel) = if view.id == Some(p.id) { (view.scroll.min(p.max_first()), view.sel) } else { (0, None) };
+        fill_panel(renderer, p.rect, POPUP_SURFACE, POPUP_BORDER, p.radius);
+        let text_x = p.rect.x + p.pad_x;
+        let wash_right = p.rect.x + p.rect.width - if p.overflow() { HOVER_SB_W } else { 0.0 } - 1.0;
+        for (vi, i) in (first..(first + p.visible).min(p.total)).enumerate() {
+            let ly = p.rect.y + p.pad_y + vi as f32 * line_h;
+            // The selection wash under line `i` (`len` chars), a half cell past
+            // its end when the selection runs on to the next line — clipped to
+            // the panel, as long rows are.
+            let wash = |renderer: &mut iced::Renderer, len: usize| {
+                if let Some((c0, c1, eol)) = sel.and_then(|s| s.span_on(i, len)) {
+                    let x0 = (text_x + c0 as f32 * advance).max(p.rect.x + 1.0);
+                    let x1 = (text_x + c1 as f32 * advance + if eol { advance * 0.5 } else { 0.0 }).min(wash_right);
+                    if x1 > x0 {
+                        fill(renderer, Rectangle { x: x0, y: ly, width: x1 - x0, height: line_h }, selection_color);
+                    }
                 }
-                let font = if *st == MdStyle::Bold {
-                    Font { weight: iced::font::Weight::Bold, ..self.font }
-                } else {
-                    self.font
-                };
-                self.draw_run(renderer, run.clone(), Point::new(rx, ly), text_color, font, l.rect);
-                col += n;
+            };
+            match &p.content {
+                PanelContent::Hover(text) => {
+                    wash(renderer, text.line_len(i));
+                    // The runs left-to-right (monospace ⇒ cell = char): bold in
+                    // a bold weight, inline `code` over a rounded pill, plain as-is.
+                    let mut col = 0usize;
+                    for (run, st) in &text.lines[i] {
+                        let rx = text_x + col as f32 * advance;
+                        let n = run.chars().count();
+                        if *st == MdStyle::Code {
+                            let pill = Rectangle { x: rx - 2.0, y: ly + 1.0, width: n as f32 * advance + 4.0, height: line_h - 2.0 };
+                            fill_rounded(renderer, pill, CODE_PILL_BG, 3.0);
+                        }
+                        let font = if *st == MdStyle::Bold {
+                            Font { weight: iced::font::Weight::Bold, ..self.font }
+                        } else {
+                            self.font
+                        };
+                        self.draw_run(renderer, run.clone(), Point::new(rx, ly), text_color, font, p.rect);
+                        col += n;
+                    }
+                }
+                PanelContent::Fold { frag, strip } => {
+                    // The line's slice of its row, in its syntax colors when it
+                    // has them, placed where `fold_line_text` puts it: byte
+                    // column `c` lands `lead + cells(c) − cells(cols.start)`
+                    // cells in, less the indent stripped from it.
+                    let row = frag.row(i);
+                    let line = self.doc.buffer().line(row);
+                    let pl = frag.line(i, line.len() as u32);
+                    let (shown, stripped) = fold_line_text(&line, &pl, *strip);
+                    wash(renderer, shown.chars().count());
+                    let x0 = text_x
+                        + (pl.lead as f32 - display_map::expand(&line, pl.cols.start, TAB) as f32 - stripped as f32)
+                            * advance;
+                    match self.doc.highlight_line_spans(row) {
+                        Some(spans) if !spans.is_empty() => {
+                            // The spans clipped to the slice — a sliced opener or
+                            // closer line keeps its colors, as a whole row does.
+                            let clipped: Vec<HighlightSpan> = spans
+                                .iter()
+                                .filter_map(|s| {
+                                    let range = s.range.start.max(pl.cols.start)..s.range.end.min(pl.cols.end);
+                                    (range.start < range.end).then(|| HighlightSpan { range, ..s.clone() })
+                                })
+                                .collect();
+                            self.draw_spans(renderer, &line, &clipped, Point::new(x0, ly), advance, p.rect);
+                        }
+                        _ if !shown.trim().is_empty() => {
+                            self.draw_line(renderer, shown, Point::new(text_x, ly), text_color, Alignment::Left, p.rect);
+                        }
+                        _ => {}
+                    }
+                    // Its brackets over-painted in their pair-depth colors, as
+                    // the editor paints them — the editor's bracket pass covers
+                    // only visible rows, and these are folded away.
+                    let row_start = self.doc.buffer().point_to_offset(BufPoint { row, col: 0 });
+                    for br in self.doc.brackets().in_range_iter(row_start + pl.cols.start..row_start + pl.cols.end) {
+                        let col = br.offset - row_start;
+                        let Some(ch) = line[col as usize..].chars().next() else { continue };
+                        let x = x0 + display_map::expand(&line, col, TAB) as f32 * advance;
+                        self.draw_line(renderer, ch.to_string(), Point::new(x, ly), bracket_color(&br), Alignment::Left, p.rect);
+                    }
+                }
             }
         }
 
         // Auto scrollbar on the right edge when the content overflows.
-        if l.overflow {
-            let track_h = l.visible as f32 * line_h;
-            let thumb_h = (l.visible as f32 / l.lines.len() as f32 * track_h).max(HOVER_SB_W);
-            let frac = if l.max_scroll > 0.0 { scroll / l.max_scroll } else { 0.0 };
-            let thumb_y = l.rect.y + l.pad_y + frac * (track_h - thumb_h);
-            let sbx = l.rect.x + l.rect.width - HOVER_SB_W - 1.0;
+        if p.overflow() {
+            let track_h = p.visible as f32 * line_h;
+            let thumb_h = (p.visible as f32 / p.total as f32 * track_h).max(HOVER_SB_W);
+            let frac = first as f32 / p.max_first() as f32;
+            let thumb_y = p.rect.y + p.pad_y + frac * (track_h - thumb_h);
+            let sbx = p.rect.x + p.rect.width - HOVER_SB_W - 1.0;
             fill_rounded(renderer, Rectangle { x: sbx, y: thumb_y, width: HOVER_SB_W, height: thumb_h }, SCROLLBAR_THUMB, HOVER_SB_W / 2.0);
         }
     }
@@ -3145,95 +3526,6 @@ impl<Message> Editor<'_, Message> {
             .find(|&o| self.collapsed_chip_rect(&fold_map, geo, o).is_some_and(|r| r.contains(pos)))
     }
 
-    /// Draw the hover preview of a collapsed fold's hidden content: a floating
-    /// panel, anchored under the collapsed line's chip, showing the folded interior
-    /// (a block's hidden rows, or an inline pair's own expanded line) in the
-    /// editor's own syntax colors — a folded-region hover like mainstream editors'.
-    /// `opener` is the
-    /// collapsed pair's opening-bracket offset; a no-op if it is not a live
-    /// collapsed fold (e.g. expanded since the preview armed) or its header is
-    /// scrolled/folded out of view.
-    fn draw_fold_preview(&self, renderer: &mut iced::Renderer, geo: &Geo, opener: u32, text_color: Color) {
-        let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
-        if !self.doc.folds().is_folded(opener) {
-            return; // expanded since the preview armed — nothing hidden
-        }
-        let buffer = self.doc.buffer();
-        let Some(b) = self.doc.brackets().at(opener).filter(|b| b.open) else { return };
-        let Some(close) = b.partner else { return };
-        let header = buffer.offset_to_point(opener).row;
-        let last = buffer.offset_to_point(close).row;
-        let fold_map = self.fold_map();
-        if fold_map.is_folded(BufferRow(header)) {
-            return; // the collapsed line is itself hidden inside an outer fold
-        }
-        // Rows to show: a block's hidden interior (`header+1..=last`), or the inline
-        // pair's own row expanded. Only the first `MAX_ROWS` are ever read, so
-        // `take` them — the interior of a document-scale collapsed block must not
-        // materialize an O(hidden-rows) Vec on every repaint of the preview.
-        const MAX_ROWS: usize = 18;
-        let total = if last > header { (last - header) as usize } else { 1 };
-        let rows: Vec<u32> = if last > header {
-            (header + 1..=last).take(MAX_ROWS).collect()
-        } else {
-            vec![header]
-        };
-        let shown = rows.len(); // == total.min(MAX_ROWS)
-        let more = total - shown;
-        // Strip the shared leading indent so the preview reads compact.
-        let mut min_cells = u32::MAX;
-        let mut max_cells = 0u32;
-        for &r in &rows[..shown] {
-            let l = buffer.line(r);
-            if l.trim().is_empty() {
-                continue;
-            }
-            min_cells = min_cells.min(line_indent_cells(&l));
-            max_cells = max_cells.max(display_map::expand(&l, l.len() as u32, TAB));
-        }
-        let min_cells = if min_cells == u32::MAX { 0 } else { min_cells };
-        let content_cells = max_cells.saturating_sub(min_cells);
-        let pad = 8.0_f32;
-        let code_w = (bounds.width - geo.gutter() - SCROLLBAR_WIDTH).max(advance * 8.0);
-        let width = (content_cells as f32 * advance + 2.0 * pad).clamp(advance * 8.0, code_w);
-        let height = (shown + usize::from(more > 0)) as f32 * line_h + 2.0 * pad;
-        // Anchor at the `…` chip being previewed — the SAME rect the hover
-        // wash, finger cursor, and expand click measure against, so the panel
-        // opens under the thing the pointer is on (a mid-line inline chip
-        // included, not the row's end). Flip above when it would overflow the
-        // bottom, and clamp horizontally.
-        let Some(chip) = self.collapsed_chip_rect(&fold_map, geo, opener) else {
-            return; // no chip on screen (nested away) ⇒ nothing to anchor to
-        };
-        let code_left = geo.code_left();
-        let x = chip.x.clamp(code_left, (bounds.x + bounds.width - width - 4.0).max(code_left));
-        let line_top = geo.row_y(fold_map.to_display_row(BufferRow(header)));
-        let below = line_top + line_h + 2.0;
-        let y = if below + height <= bounds.y + bounds.height { below } else { (line_top - height - 2.0).max(bounds.y) };
-        let rect = Rectangle { x, y, width, height };
-        fill_panel(renderer, rect, POPUP_SURFACE, POPUP_BORDER, 4.0);
-        // Content lines, shifted left by the stripped indent, in their syntax colors.
-        let sx = rect.x + pad - min_cells as f32 * advance;
-        for (i, &r) in rows[..shown].iter().enumerate() {
-            let ry = rect.y + pad + i as f32 * line_h;
-            match self.doc.highlight_line_spans(r) {
-                Some(spans) if !spans.is_empty() => self.draw_spans(renderer, &buffer.line(r), spans, Point::new(sx, ry), advance, rect),
-                _ => {
-                    let line = buffer.line(r);
-                    let l = line.trim_start();
-                    if !l.is_empty() {
-                        self.draw_line(renderer, expand_tabs(l), Point::new(rect.x + pad, ry), text_color, Alignment::Left, rect);
-                    }
-                }
-            }
-        }
-        if more > 0 {
-            let ry = rect.y + pad + shown as f32 * line_h;
-            let msg = format!("… {more} more line{}", if more == 1 { "" } else { "s" });
-            self.draw_line(renderer, msg, Point::new(rect.x + pad, ry), Color { a: 0.6, ..text_color }, Alignment::Left, rect);
-        }
-    }
-
     /// Draw one line as its colored highlight spans (each a byte range within the
     /// line, positioned by its start cell). Bold/italic deferred; fg only.
     fn draw_spans(
@@ -3376,6 +3668,30 @@ fn expand_tabs(line: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `key` is a bare modifier or lock key — a press that only readies a
+/// chord (Ctrl before the C of Ctrl+C), so it must not close a hover panel.
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            Named::Shift
+                | Named::Control
+                | Named::Alt
+                | Named::AltGraph
+                | Named::Super
+                | Named::Meta
+                | Named::Hyper
+                | Named::Fn
+                | Named::FnLock
+                | Named::CapsLock
+                | Named::NumLock
+                | Named::ScrollLock
+                | Named::Symbol
+                | Named::SymbolLock
+        )
+    )
 }
 
 /// The glyph a numpad *character* key carries in `text`, or `None` for a
@@ -3607,124 +3923,63 @@ fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
     );
 }
 
-/// Inline markdown styling for a hover run.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MdStyle {
-    Plain,
-    Bold,
-    Code,
+/// What a hover panel shows — the two content kinds behind the one panel
+/// behavior (see [`crate::panel`]).
+enum PanelContent {
+    /// The hover popup's wrapped markdown.
+    Hover(HoverText),
+    /// A fold preview: the folded pair's lines (see [`FoldFragment`]), shown
+    /// with up to `strip` cells of their shared indent removed.
+    Fold { frag: FoldFragment, strip: u32 },
 }
 
-/// Split one markdown line into styled runs, consuming the `**bold**` and
-/// `` `code` `` markers. A minimal inline subset (no nesting) — enough for the
-/// hover's spec-derived docs; unmatched markers just toggle back at line end.
-fn parse_md_runs(line: &str) -> Vec<(String, MdStyle)> {
-    let mut runs = Vec::new();
-    let mut cur = String::new();
-    let mut style = MdStyle::Plain;
-    let mut push = |cur: &mut String, style: MdStyle| {
-        if !cur.is_empty() {
-            runs.push((std::mem::take(cur), style));
-        }
-    };
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' if chars.peek() == Some(&'*') => {
-                chars.next(); // second '*'
-                push(&mut cur, style);
-                style = if style == MdStyle::Bold { MdStyle::Plain } else { MdStyle::Bold };
-            }
-            '`' => {
-                push(&mut cur, style);
-                style = if style == MdStyle::Code { MdStyle::Plain } else { MdStyle::Code };
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        runs.push((cur, style));
-    }
-    runs
-}
-
-/// Coalesce a per-char styled sequence into `(String, style)` segments.
-fn coalesce_chars(chars: Vec<(char, MdStyle)>) -> Vec<(String, MdStyle)> {
-    let mut segs: Vec<(String, MdStyle)> = Vec::new();
-    for (c, s) in chars {
-        match segs.last_mut() {
-            Some((t, st)) if *st == s => t.push(c),
-            _ => segs.push((c.to_string(), s)),
-        }
-    }
-    segs
-}
-
-/// Word-wrap one source line's styled runs into visual lines that each fit in
-/// `max_cells` (monospace ⇒ 1 cell = 1 char). Breaks at spaces (dropped at the
-/// break); a word longer than the width hard-breaks. Per-char style rides along.
-fn wrap_runs(runs: &[(String, MdStyle)], max_cells: usize) -> Vec<Vec<(String, MdStyle)>> {
-    let max = max_cells.max(1);
-    let flat: Vec<(char, MdStyle)> =
-        runs.iter().flat_map(|(t, s)| t.chars().map(move |c| (c, *s))).collect();
-    let mut lines: Vec<Vec<(char, MdStyle)>> = Vec::new();
-    let mut cur: Vec<(char, MdStyle)> = Vec::new();
-    let trim = |line: &mut Vec<(char, MdStyle)>| {
-        while line.last().map(|&(c, _)| c) == Some(' ') {
-            line.pop();
-        }
-    };
-    let mut i = 0;
-    while i < flat.len() {
-        if flat[i].0 == ' ' {
-            if cur.len() < max {
-                cur.push(flat[i]); // spaces only count while the line has room
-            }
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < flat.len() && flat[i].0 != ' ' {
-            i += 1;
-        }
-        let word = &flat[start..i];
-        if word.len() > max {
-            // Hard-break an over-long word across lines.
-            for &ch in word {
-                if cur.len() >= max {
-                    lines.push(std::mem::take(&mut cur));
-                }
-                cur.push(ch);
-            }
-        } else {
-            if cur.len() + word.len() > max {
-                trim(&mut cur);
-                lines.push(std::mem::take(&mut cur));
-            }
-            cur.extend_from_slice(word);
-        }
-    }
-    trim(&mut cur);
-    lines.push(cur);
-    lines.into_iter().map(coalesce_chars).collect()
-}
-
-/// Geometry + wrapped content for the hover popup — computed once and shared by
-/// `draw_hover` and the wheel-scroll handler (one source of truth for the box).
-struct HoverLayout {
-    /// The whole popup box.
+/// Geometry + content for an open hover panel — computed once per pass and
+/// shared by drawing, hit-testing, the wheel, the keep-open test, selection,
+/// and copy (one source of truth for the box and what is in it).
+struct PanelLayout {
+    /// Which panel this is.
+    id: PanelId,
+    /// The whole panel box.
     rect: Rectangle,
-    /// Word-wrapped visual lines (styled runs).
-    lines: Vec<Vec<(String, MdStyle)>>,
-    /// How many lines are visible at once (≤ `HOVER_MAX_VISIBLE`).
+    /// What it shows.
+    content: PanelContent,
+    /// Content lines in all (≥ 1), and how many are visible at once.
+    total: usize,
     visible: usize,
-    /// Max vertical scroll offset in px (`(total − visible) · line_h`), 0 if it fits.
-    max_scroll: f32,
-    /// Inner padding (x, y).
+    /// Inner padding (x, y) — where the text grid starts inside `rect`.
     pad_x: f32,
     pad_y: f32,
+    /// Corner radius of the panel surface.
+    radius: f32,
+}
+
+impl PanelLayout {
     /// Whether the content is taller than the box (⇒ scrollbar + wheel scroll).
-    overflow: bool,
+    fn overflow(&self) -> bool {
+        self.total > self.visible
+    }
+
+    /// The furthest the panel scrolls: the last valid first-visible line.
+    fn max_first(&self) -> usize {
+        self.total - self.visible
+    }
+}
+
+/// A fold-preview line as the panel shows it, and how many indent cells it
+/// lost: the bytes `pl.cols` of its row `line`, tabs expanded at their real
+/// stops, set `pl.lead` cells in, then up to `strip` cells of that indent
+/// dropped — never more than the line has, so no text is lost. The one owner
+/// of a preview line's text: the draw, hit-testing, selection, and copy all
+/// read it.
+fn fold_line_text(line: &str, pl: &PreviewLine, strip: u32) -> (String, u32) {
+    let len = line.len() as u32;
+    let (a, b) = (pl.cols.start.min(len), pl.cols.end.min(len));
+    let (ca, cb) = (display_map::expand(line, a, TAB), display_map::expand(line, b, TAB));
+    let expanded = expand_tabs(line);
+    let body = expanded.chars().skip(ca as usize).take((cb - ca) as usize);
+    let raw: String = std::iter::repeat_n(' ', pl.lead as usize).chain(body).collect();
+    let stripped = strip.min(raw.chars().take_while(|&c| c == ' ').count() as u32);
+    (raw.chars().skip(stripped as usize).collect(), stripped)
 }
 
 /// A filled rounded rect with no border or shadow — the inline-code pill.
@@ -3828,6 +4083,22 @@ impl<'a, Message: 'a> From<Editor<'a, Message>>
 }
 
 #[cfg(test)]
+impl<Message> Editor<'_, Message> {
+    /// The geometry a fresh, unscrolled widget of this editor lays out in
+    /// `bounds`, and the rect of the hover panel it would show (the preview of
+    /// the collapsed fold opened at `fold_preview`, else its hover) — so
+    /// end-to-end tests aim the pointer at real pixels rather than assume font
+    /// metrics.
+    pub(crate) fn test_layout(&self, bounds: Rectangle, fold_preview: Option<u32>) -> (Geo, Option<Rectangle>) {
+        let mut state = State::default();
+        self.ensure_metrics(&mut state);
+        let geo = self.geo(&state, bounds);
+        let rect = self.open_panel(fold_preview, &geo).map(|p| p.rect);
+        (geo, rect)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use iced::advanced::widget::operation;
@@ -3892,41 +4163,6 @@ mod tests {
         assert_eq!(numpad_text(&Physical::Code(Code::Digit2), Some("2")), None);
         // NumpadEnter is excluded ⇒ left for the Named::Enter → newline path.
         assert_eq!(numpad_text(&Physical::Code(Code::NumpadEnter), Some("\r")), None);
-    }
-
-    #[test]
-    fn wrap_runs_wraps_at_word_boundaries() {
-        use MdStyle::*;
-        let text = |line: &Vec<(String, MdStyle)>| line.iter().map(|(t, _)| t.as_str()).collect::<String>();
-        // Greedy word wrap at width 8.
-        let w = wrap_runs(&[("hello world foo".to_string(), Plain)], 8);
-        assert_eq!(w.iter().map(text).collect::<Vec<_>>(), vec!["hello", "world", "foo"]);
-        // A word longer than the width hard-breaks.
-        let h = wrap_runs(&[("verylongword".to_string(), Plain)], 4);
-        assert_eq!(h.iter().map(text).collect::<Vec<_>>(), vec!["very", "long", "word"]);
-        // Short content stays one line and keeps its styles.
-        let s = wrap_runs(&[("a".to_string(), Bold), (" b".to_string(), Plain)], 40);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0], vec![("a".to_string(), Bold), (" b".to_string(), Plain)]);
-    }
-
-    #[test]
-    fn parse_md_runs_splits_bold_and_code() {
-        use MdStyle::*;
-        let runs = parse_md_runs("**name** `id { … }` — handle it.");
-        assert_eq!(
-            runs,
-            vec![
-                ("name".to_string(), Bold),
-                (" ".to_string(), Plain),
-                ("id { … }".to_string(), Code),
-                (" — handle it.".to_string(), Plain),
-            ]
-        );
-        // Plain text with no markers is a single Plain run.
-        assert_eq!(parse_md_runs("just words"), vec![("just words".to_string(), Plain)]);
-        // A single '*' is literal (only '**' toggles bold).
-        assert_eq!(parse_md_runs("a * b"), vec![("a * b".to_string(), Plain)]);
     }
 
     #[test]

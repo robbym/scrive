@@ -684,10 +684,15 @@ impl CodeEditor {
             }
             // Hover: the pointer rested over `offset` — diagnostics first (their
             // messages ride the decoration store), then the provider's docs.
+            // `offset` is a caret, and both subjects are the ones TOUCHING it
+            // (`start..=end`): `word_around` by construction, and the empty
+            // query range for diagnostics (`offset..offset + 1` would also take
+            // one starting a char later). The widget keeps the hover open by
+            // the same rule, so wherever a hover opens, it holds.
             Event::Editor(Action::HoverQuery(offset)) => {
                 let diags: Vec<(Range<u32>, String)> = self
                     .doc
-                    .diagnostics_in(offset..offset + 1)
+                    .diagnostics_in(offset..offset)
                     .map(|(r, sev, msg)| (r, format!("**{}:** {msg}", severity_label(sev))))
                     .collect();
                 let cx = self.build_hover_cx(offset);
@@ -2140,5 +2145,413 @@ mod tests {
         // Ctrl+Z reaches the log too (it once drained `[]`, stranding the host).
         let _ = ed.update(Event::Editor(Action::Undo));
         assert_eq!(ed.drain_changes(), vec![EditOp::delete(0..1)], "undo logs the revert");
+    }
+
+    /// A headless app loop for end-to-end hover-panel tests: each event goes
+    /// through a `UserInterface` built from the editor's current view, and what
+    /// the widget publishes loops back into `update` — the real widget, minus a
+    /// window. The clock is injected (`RedrawRequested` carries `t0 + ms`), so
+    /// the idle and hiding timers fire deterministically.
+    struct Drive {
+        ed: CodeEditor,
+        r: iced::Renderer,
+        cache: Option<iced_runtime::user_interface::Cache>,
+        at: iced::Point,
+        t0: std::time::Instant,
+        ms: u64,
+        clip: TestClipboard,
+        /// How many hover queries / dismissals the widget has published — a
+        /// held hover publishes neither.
+        queries: usize,
+        dismissals: usize,
+    }
+
+    /// A clipboard that keeps what the widget writes.
+    #[derive(Default)]
+    struct TestClipboard(Option<String>);
+
+    impl iced::advanced::Clipboard for TestClipboard {
+        fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+            self.0.clone()
+        }
+        fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+            self.0 = Some(contents);
+        }
+    }
+
+    impl Drive {
+        const SIZE: iced::Size = iced::Size::new(600.0, 400.0);
+
+        fn new(ed: CodeEditor) -> Self {
+            let r = iced_renderer::fallback::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+                Font::default(),
+                iced::Pixels(14.0),
+            ));
+            let cache = Some(iced_runtime::user_interface::Cache::new());
+            let t0 = std::time::Instant::now();
+            Self { ed, r, cache, at: iced::Point::ORIGIN, t0, ms: 0, clip: TestClipboard::default(), queries: 0, dismissals: 0 }
+        }
+
+        fn send(&mut self, ev: iced::Event) {
+            let cache = self.cache.take().expect("cache");
+            let mut ui =
+                iced_runtime::user_interface::UserInterface::build(self.ed.view(), Self::SIZE, cache, &mut self.r);
+            let mut msgs = Vec::new();
+            ui.update(&[ev], iced::mouse::Cursor::Available(self.at), &mut self.r, &mut self.clip, &mut msgs);
+            self.cache = Some(ui.into_cache());
+            for m in msgs {
+                match m {
+                    Event::Editor(Action::HoverQuery(_)) => self.queries += 1,
+                    Event::Editor(Action::HoverDismiss) => self.dismissals += 1,
+                    _ => {}
+                }
+                let _ = self.ed.update(m);
+            }
+        }
+
+        /// One frame at the current clock — stamps any timer a move armed.
+        fn frame(&mut self) {
+            let now = self.t0 + std::time::Duration::from_millis(self.ms);
+            self.send(iced::Event::Window(iced::window::Event::RedrawRequested(now)));
+        }
+
+        /// Advance the clock and deliver the frame due then.
+        fn wait(&mut self, ms: u64) {
+            self.ms += ms;
+            self.frame();
+        }
+
+        fn move_to(&mut self, p: iced::Point) {
+            self.at = p;
+            self.send(iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: p }));
+            self.frame();
+        }
+
+        fn press(&mut self) {
+            self.send(iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)));
+        }
+
+        fn release(&mut self) {
+            self.send(iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)));
+        }
+
+        fn click_at(&mut self, p: iced::Point) {
+            self.move_to(p);
+            self.press();
+            self.release();
+        }
+
+        fn wheel(&mut self, lines: f32) {
+            let delta = iced::mouse::ScrollDelta::Lines { x: 0.0, y: lines };
+            self.send(iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }));
+        }
+
+        fn key(&mut self, key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) {
+            use iced::keyboard::key::{NativeCode, Physical};
+            self.send(iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                location: iced::keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            }));
+        }
+
+        /// Press Ctrl+C and return what landed on the clipboard (LF-normalized).
+        fn copy(&mut self) -> String {
+            self.clip = TestClipboard::default();
+            self.key(iced::keyboard::Key::Character("c".into()), iced::keyboard::Modifiers::COMMAND);
+            self.clip.0.clone().unwrap_or_default().replace("\r\n", "\n")
+        }
+
+        /// The real geometry, and the open panel's rect (the preview of the
+        /// fold opened at `fold`, else the hover) — as the widget lays it out.
+        fn layout(&self, fold: Option<u32>) -> (crate::geo::Geo, Option<iced::Rectangle>) {
+            Editor::new(&self.ed.doc, |_: Action| ())
+                .hover(self.ed.hover.as_ref())
+                .font(self.ed.font)
+                .text_size(self.ed.text_size)
+                .test_layout(iced::Rectangle::with_size(Self::SIZE), fold)
+        }
+
+        /// The screen point at the middle of buffer `row`, `cell` cells in.
+        fn at_cell(&self, row: u32, cell: f32) -> iced::Point {
+            let (geo, _) = self.layout(None);
+            let display = self.ed.doc.fold_map().to_display_row(scrive_core::BufferRow(row));
+            iced::Point::new(geo.cell_x(cell), geo.row_y(display) + geo.line_h() / 2.0)
+        }
+
+        /// The middle of line `line`, `cell` cells in, of the text grid of a
+        /// panel at `rect` with padding `pad`.
+        fn in_panel(&self, rect: iced::Rectangle, (pad_x, pad_y): (f32, f32), line: usize, cell: f32) -> iced::Point {
+            let (geo, _) = self.layout(None);
+            iced::Point::new(rect.x + pad_x + cell * geo.advance(), rect.y + pad_y + (line as f32 + 0.5) * geo.line_h())
+        }
+    }
+
+    /// A hover provider that documents every word.
+    struct EveryWord(&'static str);
+
+    impl Hover for EveryWord {
+        fn hover(&mut self, cx: &HoverCx) -> Option<HoverInfo> {
+            Some(HoverInfo { markdown: self.0.into(), range: cx.word.clone() })
+        }
+    }
+
+    /// The hover popup's text-grid padding (x, y) — `hover_layout`'s.
+    const HOVER_PAD: (f32, f32) = (8.0, crate::popup::POPUP_PAD);
+    /// The fold preview's — `fold_preview_layout`'s.
+    const FOLD_PAD: (f32, f32) = (8.0, 8.0);
+
+    /// The hover latch, as a fails-first regression: wherever a resting pointer
+    /// OPENS a hover, a pointer move at that same spot must hold it — no
+    /// dismissal, no re-query, however long the pointer then rests. The
+    /// query and the widget's keep-open test both see the pointer as a
+    /// caret-rounded offset; the query took anything *touching* that caret (a
+    /// word through its end, a diagnostic from one char before its start) while
+    /// the keep-open test took a half-open `start..end`. So resting on the right
+    /// half of a word's last char (or the left half of the char after it), or
+    /// just before a squiggle, opened a popup the very next move dismissed — it
+    /// never latched, and could not be moved into. Swept across the row in
+    /// small steps, so no font metric is assumed.
+    #[test]
+    fn hover_stays_open_wherever_it_opens() {
+        const LINE: &str = "let value = compute(alpha); // TODO later\n";
+        let todo = LINE.find("TODO").unwrap() as u32;
+        let (mut words, mut diags) = (0, 0);
+        for x in (0..600).step_by(2) {
+            let mut ed = CodeEditor::new(LINE).hover(EveryWord("doc"));
+            let rev = ed.document().revision();
+            ed.set_diagnostics(rev, vec![Diagnostic::new(todo..todo + 4, Severity::Warning, "todo")]);
+            let mut d = Drive::new(ed);
+            let pos = iced::Point::new(x as f32, 8.0);
+            d.move_to(pos);
+            d.wait(scrive_core::HOVER_IDLE_DELAY_MS + 100);
+            let Some(range) = d.ed.hover.as_ref().map(|h| h.range.clone()) else { continue };
+            d.move_to(pos);
+            d.wait(1_000);
+            assert!(
+                d.ed.hover.is_some() && (d.queries, d.dismissals) == (1, 0),
+                "the hover over {range:?} opened at x={x} but the next move let it go ({} queries, {} dismissals)",
+                d.queries,
+                d.dismissals,
+            );
+            if range == (todo..todo + 4) {
+                diags += 1;
+            } else {
+                words += 1;
+            }
+        }
+        // Not vacuous: both kinds of subject were opened (and held) many times.
+        assert!(words > 20 && diags > 5, "too few hovers opened ({words} word, {diags} diagnostic)");
+    }
+
+    /// The text for the hover-panel tests: a word with room above it for the
+    /// popup (row 6), and nothing documentable past the line's end.
+    fn panel_doc() -> String {
+        format!("{}let value = compute(alpha);\n{}", "\n".repeat(6), "\n".repeat(6))
+    }
+
+    /// The hover is sticky, as VS Code's is (`editor.hover.sticky`, with its
+    /// `hidingDelay`): leaving the word doesn't close it at once, so the pointer
+    /// can cross into the popup; it closes once the pointer has been away from
+    /// both for the hiding delay. Fails first against a hover that closed the
+    /// moment the pointer left its word.
+    #[test]
+    fn hover_is_sticky_through_a_hiding_delay() {
+        let mut d = Drive::new(CodeEditor::new(panel_doc()).hover(EveryWord("**value** — the docs")));
+        d.move_to(d.at_cell(6, 6.5)); // on "value"
+        d.wait(400);
+        let (_, rect) = d.layout(None);
+        let rect = rect.expect("the hover opened");
+        // Off the word, outside the popup (past the line's end): still open...
+        let away = d.at_cell(6, 40.0);
+        d.move_to(away);
+        assert!(d.ed.hover.is_some(), "leaving the word closed the hover at once");
+        d.wait(100);
+        assert!(d.ed.hover.is_some(), "the hover closed inside its hiding delay");
+        // ...so the pointer makes it into the popup, which then holds.
+        d.move_to(rect.center());
+        d.wait(1_000);
+        assert!(d.ed.hover.is_some(), "the hover closed with the pointer over it");
+        // Away from both for the hiding delay: closed.
+        d.move_to(away);
+        d.wait(350);
+        assert!(d.ed.hover.is_none(), "the hover outlived its hiding delay");
+    }
+
+    /// The hover's text selects and copies like a page's: a drag inside the
+    /// popup selects its text (never the code beneath), Ctrl+C copies it as
+    /// plain text, a double-click takes a word, the clicked-into popup stays
+    /// put wherever the pointer goes, and Escape closes it.
+    #[test]
+    fn hover_text_selects_and_copies() {
+        let docs = "**fn** `compute`(x)\nComputes the value of x.";
+        let mut d = Drive::new(CodeEditor::new(panel_doc()).hover(EveryWord(docs)));
+        d.move_to(d.at_cell(6, 6.5));
+        d.wait(400);
+        let (_, rect) = d.layout(None);
+        let rect = rect.expect("the hover opened");
+        let caret = d.ed.selection();
+
+        // Drag from the first line's start to 8 cells into the second.
+        d.move_to(d.in_panel(rect, HOVER_PAD, 0, 0.0));
+        d.press();
+        d.move_to(d.in_panel(rect, HOVER_PAD, 1, 8.0));
+        d.release();
+        assert_eq!(d.ed.selection(), caret, "the press reached the code beneath the popup");
+        assert_eq!(d.copy(), "fn compute(x)\nComputes", "markers stripped, lines joined");
+
+        // Clicked into, it stays wherever the pointer goes.
+        d.move_to(d.at_cell(12, 40.0));
+        d.wait(1_000);
+        assert!(d.ed.hover.is_some(), "a clicked-into hover closed when the pointer left");
+
+        // A double-click selects the word under it.
+        let word = d.in_panel(rect, HOVER_PAD, 1, 14.5); // in "value"
+        d.click_at(word);
+        d.click_at(word);
+        assert_eq!(d.copy(), "value");
+
+        // Escape closes it — and only it.
+        d.key(iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape), iced::keyboard::Modifiers::default());
+        assert!(d.ed.hover.is_none(), "Escape left the hover open");
+        assert_eq!(d.ed.selection(), caret);
+    }
+
+    /// Typing (any key but a bare modifier) closes the hover, as in VS Code;
+    /// Shift alone — half of a chord — does not.
+    #[test]
+    fn a_key_closes_the_hover_but_a_bare_modifier_does_not() {
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        let mut d = Drive::new(CodeEditor::new(panel_doc()).hover(EveryWord("docs")));
+        d.move_to(d.at_cell(6, 6.5));
+        d.wait(400);
+        assert!(d.ed.hover.is_some());
+        d.key(Key::Named(Named::Shift), Modifiers::SHIFT);
+        assert!(d.ed.hover.is_some(), "a bare Shift closed the hover");
+        d.key(Key::Named(Named::F7), Modifiers::default()); // bound to nothing
+        assert!(d.ed.hover.is_none(), "a key left the hover open");
+    }
+
+    /// A collapsed block of 30 body rows, its opening brace on row `header`
+    /// at `indent` spaces — and that brace's offset.
+    fn folded_block(header: usize, indent: usize) -> (String, u32) {
+        let pad = " ".repeat(indent);
+        let mut text = String::new();
+        for _ in 0..header {
+            text.push_str("// above\n");
+        }
+        text.push_str(&format!("{pad}fn big() {{\n"));
+        for i in 0..30 {
+            text.push_str(&format!("{pad}    let v{i} = {i};\n"));
+        }
+        text.push_str(&format!("{pad}}}\n"));
+        let opener = text.find("() {").unwrap() as u32 + 3;
+        (text, opener)
+    }
+
+    /// Rest on the `…` chip of the block folded at `opener` (its `{` is at
+    /// cell `brace` of row `row`) until its preview opens; the preview's rect.
+    fn open_preview(d: &mut Drive, row: u32, brace: f32, opener: u32) -> iced::Rectangle {
+        d.move_to(d.at_cell(row, brace + 1.5)); // just past the `{`
+        d.wait(400);
+        d.layout(Some(opener)).1.expect("the chip is on screen")
+    }
+
+    /// Triple-click a panel line, then copy it.
+    fn copy_line(d: &mut Drive, at: iced::Point) -> String {
+        for _ in 0..3 {
+            d.click_at(at);
+        }
+        d.copy()
+    }
+
+    /// The fold preview is the same kind of panel: it opens on its `…` chip,
+    /// the pointer can cross the gap into it, its rows scroll and select, and a
+    /// copy gives the rows as shown. Fails first against a preview that closed
+    /// on any pointer move.
+    #[test]
+    fn fold_preview_is_a_sticky_selectable_scrolling_panel() {
+        let (text, opener) = folded_block(0, 0);
+        let mut ed = CodeEditor::new(text);
+        assert!(ed.doc.toggle_fold_opener(opener));
+        let mut d = Drive::new(ed);
+        let rect = open_preview(&mut d, 0, 9.0, opener);
+        // Cross the gap between the chip's row and the panel, then hold.
+        d.move_to(iced::Point::new(rect.x + 20.0, rect.y - 1.0));
+        d.wait(100);
+        d.move_to(d.in_panel(rect, FOLD_PAD, 0, 2.0));
+        d.wait(1_000);
+
+        // Scrolled a line, the top row is the first body row.
+        d.wheel(-1.0);
+        let top = d.in_panel(rect, FOLD_PAD, 0, 2.0);
+        assert_eq!(copy_line(&mut d, top), "    let v0 = 0;", "the preview closed, didn't scroll, or didn't select");
+
+        // A drag across rows copies them joined.
+        d.move_to(d.in_panel(rect, FOLD_PAD, 0, 4.0));
+        d.press();
+        d.move_to(d.in_panel(rect, FOLD_PAD, 2, 10.0));
+        d.release();
+        assert_eq!(d.copy(), "let v0 = 0;\n    let v1 = 1;\n    let v2");
+
+        // A click outside closes it: the same triple-click now lands in the code.
+        let below = iced::Point::new(rect.x + 20.0, rect.y + rect.height + d.layout(None).0.line_h());
+        d.click_at(below);
+        assert_ne!(copy_line(&mut d, top), "    let v0 = 0;", "the preview survived a click outside it");
+    }
+
+    /// Line `i` of the open preview at `rect`, copied by a triple-click.
+    fn preview_line(d: &mut Drive, rect: iced::Rectangle, i: usize) -> String {
+        let at = d.in_panel(rect, FOLD_PAD, i, 0.5);
+        copy_line(d, at)
+    }
+
+    /// Every line of the preview of the pair folded at `opener` in `text`
+    /// (one short enough to show whole), as the panel shows them.
+    fn preview_of(text: &str, opener: u32) -> Vec<String> {
+        let mut ed = CodeEditor::new(text);
+        assert!(ed.doc.toggle_fold_opener(opener), "{text:?} folds at {opener}");
+        let p = ed.doc.buffer().offset_to_point(opener);
+        let mut d = Drive::new(ed);
+        let rect = open_preview(&mut d, p.row, p.col as f32, opener);
+        let lines = ((rect.height - 2.0 * FOLD_PAD.1) / d.layout(None).0.line_h()).round() as usize;
+        (0..lines).map(|i| preview_line(&mut d, rect, i)).collect()
+    }
+
+    /// The fold preview's missing opener, as a fails-first regression: a collapsed
+    /// block's preview is the folded pair as one fragment — the opener (at the
+    /// closer's indent), the interior, then the closer and nothing after it —
+    /// for every bracket kind. It used to show the rows after the opener's
+    /// row through the whole closing row: `my_code_here` then `}` with no `{`,
+    /// a trailing `} else {`, and `1,` `2,` `];` with no `[`.
+    #[test]
+    fn fold_preview_runs_opener_to_closer() {
+        assert_eq!(preview_of("fn foo() {\n    my_code_here\n}\n", 9), ["{", "    my_code_here", "}"]);
+        assert_eq!(preview_of("if a {\n    x\n} else {\n    y\n}\n", 5), ["{", "    x", "}"]);
+        assert_eq!(preview_of("let xs = [\n    1,\n    2,\n];\n", 9), ["[", "    1,", "    2,", "]"]);
+    }
+
+    /// The preview keeps its block's shape: one indent strip over the whole
+    /// fragment, so a nested block's body stays indented under its braces, and
+    /// the row cap counts the opener line — scrolled to the end, the closer is
+    /// the last line. Fails first against the strip measured over the hidden
+    /// rows alone, which flattened a long block's body to its braces' column.
+    #[test]
+    fn fold_preview_keeps_the_body_indented_under_its_braces() {
+        let (text, opener) = folded_block(1, 4); // nested: its `{` at cell 13
+        let mut ed = CodeEditor::new(text);
+        assert!(ed.doc.toggle_fold_opener(opener));
+        let mut d = Drive::new(ed);
+        let rect = open_preview(&mut d, 1, 13.0, opener);
+        assert_eq!(preview_line(&mut d, rect, 0), "{");
+        assert_eq!(preview_line(&mut d, rect, 1), "    let v0 = 0;", "the body lost its indent");
+        d.wheel(-100.0);
+        let last = crate::editor::FOLD_PREVIEW_MAX_VISIBLE - 1;
+        assert_eq!(preview_line(&mut d, rect, last), "}", "the closer isn't the last line");
+        assert_eq!(preview_line(&mut d, rect, last - 1), "    let v29 = 29;");
     }
 }

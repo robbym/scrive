@@ -52,6 +52,7 @@ pub mod editor;
 mod geo;
 mod highlight_pool;
 pub mod metrics;
+mod panel;
 pub mod popup;
 
 pub use code_editor::{CodeEditor, Event};

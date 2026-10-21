@@ -47,6 +47,8 @@ pub struct HoverInfo {
     /// text at render).
     pub markdown: String,
     /// The word range the doc describes — the popup anchors here and the widget
-    /// re-tests pointer containment against it for dismissal.
+    /// keeps it open while the pointer's caret offset touches this range
+    /// (`start..=end`) or the pointer is over the popup itself, closing it only
+    /// after the pointer has been off both for a short hiding delay.
     pub range: Range<u32>,
 }
